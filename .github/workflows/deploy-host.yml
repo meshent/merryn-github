@@ -1,0 +1,126 @@
+# Reusable: deploy a Merryn tenant host to its Azure App Service, from the tenant bundle, after its tests.
+#
+# Call it from a thin wrapper in the host repository (see README.md). It reads where the tenant lives from the bundle
+# (host.subscription, host.resourceGroup, host.siteName, publicUrl) so the wrapper names nothing twice, signs in with
+# Azure OIDC through the caller's repository variables (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID; the
+# federated identity `infra/bringup.sh` creates), publishes the host, ships it as a run-from-package zip, then waits
+# for /health to name THIS build (the informational version carries the commit) and for /tenant to report
+# seeded=true, so "deployed" means the new process answered and the bundle's domains are there.
+#
+# The deploy job skips (green) while AZURE_CLIENT_ID is unset, so the wrapper can land before the identity exists.
+# F1 plans have no slots: this is a direct deploy; the health wait is the safety net.
+name: Deploy Merryn host (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      bundle:
+        description: Path to the tenant bundle, e.g. src/Mira.Host/tenants/mira.json
+        type: string
+        required: true
+      project:
+        description: The host project to publish, e.g. src/Mira.Host/Mira.Host.csproj
+        type: string
+        required: true
+      test-path:
+        description: Test project or solution to run before deploying; empty skips the gate
+        type: string
+        default: ""
+      dotnet-version:
+        type: string
+        default: "10.0.x"
+      health-attempts:
+        description: How many 5-second waits for /health to name the new build
+        type: number
+        default: 30
+    secrets:
+      packages-token:
+        description: Token with read:packages on the feed that publishes Mira.Core and Mira.Cosmos; needed when the host repository is outside the org that owns the feed. Falls back to GITHUB_TOKEN.
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  test:
+    if: ${{ inputs.test-path != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.packages-token || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - run: dotnet test ${{ inputs.test-path }} -c Release
+
+  deploy:
+    needs: [test]
+    # always() so a skipped test job (no test-path) does not skip the deploy; a failed one still blocks it.
+    if: ${{ always() && needs.test.result != 'failure' && needs.test.result != 'cancelled' && vars.AZURE_CLIENT_ID != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.packages-token || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Read the bundle
+        id: bundle
+        run: |
+          b="${{ inputs.bundle }}"
+          [ -f "$b" ] || { echo "::error::no such bundle: $b"; exit 2; }
+          for k in host.subscription host.resourceGroup host.siteName; do
+            v=$(jq -r ".$k // empty" "$b"); [ -n "$v" ] || { echo "::error::bundle is missing $k"; exit 2; }
+          done
+          sub=$(jq -r '.host.subscription' "$b")
+          [[ "$sub" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "::error::host.subscription must be a subscription ID (GUID)"; exit 2; }
+          [ "$sub" = "${{ vars.AZURE_SUBSCRIPTION_ID }}" ] || { echo "::error::the bundle's host.subscription ($sub) is not the AZURE_SUBSCRIPTION_ID variable the identity was granted in; refusing to deploy across subscriptions"; exit 2; }
+          {
+            echo "sub=$sub"
+            echo "rg=$(jq -r '.host.resourceGroup' "$b")"
+            echo "site=$(jq -r '.host.siteName' "$b")"
+            echo "url=$(jq -r '.publicUrl // ("https://" + .host.siteName + ".azurewebsites.net")' "$b")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        run: dotnet publish "${{ inputs.project }}" -c Release -o "$RUNNER_TEMP/publish" --nologo
+
+      - name: Zip
+        run: cd "$RUNNER_TEMP/publish" && zip -qr "$RUNNER_TEMP/publish.zip" .
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to App Service
+        run: |
+          az webapp deploy --subscription "${{ steps.bundle.outputs.sub }}" -g "${{ steps.bundle.outputs.rg }}" -n "${{ steps.bundle.outputs.site }}" \
+            --src-path "$RUNNER_TEMP/publish.zip" --type zip --clean true --restart true -o none
+
+      - name: Wait for the new build to answer /health
+        run: |
+          url="${{ steps.bundle.outputs.url }}"; sha="${{ github.sha }}"; code=""
+          for i in $(seq 1 ${{ inputs.health-attempts }}); do
+            health=$(curl -s -w '\n%{http_code}' "$url/health" || true); code=${health##*$'\n'}; body=${health%$'\n'*}
+            if [ "$code" = 200 ] && [[ "$body" == *"$sha"* ]]; then echo "healthy: $body"; exit 0; fi
+            echo "attempt $i: /health returned $code (waiting for build $sha)"; sleep 5
+          done
+          echo "::error::${{ steps.bundle.outputs.site }} did not come back healthy on build $sha"; exit 1
+
+      - name: Wait for the bundle to seed
+        run: |
+          url="${{ steps.bundle.outputs.url }}"
+          for i in $(seq 1 30); do
+            tenant=$(curl -s "$url/tenant" || true)
+            if [ "$(jq -r '.seeded // false' <<<"$tenant" 2>/dev/null)" = true ]; then echo "seeded: $tenant"; exit 0; fi
+            echo "attempt $i: not seeded yet ($(jq -c '{seeded,seedAttempts}' <<<"$tenant" 2>/dev/null || echo '?'))"; sleep 10
+          done
+          echo "::error::${{ steps.bundle.outputs.site }} is healthy but the bundle never seeded; check the app log (Cosmos role assignment or database name)"; exit 1
