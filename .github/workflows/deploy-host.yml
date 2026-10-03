@@ -29,10 +29,10 @@ on:
       dotnet-version:
         type: string
         default: "10.0.x"
-      health-attempts:
-        description: How many 5-second waits for /health to name the new build
+      health-timeout:
+        description: Seconds to wait, in all, for /health to name the new build
         type: number
-        default: 30
+        default: 900
     secrets:
       packages-token:
         description: Token with read:packages on the feed that publishes Mira.Core and Mira.Cosmos; needed when the host repository is outside the org that owns the feed. Falls back to GITHUB_TOKEN.
@@ -100,26 +100,34 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # --async: return once the zip is accepted rather than riding Azure's OneDeploy status poll, which on the F1 Linux
+      # plan reported "site failed to start within 10 mins" while the new container was already serving (Mira c841106,
+      # 2026-10-03). The /health wait below is the check, and the only one that proves THIS build is up.
       - name: Deploy to App Service
         run: |
           az webapp deploy --subscription "${{ steps.bundle.outputs.sub }}" -g "${{ steps.bundle.outputs.rg }}" -n "${{ steps.bundle.outputs.site }}" \
-            --src-path "$RUNNER_TEMP/publish.zip" --type zip --clean true --restart true -o none
+            --src-path "$RUNNER_TEMP/publish.zip" --type zip --clean true --restart true --async true -o none
 
       - name: Wait for the new build to answer /health
         run: |
-          url="${{ steps.bundle.outputs.url }}"; sha="${{ github.sha }}"; code=""
-          for i in $(seq 1 ${{ inputs.health-attempts }}); do
-            health=$(curl -s -w '\n%{http_code}' "$url/health" || true); code=${health##*$'\n'}; body=${health%$'\n'*}
+          url="${{ steps.bundle.outputs.url }}"; sha="${{ github.sha }}"; timeout=${{ inputs.health-timeout }}
+          deadline=$((SECONDS + timeout)); i=0
+          while :; do
+            i=$((i + 1))
+            health=$(curl -s --max-time 30 -w '\n%{http_code}' "$url/health" || true); code=${health##*$'\n'}; body=${health%$'\n'*}
             if [ "$code" = 200 ] && [[ "$body" == *"$sha"* ]]; then echo "healthy: $body"; exit 0; fi
-            echo "attempt $i: /health returned $code (waiting for build $sha)"; sleep 5
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "last /health: HTTP ${code:-000}: ${body:-<empty>}"
+              echo "::error::${{ steps.bundle.outputs.site }} did not come back healthy on build $sha within ${timeout}s ($i attempts)"; exit 1
+            fi
+            echo "attempt $i: /health returned ${code:-000} (waiting for build $sha)"; sleep 10
           done
-          echo "::error::${{ steps.bundle.outputs.site }} did not come back healthy on build $sha"; exit 1
 
       - name: Wait for the bundle to seed
         run: |
           url="${{ steps.bundle.outputs.url }}"
           for i in $(seq 1 30); do
-            tenant=$(curl -s "$url/tenant" || true)
+            tenant=$(curl -s --max-time 30 "$url/tenant" || true)
             if [ "$(jq -r '.seeded // false' <<<"$tenant" 2>/dev/null)" = true ]; then echo "seeded: $tenant"; exit 0; fi
             echo "attempt $i: not seeded yet ($(jq -c '{seeded,seedAttempts}' <<<"$tenant" 2>/dev/null || echo '?'))"; sleep 10
           done

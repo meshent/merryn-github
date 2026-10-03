@@ -43,7 +43,7 @@ jobs:
 | `project` | the host project to publish |
 | `test-path` | test project or solution that gates the deploy; empty skips the gate |
 | `dotnet-version` | default `10.0.x` |
-| `health-attempts` | 5-second waits for the new build to answer `/health`; default 30 |
+| `health-timeout` | seconds, in all, for the new build to answer `/health`; default 900. The zip deploys `--async` (Azure's own start-up poll gave false failures on F1), so this wait is the check; on timeout it prints the last `/health` answer |
 | secret `packages-token` | read:packages on the feed that publishes Mira.Core and Mira.Cosmos, when the host repository is outside the org that owns it; otherwise the workflow's own token is enough |
 
 **Identity.** The workflow signs in through the caller repository's variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
