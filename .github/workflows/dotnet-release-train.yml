@@ -103,10 +103,11 @@ jobs:
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
                       package edges (a cycle fails, naming it), select the repos whose TRAIN_REF moved since their latest
                       train/* tag, derive the one version stamp, refuse a repo whose main is not an ancestor of TRAIN_REF
-            build     per selected repo, bottom-up: point its nuget.config at the local feed, run its test gate from
-                      source, pack every packable project (without the source-graph switch, from an untouched copy) into
-                      the local feed, then check every package carries the train version and every in-train dependency
-                      in its nuspec names that same version
+            build     per selected repo, bottom-up: bump every exact pin on an in-train package to the train version
+                      (committed on a live train), point its nuget.config at the local feed, pack every packable project
+                      (without the source-graph switch, from an untouched copy) into the local feed, check every package
+                      carries the train version and every in-train dependency in its nuspec names that same version, then
+                      run its test gate from source
             publish   push every package to the org feed in the same order (only reached when build passed everywhere)
             promote   fast-forward main to TRAIN_REF and tag train/<version> in each selected repo
             record    write the run summary and, when MERRYN_URL is set, POST the release record to it
@@ -265,37 +266,25 @@ jobs:
               return json.loads(text)["Properties"]
 
 
-          def is_literal_version(version):
-              """A deliberate pin: a version with no float (*) and no MSBuild property in it."""
-              text = (version or "").strip()
-              return bool(text) and "*" not in text and "$(" not in text
-
-
           def read_csproj(csproj):
-              """The package and project references of one csproj. pins maps a package id to the literal version the project
-              pins it at (a deliberate minimum seam version); a floating or property-driven reference is not a pin."""
               root = ET.parse(csproj).getroot()
-              packages, projects, pins = set(), set(), {}
+              packages, projects = set(), set()
               for el in root.iter():
                   tag, include = el.tag.split("}")[-1], el.get("Include")
                   if tag == "PackageReference" and include:
                       packages.add(include)
-                      child = next((c for c in el if c.tag.split("}")[-1] == "Version"), None)
-                      version = el.get("Version") or (child.text if child is not None else None)
-                      if is_literal_version(version):
-                          pins[include] = version.strip()
                   elif tag == "ProjectReference" and include:
                       projects.add(str((Path(csproj).parent / include.replace("\\", "/")).resolve()))
-              return packages, projects, pins
+              return packages, projects
 
 
           def describe_project(dest, csproj):
-              packages, projects, pins = read_csproj(csproj)
+              packages, projects = read_csproj(csproj)
               props = msbuild_properties(csproj, ["PackageId", "IsPackable", "IsTestProject"])
               test = props.get("IsTestProject", "").lower() == "true" or "Microsoft.NET.Test.Sdk" in packages
               packable = props.get("IsPackable", "").lower() != "false" and not test
               return {"path": str(Path(csproj).relative_to(dest)), "id": props.get("PackageId") or Path(csproj).stem,
-                      "packable": packable, "packages": sorted(packages), "pins": pins,
+                      "packable": packable, "packages": sorted(packages),
                       "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest))}
 
 
@@ -389,6 +378,36 @@ jobs:
               tree.write(config, encoding="utf-8", xml_declaration=True)
 
 
+          # --- Exact pins ---------------------------------------------------------------------------------------------------
+
+          PIN = re.compile(r'(<Package(?:Reference|Version)\b[^>]*?\bInclude="(?P<id>[^"]+)"[^>]*?\bVersion=")(?P<version>[^"]*)(")')
+
+
+          def pin_train_versions(dest, train_ids, version):
+              """Bump every exact pin on a package this train produces to the train version, in every .csproj and
+              Directory.Packages.props under dest. A float (`*`, `1.*`) is left alone: it resolves to the train version through
+              the local feed by itself. Returns [(path, id, old, new)], the record of what the train rewrote. This is what makes
+              exact pins (dependencies tracked, never discovered) and one-version trains compatible: the train is the one place
+              that knows the version it is about to publish, so it maintains the pins, and on a live train commits them."""
+              changed = []
+              for path in sorted(list(Path(dest).rglob("*.csproj")) + list(Path(dest).rglob("Directory.Packages.props"))):
+                  if {"bin", "obj", ".git"} & set(path.parts):
+                      continue
+                  text = path.read_text(encoding="utf-8")
+
+                  def bump(m):
+                      package_id, old = m.group("id"), m.group("version")
+                      if package_id not in train_ids or "*" in old or old == version:
+                          return m.group(0)
+                      changed.append((str(path.relative_to(dest)), package_id, old, version))
+                      return f"{m.group(1)}{version}{m.group(4)}"
+
+                  new = PIN.sub(bump, text)
+                  if new != text:
+                      path.write_text(new, encoding="utf-8")
+              return changed
+
+
           # --- Checking what was packed ------------------------------------------------------------------------------------
 
           def nuspec_of(nupkg):
@@ -417,22 +436,15 @@ jobs:
               return match[0]
 
 
-          def check_package(package_id, version, train_ids, pins=None):
-              """The packed nuspec carries the train version, and so does every dependency on a train sibling, except one the
-              project pins at a literal version: that dependency must carry exactly its pin."""
-              pins = pins or {}
+          def check_package(package_id, version, train_ids):
               nupkg = find_package(package_id, version)
               nid, nversion, deps = nuspec_of(nupkg)
               if nversion != version:
                   raise TrainError(f"{nupkg.name}: nuspec version {nversion}, expected the train version {version}")
-              wrong = [(d, v) for d, v in deps if d in train_ids and d not in pins and lower_bound(v) != version]
+              wrong = [(d, v) for d, v in deps if d in train_ids and lower_bound(v) != version]
               if wrong:
                   raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in wrong)}, not the train "
                                    f"version {version}; it restored a sibling from outside this train")
-              drifted = [(d, v) for d, v in deps if d in pins and lower_bound(v) != lower_bound(pins[d])]
-              if drifted:
-                  raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in drifted)}, but the project "
-                                   f"pins {', '.join(f'{d} {pins[d]}' for d, _ in drifted)}")
               return {"id": nid, "version": nversion, "file": nupkg.name,
                       "dependencies": [f"{d} {v}" for d, v in deps if d in train_ids]}
 
@@ -525,12 +537,37 @@ jobs:
                   repo = plan["repos"][name]
                   src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
                   log(f"::group::{name}")
+                  # Exact pins on in-train packages move to the train version first, in the source tree, before any copy: the
+                  # train is the one place that knows the version it is about to publish. On a live train that edit is
+                  # committed on top of the ref (only the project files, never the nuget.config edit below), so main and the
+                  # ref receive exactly what was packed. A dry run keeps the edit in the runner's copy only.
+                  pins = pin_train_versions(src, train_ids, version)
+                  repo["pins"] = [list(p) for p in pins]
+                  if pins:
+                      log(f"{name}: pinned {len(pins)} reference(s) to {version}: " +
+                          ", ".join(sorted({f'{pid} ({old})' for _, pid, old, _ in pins})))
+                      if not plan["dry_run"]:
+                          run(["git", "add", "--", *sorted({path for path, *_ in pins})], cwd=src)
+                          run(["git", "-c", "user.name=release-train", "-c", "user.email=release-train@users.noreply.github.com",
+                               "commit", "-q", "-m", f"[train {version}] pin " + ", ".join(sorted({pid for _, pid, *_ in pins})) +
+                               f" to {version}"], cwd=src)
+                          repo["sha"] = git(["rev-parse", "HEAD"], cwd=src, capture=True).strip()
+                          repo["pinned"] = True
                   # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
                   if pack.exists():
                       shutil.rmtree(pack)
                   shutil.copytree(src, pack, symlinks=True)
                   for tree in (src, pack):
                       point_at_local_feed(tree, train_ids)
+                  # Pack before testing: a pin bumped to the train version can only restore once the upstream package is in
+                  # the local feed, and the project order puts it there first. Publishing is still gated on the tests below.
+                  for path in repo["project_order"]:
+                      run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
+                           f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
+                           "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
+                  for path in repo["project_order"]:
+                      project = next(p for p in repo["projects"] if p["path"] == path)
+                      packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
                   if repo["test"]:
                       args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
                       if repo["source_graph"]:
@@ -539,14 +576,6 @@ jobs:
                       run(args, cwd=src, env=env)
                   else:
                       log(f"{name}: tests skipped (\"test\": false in the manifest)")
-                  for path in repo["project_order"]:
-                      run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
-                           f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
-                           "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
-                  for path in repo["project_order"]:
-                      project = next(p for p in repo["projects"] if p["path"] == path)
-                      packages.append({"repo": name, **check_package(project["id"], version, train_ids,
-                                                                     project.get("pins"))})
                   log("::endgroup::")
                   log(f"{name}: {len(repo['project_order'])} package(s) at {version}")
               plan["packages"] = packages
@@ -566,6 +595,10 @@ jobs:
               tag = f"train/{plan['version']}"
               for name in plan["selected"]:
                   repo, dest = plan["repos"][name], checkout_dir(SRC, name)
+                  if repo.get("pinned"):
+                      # The pin commit sits on top of the ref in the runner's clone; the ref takes it first (a fast-forward),
+                      # then main, so the ref never falls behind main after a train.
+                      git(["push", "origin", f"{repo['sha']}:refs/heads/{plan['ref']}"], cwd=dest)
                   if repo["main"] != repo["sha"]:
                       # A plain push: the remote refuses anything but a fast-forward. Never forced.
                       git(["push", "origin", f"{repo['sha']}:refs/heads/main"], cwd=dest)

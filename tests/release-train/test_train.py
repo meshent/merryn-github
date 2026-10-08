@@ -118,6 +118,33 @@ class Unit(unittest.TestCase):
             z.writestr(f"{package_id}.nuspec", nuspec)
         return path
 
+    def test_exact_pins_on_in_train_packages_move_to_the_train_version_and_floats_stay(self):
+        repo = Path(self.tmp.name) / "pins"
+        (repo / "Adapter").mkdir(parents=True)
+        (repo / "Adapter" / "Adapter.csproj").write_text(textwrap.dedent("""\
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <PackageReference Include="Patterns.Messaging.Sms" Version="0.0.2460.13471" />
+                <PackageReference Include="meshNet.Common" Version="*" />
+                <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
+              </ItemGroup>
+            </Project>
+            """))
+        (repo / "Directory.Packages.props").write_text(
+            '<Project><ItemGroup><PackageVersion Include="Patterns.Messaging.Sms" Version="0.0.2460.13471" /></ItemGroup></Project>\n')
+        (repo / "obj").mkdir()
+        (repo / "obj" / "Stale.csproj").write_text('<PackageReference Include="Patterns.Messaging.Sms" Version="1" />')
+        changed = self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms", "meshNet.Common"}, "0.0.2472.17298")
+        self.assertEqual(sorted(c[0] for c in changed), ["Adapter/Adapter.csproj", "Directory.Packages.props"])
+        self.assertEqual({(c[1], c[2], c[3]) for c in changed},
+                         {("Patterns.Messaging.Sms", "0.0.2460.13471", "0.0.2472.17298")})
+        text = (repo / "Adapter" / "Adapter.csproj").read_text()
+        self.assertIn('Include="Patterns.Messaging.Sms" Version="0.0.2472.17298"', text)
+        self.assertIn('Include="meshNet.Common" Version="*"', text)                       # a float stays a float
+        self.assertIn('Include="Microsoft.Extensions.Http" Version="10.0.12"', text)     # not in the train
+        self.assertIn('Version="1"', (repo / "obj" / "Stale.csproj").read_text())          # obj/ is never touched
+        self.assertEqual(self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms"}, "0.0.2472.17298"), [])  # idempotent
+
     def test_a_package_that_restored_a_sibling_from_outside_the_train_fails(self):
         self._nupkg("A", "0.0.9.1", [("B", "0.0.9.1"), ("Newtonsoft.Json", "13.0.3")])
         self.assertEqual(self.train.check_package("A", "0.0.9.1", {"A", "B"})["dependencies"], ["B 0.0.9.1"])
@@ -125,29 +152,6 @@ class Unit(unittest.TestCase):
         with self.assertRaises(self.train.TrainError) as raised:
             self.train.check_package("C", "0.0.9.1", {"B", "C"})
         self.assertIn("not the train version", str(raised.exception))
-
-    def test_a_literal_pin_on_a_sibling_must_hold_its_own_version(self):
-        # A project may pin a sibling at an exact minimum seam version: that dependency carries the pin, not the stamp.
-        self._nupkg("T", "0.0.9.1", [("S", "0.0.7.3"), ("U", "0.0.9.1")])
-        result = self.train.check_package("T", "0.0.9.1", {"S", "T", "U"}, {"S": "0.0.7.3"})
-        self.assertEqual(result["dependencies"], ["S 0.0.7.3", "U 0.0.9.1"])
-        self._nupkg("V", "0.0.9.1", [("S", "0.0.7.4")])
-        with self.assertRaises(self.train.TrainError) as raised:
-            self.train.check_package("V", "0.0.9.1", {"S", "V"}, {"S": "0.0.7.3"})
-        self.assertIn("pins S 0.0.7.3", str(raised.exception))
-
-    def test_read_csproj_records_only_literal_pins(self):
-        csproj = Path(self.tmp.name) / "P.csproj"
-        csproj.write_text("""<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
-  <PackageReference Include="Float" Version="*" />
-  <PackageReference Include="Prop" Version="$(SiblingVersion)" />
-  <PackageReference Include="Pin" Version="0.0.2460.13471" />
-  <PackageReference Include="Child"><Version>1.2.3</Version></PackageReference>
-  <PackageReference Include="Bare" />
-</ItemGroup></Project>""")
-        packages, _, pins = self.train.read_csproj(csproj)
-        self.assertEqual(packages, {"Float", "Prop", "Pin", "Child", "Bare"})
-        self.assertEqual(pins, {"Pin": "0.0.2460.13471", "Child": "1.2.3"})
 
     def test_tokens_never_reach_the_log_or_an_error(self):
         import contextlib, io
@@ -262,6 +266,32 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(all(p["version"] == version for p in result["packages"]))
         self.assertEqual(result["packages"][1]["dependencies"], [f"Up.Lib {version}"])
         self.assertEqual(result["repos"]["Down"]["items"], ["test:T1"])
+
+    def test_an_exact_pin_on_an_in_train_package_is_bumped_before_packing(self):
+        # Down pins Up.Lib to a version that exists on no feed at all: the build can only succeed if the train moved
+        # the pin to the train version before packing, so the nuspec names the train version and the source tree
+        # carries the bumped pin (the commit it would make on a live train).
+        pinned = csproj([]).replace("<ItemGroup></ItemGroup>",
+                                   '<ItemGroup><PackageReference Include="Up.Lib" Version="0.0.1.1" /></ItemGroup>')
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
+                         "Up.slnx": '<Solution><Project Path="Up.Lib/Up.Lib.csproj" /></Solution>'})
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": pinned,
+                           "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}",
+                           "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
+        self.manifest(["Down", "Up"])
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        state = json.loads((self.root / "train" / "plan.json").read_text())
+        version = state["version"]
+        self.assertIn("Down: pinned 1 reference(s) to " + version, build.stdout)
+        self.assertEqual(state["repos"]["Down"]["pins"], [["Down.Lib/Down.Lib.csproj", "Up.Lib", "0.0.1.1", version]])
+        down = next(p for p in state["packages"] if p["id"] == "Down.Lib")
+        self.assertEqual(down["dependencies"], [f"Up.Lib {version}"])
+        self.assertIn(f'Include="Up.Lib" Version="{version}"',
+                      (self.root / "train" / "src" / "Down" / "Down" / "Down.Lib" / "Down.Lib.csproj").read_text())
+        self.assertNotIn("pinned", state["repos"]["Down"])  # a dry run commits nothing
 
     def test_a_sibling_checkout_switch_never_sees_the_other_train_repos(self):
         # Like meshNet.Commerce: a project that builds against a sibling checkout when one sits next to it must build
