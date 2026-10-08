@@ -1,0 +1,41 @@
+# This repository's own checks. It is public, so its Actions minutes are not billed to the organization.
+#
+# `train` runs the release-train tests (the script is extracted from dotnet-release-train.yml, unit and end-to-end on
+# throwaway git repositories). `validate` calls dotnet-validate.yml exactly as a tenant wrapper does, against a tiny
+# fixture solution, so a PR labelled `ci:validate` here shows that workflow running as one job, and an unlabelled one
+# shows it skipped.
+name: Self-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:validate' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  train:
+    if: ${{ github.event.action != 'labeled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - run: python3 -m pip install --quiet pyyaml
+      - name: Release-train tests
+        run: python3 tests/release-train/test_train.py
+        env:
+          TRAIN_DOTNET: "1"
+
+  validate:
+    uses: ./.github/workflows/dotnet-validate.yml
+    with:
+      solution: tests/validate-fixture/Fixture.slnx
