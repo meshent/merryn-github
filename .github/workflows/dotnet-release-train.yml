@@ -32,6 +32,10 @@ on:
         description: The branch the train assembles from in every manifest repository
         type: string
         default: release
+      ref-overrides:
+        description: "Dry runs only: repo=ref entries (one per line or comma-separated) taken at that branch instead of ref; a live train refuses them"
+        type: string
+        default: ""
       dry-run:
         description: Build, test and pack into a local feed, upload it as an artifact, publish and promote nothing
         type: boolean
@@ -82,6 +86,7 @@ jobs:
     env:
       TRAIN_WORK: ${{ github.workspace }}/_train
       TRAIN_REF: ${{ inputs.ref }}
+      TRAIN_REF_OVERRIDES: ${{ inputs.ref-overrides }}
       TRAIN_DRY_RUN: ${{ inputs.dry-run }}
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +108,8 @@ jobs:
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
                       package edges (a cycle fails, naming it), select the repos whose TRAIN_REF moved since their latest
                       train/* tag, derive the one version stamp, refuse a repo whose main is not an ancestor of TRAIN_REF
+                      (a dry run warns instead: it promotes nothing). TRAIN_REF_OVERRIDES, dry runs only, takes the
+                      repos it names at another branch, so a lane branch can ride a rehearsal before it merges
             build     per selected repo, bottom-up: bump every exact pin on an in-train package to the train version
                       (committed on a live train), point its nuget.config at the local feed, pack every packable project
                       (without the source-graph switch, from an untouched copy) into the local feed, check every package
@@ -112,7 +119,7 @@ jobs:
             promote   fast-forward main to TRAIN_REF and tag train/<version> in each selected repo
             record    write the run summary and, when MERRYN_URL is set, POST the release record to it
 
-          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_DRY_RUN, REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL,
+          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_REF_OVERRIDES, TRAIN_DRY_RUN, REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL,
           MERRYN_TOKEN; GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and GITHUB_SERVER_URL as Actions sets them.
           """
           import json
@@ -454,9 +461,31 @@ jobs:
 
           # --- Subcommands -------------------------------------------------------------------------------------------------
 
+          def ref_overrides():
+              """TRAIN_REF_OVERRIDES: `repo=ref` entries separated by newlines or commas, as {repo: ref}."""
+              overrides = {}
+              for entry in re.split(r"[,\n]", os.environ.get("TRAIN_REF_OVERRIDES", "")):
+                  entry = entry.strip()
+                  if not entry:
+                      continue
+                  name, sep, ref = (part.strip() for part in entry.partition("="))
+                  if not sep or not name or not ref:
+                      raise TrainError(f"ref override '{entry}' is not of the form repo=ref")
+                  overrides[name] = ref
+              return overrides
+
+
           def cmd_plan():
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
               ref = os.environ.get("TRAIN_REF", "release")
+              dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
+              overrides = ref_overrides()
+              if overrides and not dry_run:
+                  raise TrainError("ref overrides are for dry runs only: a live train assembles every repository from "
+                                   f"'{ref}' and promotes that to main (overrides named {', '.join(sorted(overrides))})")
+              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"]})
+              if unknown:
+                  raise TrainError(f"ref overrides name repositories that are not in the manifest: {', '.join(unknown)}")
               if WORK.exists():
                   shutil.rmtree(WORK)
               SRC.mkdir(parents=True)
@@ -465,16 +494,18 @@ jobs:
               repos = {}
               for repo in manifest["repos"]:
                   name = repo["repo"]
+                  repo_ref = overrides.get(name, ref)
                   dest = checkout_dir(SRC, name)
-                  sha = clone(manifest["org"], name, ref, dest)
+                  sha = clone(manifest["org"], name, repo_ref, dest)
                   tag = latest_train_tag(dest)
                   main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
-                  log(f"{name}: {ref} {sha[:12]}, main {main[:12]}, latest train tag {tag['tag'] if tag else '(none)'}")
+                  log(f"{name}: {repo_ref} {sha[:12]}{' (override)' if name in overrides else ''}, main {main[:12]}, "
+                      f"latest train tag {tag['tag'] if tag else '(none)'}")
                   projects = [describe_project(dest, p) for p in find_projects(dest)]
-                  repos[name] = {**repo, "sha": sha, "main": main, "tag": tag, "projects": projects,
+                  repos[name] = {**repo, "ref": repo_ref, "sha": sha, "main": main, "tag": tag, "projects": projects,
                                  "selected": tag is None or tag["sha"] != sha,
                                  "reason": "no train tag yet" if tag is None else
-                                           (f"{ref} moved since {tag['tag']}" if tag["sha"] != sha else f"unchanged since {tag['tag']}")}
+                                           (f"{repo_ref} moved since {tag['tag']}" if tag["sha"] != sha else f"unchanged since {tag['tag']}")}
 
               owner = {}
               for name, repo in repos.items():
@@ -498,11 +529,17 @@ jobs:
                                            if by_path[path]["packable"]]
 
               selected = [n for n in repo_order if repos[n]["selected"]]
+              warnings = []
               for name in selected:
                   repo = repos[name]
                   if not is_ancestor(checkout_dir(SRC, name), repo["main"], repo["sha"]):
-                      raise TrainError(f"{name}: main ({repo['main'][:12]}) is not an ancestor of {ref} ({repo['sha'][:12]}), "
-                                       f"so the train could publish it but never fast-forward main. Merge main into {ref} first.")
+                      message = (f"{name}: main ({repo['main'][:12]}) is not an ancestor of {repo['ref']} ({repo['sha'][:12]}), "
+                                 f"so the train could publish it but never fast-forward main. Merge main into {repo['ref']} first.")
+                      if not dry_run:
+                          raise TrainError(message)
+                      # A dry run promotes nothing, so it can still build and test the branch; the summary carries the warning.
+                      warnings.append(message + " A live train refuses this repository.")
+                      log(f"WARNING {message}")
                   repo["solution_file"] = find_solution(checkout_dir(SRC, name), repo) if repo["test"] else ""
                   repo["source_graph"] = SWITCH in ((checkout_dir(SRC, name) / "Directory.Build.targets").read_text()
                                                     if (checkout_dir(SRC, name) / "Directory.Build.targets").exists() else "")
@@ -514,12 +551,13 @@ jobs:
               version = normalized_version(build, revision)
               train_ids = sorted(p["id"] for n in selected for p in repos[n]["projects"] if p["packable"])
               plan = {"org": manifest["org"], "ref": ref, "version": version, "build": build, "revision": revision,
-                      "dry_run": os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false",
+                      "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids,
                       "repo_edges": repo_edges, "repos": repos, "hosts": manifest["hosts"], "packages": [], "promoted": []}
               PLAN.write_text(json.dumps(plan, indent=2))
 
-              log(f"\nTrain {version} ({'dry run' if plan['dry_run'] else 'live'}), ref {ref}")
+              log(f"\nTrain {version} ({'dry run' if dry_run else 'live'}), ref {ref}" +
+                  (" with overrides " + ", ".join(f"{n}={r}" for n, r in sorted(overrides.items())) if overrides else ""))
               log(f"Repository order: {' -> '.join(repo_order)}")
               for name in repo_order:
                   deps = ", ".join(repo_edges[name]) or "nothing in the manifest"
@@ -619,8 +657,11 @@ jobs:
                   return
               plan = json.loads(PLAN.read_text())
               mode = "dry run" if plan["dry_run"] else "live"
-              lines = [f"## Release train {plan['version']} ({mode})", "",
-                       f"Ref `{plan['ref']}`. Order: {' → '.join(plan['repo_order'])}.", "",
+              ref_line = f"Ref `{plan['ref']}`. Order: {' → '.join(plan['repo_order'])}."
+              if plan.get("overrides"):
+                  ref_line += " Overrides (dry run only): " + ", ".join(f"`{n}={r}`" for n, r in sorted(plan["overrides"].items())) + "."
+              lines = [f"## Release train {plan['version']} ({mode})", "", ref_line, "",
+                       *[f"- ⚠️ {warning}" for warning in plan.get("warnings", [])], *([""] if plan.get("warnings") else []),
                        "| repo | in train | why | depends on | items |", "|---|---|---|---|---|"]
               for name in plan["repo_order"]:
                   repo = plan["repos"][name]

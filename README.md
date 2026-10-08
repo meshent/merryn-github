@@ -89,7 +89,8 @@ For each selected repository, bottom-up, the train:
 Only when every selected repository has passed does the train push the packages, in the same order, with
 `--skip-duplicate`. It then fast-forwards `main` to `ref` in each repository (a plain push, never forced) and tags
 `train/<version>`. The plan step refuses a repository whose `main` is not an ancestor of `ref`, so a train never
-publishes something it cannot promote. A failure anywhere publishes nothing.
+publishes something it cannot promote; a dry run promotes nothing, so there it is a warning in the summary instead
+and the branch is still built and tested. A failure anywhere publishes nothing.
 
 Put the wrapper in the tenant's aggregator repository (meshNet for meshNet):
 
@@ -125,6 +126,7 @@ runs dry until you change that line.
 |---|---|
 | `manifest` | path to the manifest in the calling repository; default `release-train.json` |
 | `ref` | the branch the train assembles from in every manifest repository; default `release`. A repository without it fails the run |
+| `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
 | `dry-run` | build, test and pack only, then upload the local feed; default `true` |
 | `override` | run even when the org variable `ACTIONS_BUDGET_STATE` is `hard`. The train runs at `soft`; at `hard` only an override runs |
 | `dotnet-version` | default `10.0.x` |
