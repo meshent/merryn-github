@@ -58,6 +58,13 @@ the site, not the subscription. While `AZURE_CLIENT_ID` is unset the deploy job 
 The workflow refuses to deploy when the bundle's subscription differs from `AZURE_SUBSCRIPTION_ID`: the identity was
 granted in one subscription, and a bundle pointing elsewhere is a mistake, not a request.
 
+## Planned: release trains and an Actions budget
+
+[docs/release-trains.md](docs/release-trains.md) is the plan for `dotnet-release-train.yml` (one scheduled run that
+builds, tests, packs and publishes every repository of a tenant in dependency order, then pins and deploys its hosts),
+`dotnet-validate.yml` (the one opt-in PR check) and `actions-budget-gate.yml` (throttle before GitHub locks the org out).
+Filed as work on the meshNet and Mira boards.
+
 ## Versioning
 
 Reference `@main` for the current contract, or pin a tag. Inputs are only ever added; a renamed or removed input is a
