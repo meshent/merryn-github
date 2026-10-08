@@ -126,6 +126,29 @@ class Unit(unittest.TestCase):
             self.train.check_package("C", "0.0.9.1", {"B", "C"})
         self.assertIn("not the train version", str(raised.exception))
 
+    def test_a_literal_pin_on_a_sibling_must_hold_its_own_version(self):
+        # A project may pin a sibling at an exact minimum seam version: that dependency carries the pin, not the stamp.
+        self._nupkg("T", "0.0.9.1", [("S", "0.0.7.3"), ("U", "0.0.9.1")])
+        result = self.train.check_package("T", "0.0.9.1", {"S", "T", "U"}, {"S": "0.0.7.3"})
+        self.assertEqual(result["dependencies"], ["S 0.0.7.3", "U 0.0.9.1"])
+        self._nupkg("V", "0.0.9.1", [("S", "0.0.7.4")])
+        with self.assertRaises(self.train.TrainError) as raised:
+            self.train.check_package("V", "0.0.9.1", {"S", "V"}, {"S": "0.0.7.3"})
+        self.assertIn("pins S 0.0.7.3", str(raised.exception))
+
+    def test_read_csproj_records_only_literal_pins(self):
+        csproj = Path(self.tmp.name) / "P.csproj"
+        csproj.write_text("""<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+  <PackageReference Include="Float" Version="*" />
+  <PackageReference Include="Prop" Version="$(SiblingVersion)" />
+  <PackageReference Include="Pin" Version="0.0.2460.13471" />
+  <PackageReference Include="Child"><Version>1.2.3</Version></PackageReference>
+  <PackageReference Include="Bare" />
+</ItemGroup></Project>""")
+        packages, _, pins = self.train.read_csproj(csproj)
+        self.assertEqual(packages, {"Float", "Prop", "Pin", "Child", "Bare"})
+        self.assertEqual(pins, {"Pin": "0.0.2460.13471", "Child": "1.2.3"})
+
     def test_tokens_never_reach_the_log_or_an_error(self):
         import contextlib, io
         os.environ.update(REPOS_TOKEN="FAKE_REPOS_SECRET", PACKAGES_TOKEN="FAKE_PACKAGES_SECRET")

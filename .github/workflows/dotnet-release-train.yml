@@ -257,25 +257,37 @@ jobs:
               return json.loads(text)["Properties"]
 
 
+          def is_literal_version(version):
+              """A deliberate pin: a version with no float (*) and no MSBuild property in it."""
+              text = (version or "").strip()
+              return bool(text) and "*" not in text and "$(" not in text
+
+
           def read_csproj(csproj):
+              """The package and project references of one csproj. pins maps a package id to the literal version the project
+              pins it at (a deliberate minimum seam version); a floating or property-driven reference is not a pin."""
               root = ET.parse(csproj).getroot()
-              packages, projects = set(), set()
+              packages, projects, pins = set(), set(), {}
               for el in root.iter():
                   tag, include = el.tag.split("}")[-1], el.get("Include")
                   if tag == "PackageReference" and include:
                       packages.add(include)
+                      child = next((c for c in el if c.tag.split("}")[-1] == "Version"), None)
+                      version = el.get("Version") or (child.text if child is not None else None)
+                      if is_literal_version(version):
+                          pins[include] = version.strip()
                   elif tag == "ProjectReference" and include:
                       projects.add(str((Path(csproj).parent / include.replace("\\", "/")).resolve()))
-              return packages, projects
+              return packages, projects, pins
 
 
           def describe_project(dest, csproj):
-              packages, projects = read_csproj(csproj)
+              packages, projects, pins = read_csproj(csproj)
               props = msbuild_properties(csproj, ["PackageId", "IsPackable", "IsTestProject"])
               test = props.get("IsTestProject", "").lower() == "true" or "Microsoft.NET.Test.Sdk" in packages
               packable = props.get("IsPackable", "").lower() != "false" and not test
               return {"path": str(Path(csproj).relative_to(dest)), "id": props.get("PackageId") or Path(csproj).stem,
-                      "packable": packable, "packages": sorted(packages),
+                      "packable": packable, "packages": sorted(packages), "pins": pins,
                       "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest))}
 
 
@@ -397,15 +409,22 @@ jobs:
               return match[0]
 
 
-          def check_package(package_id, version, train_ids):
+          def check_package(package_id, version, train_ids, pins=None):
+              """The packed nuspec carries the train version, and so does every dependency on a train sibling, except one the
+              project pins at a literal version: that dependency must carry exactly its pin."""
+              pins = pins or {}
               nupkg = find_package(package_id, version)
               nid, nversion, deps = nuspec_of(nupkg)
               if nversion != version:
                   raise TrainError(f"{nupkg.name}: nuspec version {nversion}, expected the train version {version}")
-              wrong = [(d, v) for d, v in deps if d in train_ids and lower_bound(v) != version]
+              wrong = [(d, v) for d, v in deps if d in train_ids and d not in pins and lower_bound(v) != version]
               if wrong:
                   raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in wrong)}, not the train "
                                    f"version {version}; it restored a sibling from outside this train")
+              drifted = [(d, v) for d, v in deps if d in pins and lower_bound(v) != lower_bound(pins[d])]
+              if drifted:
+                  raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in drifted)}, but the project "
+                                   f"pins {', '.join(f'{d} {pins[d]}' for d, _ in drifted)}")
               return {"id": nid, "version": nversion, "file": nupkg.name,
                       "dependencies": [f"{d} {v}" for d, v in deps if d in train_ids]}
 
@@ -518,7 +537,8 @@ jobs:
                            "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
                   for path in repo["project_order"]:
                       project = next(p for p in repo["projects"] if p["path"] == path)
-                      packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
+                      packages.append({"repo": name, **check_package(project["id"], version, train_ids,
+                                                                     project.get("pins"))})
                   log("::endgroup::")
                   log(f"{name}: {len(repo['project_order'])} package(s) at {version}")
               plan["packages"] = packages
