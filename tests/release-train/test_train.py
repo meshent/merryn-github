@@ -126,6 +126,23 @@ class Unit(unittest.TestCase):
             self.train.check_package("C", "0.0.9.1", {"B", "C"})
         self.assertIn("not the train version", str(raised.exception))
 
+    def test_tokens_never_reach_the_log_or_an_error(self):
+        import contextlib, io
+        os.environ.update(REPOS_TOKEN="FAKE_REPOS_SECRET", PACKAGES_TOKEN="FAKE_PACKAGES_SECRET")
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.train.git(["--version"])
+                with self.assertRaises(self.train.TrainError) as raised:
+                    self.train.run(["git", "nonexistent-subcommand", "--api-key", "FAKE_PACKAGES_SECRET"], capture=True)
+            shown = out.getvalue() + str(raised.exception)
+            for secret in ("FAKE_REPOS_SECRET", "FAKE_PACKAGES_SECRET", self.train.basic_auth("FAKE_REPOS_SECRET")):
+                self.assertNotIn(secret, shown)
+            self.assertIn("AUTHORIZATION: basic ***", shown)
+            self.assertIn("--api-key ***", shown)
+        finally:
+            del os.environ["REPOS_TOKEN"], os.environ["PACKAGES_TOKEN"]
+
     def test_a_package_that_did_not_take_the_stamp_fails(self):
         self._nupkg("A", "1.0.0", [])
         with self.assertRaises(self.train.TrainError) as raised:

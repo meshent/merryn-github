@@ -199,7 +199,7 @@ jobs:
 | `test-args` | extra arguments for `dotnet test` |
 | `label` | the label that opts a PR in; default `ci:validate`. Empty runs on every PR event the wrapper subscribes to |
 | `dotnet-version` | default `10.0.x` |
-| secret `packages-token` | `read:packages` on the org feed; falls back to the workflow's own token |
+| secret `packages-token` | `read:packages` on the org feed. Optional: the fallback is the workflow's own token, which reads an org package only when that package grants the calling repository access (package settings › Manage Actions access). Pass one (e.g. `secrets.MESHENT_CI_PAT`) when it does not |
 
 Both workflows cache `~/.nuget/packages` with `actions/cache`, keyed on the project files. They deliberately do not
 use `setup-dotnet`'s `cache: true`, which needs `packages.lock.json`, and a lock file pins every `Version="*"` float

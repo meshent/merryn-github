@@ -143,25 +143,39 @@ jobs:
               print(message, flush=True)
 
 
+          def basic_auth(token):
+              return b64encode(f"x-access-token:{token}".encode()).decode()
+
+
+          def redact(text):
+              """Every secret this script handles, and the git header form of the repos token, replaced by ***. Applied to
+              everything run() prints or raises, so a token never reaches a log even where the runner's masker is absent
+              (a local run) or misses a derived form."""
+              for name in ("REPOS_TOKEN", "PACKAGES_TOKEN", "MERRYN_TOKEN"):
+                  secret = os.environ.get(name, "")
+                  if secret:
+                      text = text.replace(basic_auth(secret), "***").replace(secret, "***")
+              return text
+
+
           def run(args, cwd=None, capture=False, env=None):
-              log(f"$ {' '.join(str(a) for a in args)}")
+              shown = redact(" ".join(str(a) for a in args))
+              log(f"$ {shown}")
               result = subprocess.run([str(a) for a in args], cwd=cwd, text=True, env=env,
                                       stdout=subprocess.PIPE if capture else None,
                                       stderr=subprocess.STDOUT if capture else None)
               if result.returncode != 0:
                   if capture:
-                      log(result.stdout)
-                  raise TrainError(f"command failed ({result.returncode}): {' '.join(str(a) for a in args)}")
+                      log(redact(result.stdout))
+                  raise TrainError(f"command failed ({result.returncode}): {shown}")
               return result.stdout if capture else ""
 
 
           def git(args, cwd=None, capture=False):
-              # The token travels as a per-command header, never in a remote URL, so nothing on disk holds it.
+              # The token travels as a per-command header, never in a remote URL, so nothing on disk holds it; run() redacts
+              # it from what it prints.
               token = os.environ.get("REPOS_TOKEN", "")
-              auth = []
-              if token:
-                  basic = b64encode(f"x-access-token:{token}".encode()).decode()
-                  auth = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic}"]
+              auth = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth(token)}"] if token else []
               return run(["git", *auth, *args], cwd=cwd, capture=capture)
 
 
@@ -588,7 +602,7 @@ jobs:
               try:
                   COMMANDS[sys.argv[1]]()
               except TrainError as error:
-                  print(f"::error::{error}", flush=True)
+                  print(f"::error::{redact(str(error))}", flush=True)
                   sys.exit(1)
           TRAIN_PY
 
