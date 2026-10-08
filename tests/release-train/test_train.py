@@ -76,6 +76,17 @@ class Unit(unittest.TestCase):
         with self.assertRaises(self.train.TrainError):
             self.train.load_manifest(path)
 
+    def test_test_env_is_the_top_level_map_overlaid_by_the_repo_s_own(self):
+        path = Path(self.tmp.name) / "m.json"
+        path.write_text(json.dumps({"org": "o", "test-env": {"COSMOS_EMULATOR_OPTIONAL": "1"},
+                                    "repos": ["A", {"repo": "B", "test-env": {"COSMOS_EMULATOR_OPTIONAL": "0", "X": "y"}}]}))
+        manifest = self.train.load_manifest(path)
+        self.assertEqual(manifest["repos"][0]["test-env"], {"COSMOS_EMULATOR_OPTIONAL": "1"})
+        self.assertEqual(manifest["repos"][1]["test-env"], {"COSMOS_EMULATOR_OPTIONAL": "0", "X": "y"})
+        path.write_text(json.dumps({"org": "o", "repos": [{"repo": "A", "test-env": {"N": 1}}]}))
+        with self.assertRaises(self.train.TrainError):
+            self.train.load_manifest(path)
+
     def test_local_feed_is_mapped_for_train_ids_next_to_the_github_source(self):
         repo = Path(self.tmp.name) / "repo"
         repo.mkdir()

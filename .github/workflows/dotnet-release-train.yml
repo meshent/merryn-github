@@ -208,8 +208,11 @@ jobs:
                   repo = {"repo": entry} if isinstance(entry, str) else dict(entry)
                   if not repo.get("repo"):
                       raise TrainError(f"{path}: every repos entry needs a name: {entry!r}")
+                  test_env = {**data.get("test-env", {}), **repo.get("test-env", {})}
+                  if not all(isinstance(k, str) and isinstance(v, str) for k, v in test_env.items()):
+                      raise TrainError(f"{repo['repo']}: test-env must map variable names to string values")
                   repos.append({"repo": repo["repo"], "solution": repo.get("solution", ""),
-                                "test": repo.get("test", True), "test-args": repo.get("test-args", "")})
+                                "test": repo.get("test", True), "test-args": repo.get("test-args", ""), "test-env": test_env})
               names = [r["repo"] for r in repos]
               if len(set(n.lower() for n in names)) != len(names):
                   raise TrainError(f"{path}: a repo is listed twice")
@@ -573,7 +576,8 @@ jobs:
                       if repo["source_graph"]:
                           args.append(f"-p:{SWITCH}=true")
                       args += repo["test-args"].split() if repo["test-args"] else []
-                      run(args, cwd=src, env=env)
+                      # test-env: the manifest's acknowledgements for the runner, e.g. a suite's "no emulator here" variable.
+                      run(args, cwd=src, env={**env, **repo.get("test-env", {})})
                   else:
                       log(f"{name}: tests skipped (\"test\": false in the manifest)")
                   log("::endgroup::")
