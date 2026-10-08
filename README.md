@@ -58,6 +58,113 @@ the site, not the subscription. While `AZURE_CLIENT_ID` is unset the deploy job 
 The workflow refuses to deploy when the bundle's subscription differs from `AZURE_SUBSCRIPTION_ID`: the identity was
 granted in one subscription, and a bundle pointing elsewhere is a mistake, not a request.
 
+## `dotnet-release-train.yml` — the release train
+
+One run that takes every repository of a tenant at its `release` branch, works out the dependency order from the
+`.csproj` files, tests each repository from source, packs every package into a local feed in that order (so a
+downstream resolves the upstream packed a minute earlier), and only when everything passed publishes the packages,
+fast-forwards `release` to `main` in each repository and tags `train/<id>`. One job, so one runner, one restore
+cache and no per-job minute rounding. Why, and the branch model around it: [docs/release-trains.md](docs/release-trains.md).
+
+The wrapper lives in the tenant's aggregator repository next to the manifest:
+
+```yaml
+# .github/workflows/release-train.yml
+name: Release train
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run: { type: boolean, default: true, description: "Assemble, test and pack only" }
+      branch: { type: string, default: release, description: "Branch to take (main for a rehearsal)" }
+      select: { type: string, default: changed, description: "changed | all" }
+      override: { type: boolean, default: false, description: "Run even at Actions budget state hard" }
+  # schedule:                     # turn on when the first real train has run: Tue and Fri 02:00 UTC
+  #   - cron: "0 2 * * 2,5"
+permissions:
+  contents: read
+jobs:
+  train:
+    uses: meshent/merryn-github/.github/workflows/dotnet-release-train.yml@main
+    with:
+      manifest: release-train.json
+      dry-run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+      branch: ${{ inputs.branch || 'release' }}
+      select: ${{ inputs.select || 'changed' }}
+      override: ${{ inputs.override || false }}
+    secrets:
+      repos-token: ${{ secrets.MESHENT_CI_PAT }}
+      packages-token: ${{ secrets.MESHENT_CI_PAT }}
+```
+
+The manifest names repositories; the order is computed, never maintained by hand:
+
+```json
+{
+  "org": "meshent",
+  "repos": [
+    "meshNet.Common", "meshNet.Common.Azure",
+    { "repo": "meshNet.Users", "solution": "meshNet.Users.slnx" },
+    { "repo": "meshNet.Design", "test": false, "pack": false }
+  ],
+  "hosts": [ { "repo": "meshNet", "deploy": "dispatch-deploy", "pins": "exact" } ]
+}
+```
+
+A repository entry is a name, or an object with `solution` (default: the first `*.slnx` or `*.sln` at the root),
+`test` (default true) and `pack` (default true). `hosts` are read and listed in the summary; acting on them (pins,
+deploys) is the next phase.
+
+| input | meaning |
+|---|---|
+| `manifest` | path of the manifest in the calling repository |
+| `dry-run` | default **true**: assemble, test and pack, then upload the local feed as an artifact; publish nothing, push nothing |
+| `branch` | the branch taken from every repository; default `release`. A repository without it fails the run (pass `main` for a rehearsal) |
+| `select` | `changed` (default): repositories whose branch differs from their last `train/*` tag, or that have none; `all` |
+| `override` | run even when `vars.ACTIONS_BUDGET_STATE` is `hard` |
+| `dotnet-version` | default `10.0.x` |
+| `feed` | the feed to publish to; default `https://nuget.pkg.github.com/<owner>/index.json` |
+| secret `repos-token` | reads every repository and, on a real train, pushes `main` and the tag in each |
+| secret `packages-token` | reads the feed during restore, writes it on publish |
+
+**What one train does to a repository.** Packages carry the train's version, `0.0.<days>.<half-seconds>` since
+2020-01-01 UTC, derived once for the run and passed as `VersionBuild`/`VersionRevision`, which the repositories'
+`Directory.Build.props` accepts from CI. The test gate runs from source where the repository has the
+`UseProjectReferences` switch; the tree is cleaned before packing so no switched `obj/` can leak a never-published
+sibling version into a nuspec. Project order inside a repository follows sibling `PackageReference` and
+`ProjectReference` edges; a `PackageId` of `$(MSBuildProjectName)` is understood, other expressions fall back to the
+project name. Web apps and executables are not packed unless they set `IsPackable` true. The local feed is added to
+each repository's `nuget.config` as a mapped source for every manifest package (not committed).
+
+**Before the first real train.** Every repository's own publish workflow must stop triggering on push to `main`
+(dispatch-only is fine), or the train's push republishes with a second stamp. `main` must be an ancestor of the
+train branch in every selected repository: the train refuses to promote when `main` has commits the branch lacks,
+because `main` is written only by the train. Run `dry-run` with `branch: main` and `select: all` first; the run
+summary shows the computed order, every package, and which repositories would be in the train.
+
+## `dotnet-validate.yml` — the one opt-in PR check
+
+For a pull request that carries the `ci:validate` label: one job that restores with a warm cache, runs the test gate
+from source (with the `UseProjectReferences` switch when the repository has it) and packs every packable project
+into a throwaway folder. Publishes nothing. Inputs: `solution` (default: the first solution at the root), `pack`
+(default true), `dotnet-version`; secret `packages-token` (optional, falls back to `GITHUB_TOKEN`). The caller
+gates it on the label and on the budget:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    if: ${{ vars.ACTIONS_BUDGET_STATE != 'hard' && vars.ACTIONS_BUDGET_STATE != 'soft' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:validate')) }}
+    uses: meshent/merryn-github/.github/workflows/dotnet-validate.yml@main
+    secrets:
+      packages-token: ${{ secrets.MESHENT_CI_PAT }}
+```
+
 ## `actions-budget-gate.yml` — throttle before GitHub locks the organization out
 
 Reads the organization's Actions usage for the month and sets one organization-level variable,
@@ -111,9 +218,9 @@ start on `hard` unless dispatched with an override.
 
 ## Planned: release trains and an Actions budget
 
-[docs/release-trains.md](docs/release-trains.md) is the plan for `dotnet-release-train.yml` (one scheduled run that
-builds, tests, packs and publishes every repository of a tenant in dependency order, then pins and deploys its hosts),
-`dotnet-validate.yml` (the one opt-in PR check); `actions-budget-gate.yml` above is the first piece to land.
+[docs/release-trains.md](docs/release-trains.md) is the plan the three workflows above come from. Still to come:
+the train's host phase (exact pins maintained by the train, host builds inside the train, deploys), and the Merryn
+side (train membership on items, the train's release record, the budget steward).
 Filed as work on the meshNet and Mira boards.
 
 ## Versioning
