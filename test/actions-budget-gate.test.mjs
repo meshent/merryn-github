@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 
-const yaml = readFileSync(new URL('../.github/workflows/actions-budget-gate.yml', import.meta.url), 'utf8');
+const yaml = readFileSync(new URL('../.github/workflows/actions-budget-gate.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const script = yaml.split('          script: |\n')[1].split('\n').map(line => line.replace(/^            /, '')).join('\n');
 const run = new (Object.getPrototypeOf(async function() {}).constructor)('github', 'core', 'process', 'Date', 'fetch', 'AbortSignal', script);
 const clock = class extends Date { constructor(...args) { super(...(args.length ? args : ['2026-10-08T12:00:00Z'])); } };
