@@ -1,27 +1,42 @@
-# Reusable: the one opt-in validation of a .NET repository, for a pull request that carries the ci:validate label.
-# One job: restore with a warm cache, run the test gate from source (-p:UseProjectReferences=true when the
-# repository's Directory.Build.targets has the switch), then pack every packable project into a throwaway folder
-# to prove the nuspecs. Publishes nothing. Replaces the per-package fan-out that used to run on every PR.
-# See docs/release-trains.md section 4; the caller gates it on the label and the budget (README).
-name: Validate .NET repository (reusable)
+# Reusable: the one opt-in PR validation job for a .NET package repository.
+#
+# PRs run nothing by default; a PR labelled `ci:validate` (the label is an input) runs this once: checkout, restore
+# through a NuGet cache, a `dotnet pack` of every packable project into a throwaway folder (proves the nuspecs,
+# publishes nothing), then the repository's tests from source (-p:UseProjectReferences=true where
+# Directory.Build.targets has that switch). Pack runs FIRST, on the untouched tree, because a tree built with the
+# source-graph switch must never be packed; the tests still run when the pack fails, so one run reports both.
+#
+# The job also runs on workflow_dispatch and on any non-PR event the wrapper chooses. On a PR it starts only when the
+# PR carries the label, and on a `labeled` event only when THAT label was added, so tagging a PR with something else
+# starts nothing. It skips while the org's ACTIONS_BUDGET_STATE is `soft` or `hard`: PR validation is the first thing
+# to stop. A newer push to the same PR cancels the run in progress.
+name: dotnet validate (reusable)
 
 on:
   workflow_call:
     inputs:
       solution:
-        description: Solution to test; empty picks the first *.slnx or *.sln at the repository root
+        description: Solution or project to pack and test; empty finds the one *.slnx/*.sln at the repository root
         type: string
         default: ""
-      pack:
-        description: Also pack every packable project into a throwaway folder (proves the nuspecs)
-        type: boolean
-        default: true
+      source-graph:
+        description: "'auto' passes -p:UseProjectReferences=true when Directory.Build.targets defines it; 'true' or 'false' forces it"
+        type: string
+        default: auto
+      test-args:
+        description: Extra arguments for dotnet test, e.g. a --filter
+        type: string
+        default: ""
+      label:
+        description: The PR label that opts a PR in; empty runs on every PR event the wrapper subscribes to
+        type: string
+        default: ci:validate
       dotnet-version:
         type: string
         default: "10.0.x"
     secrets:
       packages-token:
-        description: read:packages on the feed the repository restores from; falls back to GITHUB_TOKEN
+        description: read:packages on the org feed; falls back to the workflow's own token
         required: false
 
 permissions:
@@ -30,9 +45,21 @@ permissions:
 
 jobs:
   validate:
+    if: >-
+      ${{ vars.ACTIONS_BUDGET_STATE != 'hard' && vars.ACTIONS_BUDGET_STATE != 'soft' &&
+      (github.event_name != 'pull_request' || inputs.label == '' ||
+      (contains(github.event.pull_request.labels.*.name, inputs.label) &&
+      (github.event.action != 'labeled' || github.event.label.name == inputs.label))) }}
     runs-on: ubuntu-latest
+    # Per PR (or ref): a newer push cancels the superseded run. An unrelated `labeled` event gets its own group, so
+    # it can never cancel a real run.
+    concurrency:
+      group: validate-${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != inputs.label && format('-{0}', github.run_id) || '' }}
+      cancel-in-progress: true
     env:
       GITHUB_TOKEN: ${{ secrets.packages-token || github.token }}
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +67,8 @@ jobs:
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
 
-      # Not setup-dotnet's cache: that needs packages.lock.json, and a lock file pins every Version="*" reference.
+      # Not setup-dotnet's `cache: true`: that needs packages.lock.json, and a lock file pins every Version="*"
+      # float to its last resolution.
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
@@ -48,32 +76,45 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.*', '**/nuget.config') }}
           restore-keys: nuget-${{ runner.os }}-
 
-      - name: Test from source
+      - name: Find the solution and the source-graph switch
+        id: find
         env:
           SOLUTION: ${{ inputs.solution }}
+          SOURCE_GRAPH: ${{ inputs.source-graph }}
         run: |
-          set -euo pipefail
-          sol="$SOLUTION"
-          [ -n "$sol" ] || sol=$(ls -1 *.slnx *.sln 2>/dev/null | head -1 || true)
-          [ -n "$sol" ] || { echo "::error::no solution at the repository root; pass solution:"; exit 2; }
-          if [ -f Directory.Build.targets ] && grep -q UseProjectReferences Directory.Build.targets; then
-            dotnet test "$sol" --configuration Release -p:UseProjectReferences=true --nologo
-          else
-            dotnet test "$sol" --configuration Release --nologo
+          solution="$SOLUTION"
+          if [ -z "$solution" ]; then
+            mapfile -t found < <(find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) -printf '%f\n' | sort)
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::${#found[@]} solutions at the repository root (${found[*]:-none}); pass the 'solution' input"
+              exit 1
+            fi
+            solution="${found[0]}"
           fi
+          case "$SOURCE_GRAPH" in
+            auto) if [ -f Directory.Build.targets ] && grep -q UseProjectReferences Directory.Build.targets; then switch=true; else switch=false; fi ;;
+            true|false) switch="$SOURCE_GRAPH" ;;
+            *) echo "::error::source-graph must be auto, true or false, not '$SOURCE_GRAPH'"; exit 1 ;;
+          esac
+          echo "solution=$solution" >> "$GITHUB_OUTPUT"
+          echo "switch=$switch" >> "$GITHUB_OUTPUT"
+          echo "Solution $solution; source graph: $switch"
 
-      - name: Pack every packable project (throwaway)
-        if: ${{ inputs.pack }}
+      - name: Pack every project (throwaway folder, nothing published)
+        env:
+          SOLUTION: ${{ steps.find.outputs.solution }}
+        run: dotnet pack "$SOLUTION" -c Release -o "$RUNNER_TEMP/validate-packages"
+
+      - name: Test
+        if: ${{ !cancelled() && steps.find.outcome == 'success' }}
+        env:
+          SOLUTION: ${{ steps.find.outputs.solution }}
+          SWITCH: ${{ steps.find.outputs.switch }}
+          TEST_ARGS: ${{ inputs.test-args }}
         run: |
-          set -euo pipefail
-          # Never pack from a tree built with the switch: clean first so obj/ is restored without it.
-          git clean -xdfq
-          out="$RUNNER_TEMP/pack"
-          while IFS= read -r proj; do
-            case "$proj" in */Tests/*|*/bin/*|*/obj/*) continue;; esac
-            grep -q 'Microsoft.NET.Test.Sdk\|<IsTestProject>true\|<IsPackable>false' "$proj" && continue
-            echo "::group::pack $proj"
-            dotnet pack "$proj" --configuration Release --nologo --output "$out"
-            echo "::endgroup::"
-          done < <(find . -name '*.csproj' -not -path '*/.git/*' | sort)
-          ls -1 "$out" 2>/dev/null || echo "nothing packable"
+          args=(test "$SOLUTION" -c Release)
+          if [ "$SWITCH" = true ]; then args+=(-p:UseProjectReferences=true); fi
+          # Word-split on purpose: test-args is a list of arguments.
+          # shellcheck disable=SC2206
+          args+=($TEST_ARGS)
+          dotnet "${args[@]}"

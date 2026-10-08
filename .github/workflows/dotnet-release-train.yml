@@ -1,404 +1,659 @@
-# Reusable: the release train. One scheduled or dispatched run that builds, tests, packs and publishes every
-# repository of a tenant in dependency order, then promotes each repository's `release` branch to `main` and
-# tags it. Mechanics and rationale: docs/release-trains.md (section 3).
+# Reusable: the release train. One run, one job, every repository in a manifest, in dependency order, one version.
 #
-# One job, one runner, one restore cache, no per-job minute rounding. The phases, in order:
-#   1. assemble  clone every manifest repository at the release branch; read every .csproj; compute the
-#                dependency order across repositories and across projects (a cycle fails the run, named).
-#   2. select    a repository is in the train when its release branch differs from its last train/* tag (or
-#                it has none); `select: all` takes every repository.
-#   3. stamp     one version for the whole train, derived once from the clock the way the repositories'
-#                Directory.Build.props already does (days and half-seconds since 2020-01-01 UTC), passed to
-#                every pack as VersionBuild/VersionRevision. The train id is that version.
-#   4. build     for each selected repository, bottom-up: restore with a LOCAL feed folder added as a mapped
-#                source (so a downstream resolves the upstream packed a minute earlier), run the test gate
-#                from source (-p:UseProjectReferences=true where the repository has the switch), clean, then
-#                pack every packable project in dependency order into the local feed WITHOUT the switch.
-#   5. publish   only when every selected repository passed: push every package in order (skip-duplicate).
-#                Dry-run stops here and uploads the local feed as an artifact instead.
-#   6. promote   fast-forward release to main in each selected repository, tag train/<id>, push.
-#   7. record    the run summary: repositories, packages and versions, the tag.
-# Hosts and pins (manifest `hosts`) are read and listed but not acted on yet; that is the next phase.
+# Call it from a thin wrapper in the tenant's aggregator repository (see README.md), on a schedule plus a dispatch for a
+# hotfix train. The job:
 #
-# IMPORTANT until the per-repository publish workflows are retired: a real (non-dry-run) train pushes `main`
-# in every selected repository, and a repository whose publish workflow still triggers on push to main will
-# republish with its own stamp. Retire those triggers (or make them dispatch-only) before the first real train.
-name: Release train (reusable)
+#   plan     clones every manifest repository at `ref` (default `release`), reads every .csproj, and sorts the
+#            repositories (then the projects inside each) by their package edges: a PackageReference to a package
+#            another manifest repository produces is an edge. A cycle fails the run and names it. A repository is in
+#            the train when `ref` moved since its latest train/* tag (or it has none). The version is derived ONCE
+#            from the clock with Directory.Build.props' formula (UTC, one reading) and is the train id.
+#   build    bottom-up, per selected repository: adds the runner-local feed to its nuget.config (never committed), runs
+#            its tests from source (with -p:UseProjectReferences=true where Directory.Build.targets has that switch),
+#            then packs every packable project WITHOUT the switch, from a copy taken before anything was built, into
+#            the local feed. A downstream repository restores the upstream packed minutes earlier. Every package must
+#            carry the train version and every in-train dependency in its nuspec must name that same version.
+#   publish  only when every selected repository built and passed: pushes each package, in order, --skip-duplicate.
+#   promote  fast-forwards main to `ref` (a plain push, never forced) and tags train/<version> in each repository.
+#   record   writes the run summary and, when merryn-url is set, POSTs the release record.
+#
+# dry-run (the default until the first real train) stops after build and uploads the local feed as an artifact.
+# The job skips while the org's ACTIONS_BUDGET_STATE is `hard`, unless `override` is set (the hotfix reserve).
+name: dotnet release train (reusable)
 
 on:
   workflow_call:
     inputs:
       manifest:
-        description: Path, in the calling repository, of the train manifest (JSON; see README)
+        description: Path to the train manifest in the calling repository
         type: string
-        required: true
-      dry-run:
-        description: Assemble, test and pack only; publish nothing, push nothing; upload the feed as an artifact
-        type: boolean
-        default: true
-      branch:
-        description: The branch the train takes from every repository
+        default: release-train.json
+      ref:
+        description: The branch the train assembles from in every manifest repository
         type: string
         default: release
-      select:
-        description: "changed: repositories whose branch differs from their last train/* tag; all: every repository"
-        type: string
-        default: changed
+      dry-run:
+        description: Build, test and pack into a local feed, upload it as an artifact, publish and promote nothing
+        type: boolean
+        default: true
       override:
-        description: Run even when the organization's Actions budget state is hard
+        description: Run even when vars.ACTIONS_BUDGET_STATE is 'hard' (the hotfix reserve)
         type: boolean
         default: false
       dotnet-version:
         type: string
         default: "10.0.x"
-      feed:
-        description: The NuGet feed packages are published to; empty derives https://nuget.pkg.github.com/<owner>/index.json
-        type: string
-        default: ""
     secrets:
       repos-token:
-        description: Reads every manifest repository and, on a real train, pushes main and the train tag in each (contents read/write on all of them)
+        description: Reads every manifest repository; on a live train also pushes main and train/* tags
         required: true
       packages-token:
-        description: Reads the feed during restore and writes it on publish (read:packages, write:packages)
+        description: read:packages for restore; on a live train also write:packages for the push
         required: true
+      dispatch-token:
+        description: Host deploys (Phase 2; accepted and unused until hosts join the manifest)
+        required: false
+      merryn-token:
+        description: Bearer token for the release record
+        required: false
+      merryn-url:
+        description: Endpoint the release record is POSTed to; unset skips the record
+        required: false
     outputs:
-      train:
-        description: The train id (the version every package carries), or empty when nothing was selected
-        value: ${{ jobs.train.outputs.train }}
-      repositories:
-        description: Space-separated repositories the train took
-        value: ${{ jobs.train.outputs.repositories }}
+      version:
+        description: The train version (also the train id and the train/<version> tag)
+        value: ${{ jobs.train.outputs.version }}
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-train-${{ github.repository_owner }}
-  cancel-in-progress: false
-
 jobs:
   train:
-    if: ${{ inputs.override || vars.ACTIONS_BUDGET_STATE != 'hard' }}
+    if: ${{ vars.ACTIONS_BUDGET_STATE != 'hard' || inputs.override }}
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 180
+    # One train at a time per organization, and a train is never cancelled half-way: a killed publish strands a
+    # half-train on the feed.
+    concurrency:
+      group: release-train-${{ github.repository_owner }}
+      cancel-in-progress: false
     outputs:
-      train: ${{ steps.stamp.outputs.train }}
-      repositories: ${{ steps.select.outputs.repositories }}
+      version: ${{ steps.plan.outputs.version }}
     env:
-      WORK: ${{ github.workspace }}/.train
-      FEED_DIR: ${{ github.workspace }}/.train/feed
+      TRAIN_WORK: ${{ github.workspace }}/_train
+      TRAIN_REF: ${{ inputs.ref }}
+      TRAIN_DRY_RUN: ${{ inputs.dry-run }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: caller
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
 
+      - name: Write the train script
+        run: |
+          cat > "$RUNNER_TEMP/train.py" <<'TRAIN_PY'
+          """dotnet release train: one run, every manifest repository, dependency order, one version stamp.
+
+          Subcommands, run in this order by dotnet-release-train.yml (each reads what the previous one wrote under
+          TRAIN_WORK):
+
+            plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
+                      package edges (a cycle fails, naming it), select the repos whose TRAIN_REF moved since their latest
+                      train/* tag, derive the one version stamp, refuse a repo whose main is not an ancestor of TRAIN_REF
+            build     per selected repo, bottom-up: point its nuget.config at the local feed, run its test gate from
+                      source, pack every packable project (without the source-graph switch, from an untouched copy) into
+                      the local feed, then check every package carries the train version and every in-train dependency
+                      in its nuspec names that same version
+            publish   push every package to the org feed in the same order (only reached when build passed everywhere)
+            promote   fast-forward main to TRAIN_REF and tag train/<version> in each selected repo
+            record    write the run summary and, when MERRYN_URL is set, POST the release record to it
+
+          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_DRY_RUN, REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL,
+          MERRYN_TOKEN; GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and GITHUB_SERVER_URL as Actions sets them.
+          """
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          import zipfile
+          from base64 import b64encode
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          WORK = Path(os.environ.get("TRAIN_WORK", "train")).resolve()
+          SRC, PACK, FEED = WORK / "src", WORK / "pack", WORK / "feed"
+          PLAN = WORK / "plan.json"
+          LOCAL_SOURCE = "train-local"
+          SWITCH = "UseProjectReferences"
+          ITEM_KEY = re.compile(r"\b(?:[a-z][a-z-]*:[A-Z]{1,5}\d+|FEAT-\d{3,5})\b")
+
+
+          class TrainError(Exception):
+              pass
+
+
+          def log(message):
+              print(message, flush=True)
+
+
+          def basic_auth(token):
+              return b64encode(f"x-access-token:{token}".encode()).decode()
+
+
+          def redact(text):
+              """Every secret this script handles, and the git header form of the repos token, replaced by ***. Applied to
+              everything run() prints or raises, so a token never reaches a log even where the runner's masker is absent
+              (a local run) or misses a derived form."""
+              for name in ("REPOS_TOKEN", "PACKAGES_TOKEN", "MERRYN_TOKEN"):
+                  secret = os.environ.get(name, "")
+                  if secret:
+                      text = text.replace(basic_auth(secret), "***").replace(secret, "***")
+              return text
+
+
+          def run(args, cwd=None, capture=False, env=None):
+              shown = redact(" ".join(str(a) for a in args))
+              log(f"$ {shown}")
+              result = subprocess.run([str(a) for a in args], cwd=cwd, text=True, env=env,
+                                      stdout=subprocess.PIPE if capture else None,
+                                      stderr=subprocess.STDOUT if capture else None)
+              if result.returncode != 0:
+                  if capture:
+                      log(redact(result.stdout))
+                  raise TrainError(f"command failed ({result.returncode}): {shown}")
+              return result.stdout if capture else ""
+
+
+          def git(args, cwd=None, capture=False):
+              # The token travels as a per-command header, never in a remote URL, so nothing on disk holds it; run() redacts
+              # it from what it prints.
+              token = os.environ.get("REPOS_TOKEN", "")
+              auth = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth(token)}"] if token else []
+              return run(["git", *auth, *args], cwd=cwd, capture=capture)
+
+
+          def dotnet_env():
+              env = dict(os.environ, DOTNET_NOLOGO="1", DOTNET_CLI_TELEMETRY_OPTOUT="1")
+              # Repo nuget.configs read the GitHub Packages password from %GITHUB_TOKEN%.
+              if os.environ.get("PACKAGES_TOKEN"):
+                  env["GITHUB_TOKEN"] = os.environ["PACKAGES_TOKEN"]
+              return env
+
+
+          # --- Manifest ----------------------------------------------------------------------------------------------------
+
+          def load_manifest(path):
+              data = json.loads(Path(path).read_text())
+              org = data.get("org") or ""
+              if not org:
+                  raise TrainError(f"{path}: 'org' is required")
+              repos = []
+              for entry in data.get("repos", []):
+                  repo = {"repo": entry} if isinstance(entry, str) else dict(entry)
+                  if not repo.get("repo"):
+                      raise TrainError(f"{path}: every repos entry needs a name: {entry!r}")
+                  repos.append({"repo": repo["repo"], "solution": repo.get("solution", ""),
+                                "test": repo.get("test", True), "test-args": repo.get("test-args", "")})
+              names = [r["repo"] for r in repos]
+              if len(set(n.lower() for n in names)) != len(names):
+                  raise TrainError(f"{path}: a repo is listed twice")
+              if not repos:
+                  raise TrainError(f"{path}: no repos")
+              return {"org": org, "repos": repos, "hosts": data.get("hosts", [])}
+
+
+          # --- Reading a repository ----------------------------------------------------------------------------------------
+
+          def clone(org, repo, ref, dest):
+              server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+              # Blobless: the whole commit graph (ancestry, tags, messages) at the cost of one checkout.
+              try:
+                  git(["clone", "--quiet", "--filter=blob:none", "--branch", ref, f"{server}/{org}/{repo}.git", dest])
+              except TrainError:
+                  raise TrainError(f"{repo}: could not clone branch '{ref}'. A train repo needs that branch "
+                                   f"(Phase 1b creates `release` from main in every manifest repo).")
+              return git(["rev-parse", "HEAD"], cwd=dest, capture=True).strip()
+
+
+          def version_key(text):
+              return tuple(int(p) for p in text.split("."))
+
+
+          def latest_train_tag(dest):
+              tags = []
+              for line in git(["tag", "--list", "train/*"], cwd=dest, capture=True).split():
+                  version = line[len("train/"):]
+                  if re.fullmatch(r"\d+(\.\d+){1,3}", version):
+                      tags.append((version_key(version), line))
+              if not tags:
+                  return None
+              name = max(tags)[1]
+              sha = git(["rev-list", "-n", "1", name], cwd=dest, capture=True).strip()
+              return {"tag": name, "sha": sha}
+
+
+          def is_ancestor(dest, ancestor, descendant):
+              return subprocess.run(["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=dest).returncode == 0
+
+
+          def find_projects(dest):
+              return sorted(p for p in Path(dest).rglob("*.csproj")
+                            if not ({"bin", "obj", ".git"} & set(p.relative_to(dest).parts)))
+
+
+          def msbuild_properties(csproj, names):
+              out = run(["dotnet", "msbuild", csproj, "-nologo", *[f"-getProperty:{n}" for n in names]],
+                        capture=True, env=dotnet_env())
+              text = out[out.find("{"):] if len(names) > 1 else out
+              if len(names) == 1:
+                  return {names[0]: text.strip()}
+              return json.loads(text)["Properties"]
+
+
+          def read_csproj(csproj):
+              root = ET.parse(csproj).getroot()
+              packages, projects = set(), set()
+              for el in root.iter():
+                  tag, include = el.tag.split("}")[-1], el.get("Include")
+                  if tag == "PackageReference" and include:
+                      packages.add(include)
+                  elif tag == "ProjectReference" and include:
+                      projects.add(str((Path(csproj).parent / include.replace("\\", "/")).resolve()))
+              return packages, projects
+
+
+          def describe_project(dest, csproj):
+              packages, projects = read_csproj(csproj)
+              props = msbuild_properties(csproj, ["PackageId", "IsPackable", "IsTestProject"])
+              test = props.get("IsTestProject", "").lower() == "true" or "Microsoft.NET.Test.Sdk" in packages
+              packable = props.get("IsPackable", "").lower() != "false" and not test
+              return {"path": str(Path(csproj).relative_to(dest)), "id": props.get("PackageId") or Path(csproj).stem,
+                      "packable": packable, "packages": sorted(packages),
+                      "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest))}
+
+
+          def find_solution(dest, repo):
+              if repo["solution"]:
+                  return repo["solution"]
+              found = sorted(p.name for p in Path(dest).iterdir() if p.suffix in (".slnx", ".sln"))
+              if len(found) == 1:
+                  return found[0]
+              for preferred in (f"{repo['repo']}.slnx", f"{repo['repo']}.sln"):
+                  if preferred in found:
+                      return preferred
+              raise TrainError(f"{repo['repo']}: {len(found)} solutions at the root ({', '.join(found) or 'none'}); "
+                               f"name one with \"solution\" in the manifest")
+
+
+          # --- Ordering ----------------------------------------------------------------------------------------------------
+
+          def toposort(nodes, edges, what):
+              """nodes in dependency order (a dependency before its dependents); edges[n] = what n depends on.
+
+              Ties keep the input order, so the result is deterministic. A cycle raises TrainError naming it."""
+              order, state = [], {}
+
+              def visit(node, path):
+                  if state.get(node) == "done":
+                      return
+                  if state.get(node) == "open":
+                      cycle = path[path.index(node):] + [node]
+                      raise TrainError(f"{what} dependency cycle: {' -> '.join(cycle)}")
+                  state[node] = "open"
+                  for dep in edges.get(node, ()):
+                      visit(dep, path + [node])
+                  state[node] = "done"
+                  order.append(node)
+
+              for node in nodes:
+                  visit(node, [])
+              return order
+
+
+          # --- Stamp -------------------------------------------------------------------------------------------------------
+
+          EPOCH = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+
+          def stamp(now=None):
+              """Directory.Build.props' formula from ONE UTC reading: Build = whole days since 2020-01-01, Revision = half
+              seconds into that day. Passed to every pack as VersionBuild/VersionRevision, so the train has one version."""
+              seconds = int(((now or datetime.now(timezone.utc)) - EPOCH).total_seconds())
+              return seconds // 86400, (seconds % 86400) // 2
+
+
+          def normalized_version(build, revision):
+              # NuGet drops a trailing zero revision: 0.0.2471.0 is published (and named) 0.0.2471.
+              return f"0.0.{build}.{revision}" if revision else f"0.0.{build}"
+
+
+          # --- nuget.config ------------------------------------------------------------------------------------------------
+
+          def point_at_local_feed(dest, train_ids):
+              """Add the local feed to the repo's nuget.config (in the runner's copy only) so a downstream restores the
+              upstream packed minutes ago. Under packageSourceMapping, each train package id is mapped to the local feed
+              AND to the GitHub source: an exact id pattern outranks `meshNet.*`, so without the second entry an exact pin
+              on an older version could no longer resolve. Floats take the highest version, which is the train's."""
+              config = Path(dest) / "nuget.config"
+              if not config.exists():
+                  config.write_text('<?xml version="1.0" encoding="utf-8"?>\n<configuration><packageSources>'
+                                    '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />'
+                                    '</packageSources></configuration>\n')
+              tree = ET.parse(config)
+              root = tree.getroot()
+              sources = root.find("packageSources")
+              if sources is None:
+                  sources = ET.SubElement(root, "packageSources")
+              for existing in [e for e in sources if e.get("key") == LOCAL_SOURCE]:
+                  sources.remove(existing)
+              ET.SubElement(sources, "add", key=LOCAL_SOURCE, value=str(FEED))
+              mapping = root.find("packageSourceMapping")
+              if mapping is not None:
+                  github_keys = [e.get("key") for e in sources
+                                 if e.tag == "add" and "nuget.pkg.github.com" in (e.get("value") or "")]
+                  for key in [LOCAL_SOURCE, *github_keys]:
+                      source = next((s for s in mapping if s.get("key") == key), None)
+                      if source is None:
+                          source = ET.SubElement(mapping, "packageSource", key=key)
+                      have = {p.get("pattern") for p in source}
+                      for package_id in sorted(train_ids):
+                          if package_id not in have:
+                              ET.SubElement(source, "package", pattern=package_id)
+              tree.write(config, encoding="utf-8", xml_declaration=True)
+
+
+          # --- Checking what was packed ------------------------------------------------------------------------------------
+
+          def nuspec_of(nupkg):
+              with zipfile.ZipFile(nupkg) as z:
+                  name = next(n for n in z.namelist() if n.endswith(".nuspec") and "/" not in n)
+                  root = ET.fromstring(z.read(name))
+              ns = {"n": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else {}
+              find = (lambda e, p: e.findall(f".//n:{p}", ns)) if ns else (lambda e, p: e.findall(f".//{p}"))
+              meta = find(root, "metadata")[0]
+              get = (lambda tag: meta.find(f"n:{tag}", ns).text) if ns else (lambda tag: meta.find(tag).text)
+              deps = [(d.get("id"), d.get("version")) for d in find(root, "dependency")]
+              return get("id"), get("version"), deps
+
+
+          def lower_bound(version_range):
+              text = (version_range or "").strip()
+              return text.strip("[(").split(",")[0].strip()
+
+
+          def find_package(package_id, version):
+              wanted = f"{package_id}.{version}.nupkg".lower()
+              match = [p for p in FEED.glob("*.nupkg") if p.name.lower() == wanted]
+              if not match:
+                  raise TrainError(f"{package_id}: no {package_id}.{version}.nupkg in the local feed; the project did not "
+                                   f"take the train stamp (its Directory.Build.props must accept VersionBuild/VersionRevision)")
+              return match[0]
+
+
+          def check_package(package_id, version, train_ids):
+              nupkg = find_package(package_id, version)
+              nid, nversion, deps = nuspec_of(nupkg)
+              if nversion != version:
+                  raise TrainError(f"{nupkg.name}: nuspec version {nversion}, expected the train version {version}")
+              wrong = [(d, v) for d, v in deps if d in train_ids and lower_bound(v) != version]
+              if wrong:
+                  raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in wrong)}, not the train "
+                                   f"version {version}; it restored a sibling from outside this train")
+              return {"id": nid, "version": nversion, "file": nupkg.name,
+                      "dependencies": [f"{d} {v}" for d, v in deps if d in train_ids]}
+
+
+          # --- Subcommands -------------------------------------------------------------------------------------------------
+
+          def cmd_plan():
+              manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
+              ref = os.environ.get("TRAIN_REF", "release")
+              if WORK.exists():
+                  shutil.rmtree(WORK)
+              SRC.mkdir(parents=True)
+              FEED.mkdir(parents=True)
+
+              repos = {}
+              for repo in manifest["repos"]:
+                  name = repo["repo"]
+                  dest = SRC / name
+                  sha = clone(manifest["org"], name, ref, dest)
+                  tag = latest_train_tag(dest)
+                  main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
+                  log(f"{name}: {ref} {sha[:12]}, main {main[:12]}, latest train tag {tag['tag'] if tag else '(none)'}")
+                  projects = [describe_project(dest, p) for p in find_projects(dest)]
+                  repos[name] = {**repo, "sha": sha, "main": main, "tag": tag, "projects": projects,
+                                 "selected": tag is None or tag["sha"] != sha,
+                                 "reason": "no train tag yet" if tag is None else
+                                           (f"{ref} moved since {tag['tag']}" if tag["sha"] != sha else f"unchanged since {tag['tag']}")}
+
+              owner = {}
+              for name, repo in repos.items():
+                  for project in repo["projects"]:
+                      if project["packable"]:
+                          if project["id"] in owner and owner[project["id"]] != name:
+                              raise TrainError(f"package {project['id']} is produced by both {owner[project['id']]} and {name}")
+                          owner[project["id"]] = name
+
+              repo_edges = {name: sorted({owner[p] for project in repo["projects"] for p in project["packages"]
+                                          if p in owner and owner[p] != name})
+                            for name, repo in repos.items()}
+              repo_order = toposort(list(repos), repo_edges, "repository")
+
+              for name, repo in repos.items():
+                  by_path = {p["path"]: p for p in repo["projects"]}
+                  own = {p["id"]: p["path"] for p in repo["projects"] if p["packable"]}
+                  edges = {p["path"]: sorted({own[i] for i in p["packages"] if i in own} | set(p["projects"]) & set(by_path))
+                           for p in repo["projects"]}
+                  repo["project_order"] = [path for path in toposort(list(by_path), edges, f"{name} project")
+                                           if by_path[path]["packable"]]
+
+              selected = [n for n in repo_order if repos[n]["selected"]]
+              for name in selected:
+                  repo = repos[name]
+                  if not is_ancestor(SRC / name, repo["main"], repo["sha"]):
+                      raise TrainError(f"{name}: main ({repo['main'][:12]}) is not an ancestor of {ref} ({repo['sha'][:12]}), "
+                                       f"so the train could publish it but never fast-forward main. Merge main into {ref} first.")
+                  repo["solution_file"] = find_solution(SRC / name, repo) if repo["test"] else ""
+                  repo["source_graph"] = SWITCH in ((SRC / name / "Directory.Build.targets").read_text()
+                                                    if (SRC / name / "Directory.Build.targets").exists() else "")
+                  repo["items"] = sorted(set(ITEM_KEY.findall(git(
+                      ["log", "--format=%B", f"{repo['tag']['sha']}..{repo['sha']}" if repo["tag"] else repo["sha"],
+                       *([] if repo["tag"] else ["-n", "200"])], cwd=SRC / name, capture=True))))
+
+              build, revision = stamp()
+              version = normalized_version(build, revision)
+              train_ids = sorted(p["id"] for n in selected for p in repos[n]["projects"] if p["packable"])
+              plan = {"org": manifest["org"], "ref": ref, "version": version, "build": build, "revision": revision,
+                      "dry_run": os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false",
+                      "repo_order": repo_order, "selected": selected, "train_ids": train_ids,
+                      "repo_edges": repo_edges, "repos": repos, "hosts": manifest["hosts"], "packages": [], "promoted": []}
+              PLAN.write_text(json.dumps(plan, indent=2))
+
+              log(f"\nTrain {version} ({'dry run' if plan['dry_run'] else 'live'}), ref {ref}")
+              log(f"Repository order: {' -> '.join(repo_order)}")
+              for name in repo_order:
+                  deps = ", ".join(repo_edges[name]) or "nothing in the manifest"
+                  log(f"  {'*' if repos[name]['selected'] else ' '} {name}: {repos[name]['reason']}; depends on {deps}")
+              output("version", version)
+              output("selected", ",".join(selected))
+              if not selected:
+                  log("Nothing moved since the last train; nothing to build.")
+
+
+          def cmd_build():
+              plan = json.loads(PLAN.read_text())
+              train_ids = set(plan["train_ids"])
+              version, env = plan["version"], dotnet_env()
+              PACK.mkdir(exist_ok=True)
+              packages = []
+              for name in plan["selected"]:
+                  repo = plan["repos"][name]
+                  src, pack = SRC / name, PACK / name
+                  log(f"::group::{name}")
+                  # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
+                  if pack.exists():
+                      shutil.rmtree(pack)
+                  shutil.copytree(src, pack, symlinks=True)
+                  for tree in (src, pack):
+                      point_at_local_feed(tree, train_ids)
+                  if repo["test"]:
+                      args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
+                      if repo["source_graph"]:
+                          args.append(f"-p:{SWITCH}=true")
+                      args += repo["test-args"].split() if repo["test-args"] else []
+                      run(args, cwd=src, env=env)
+                  else:
+                      log(f"{name}: tests skipped (\"test\": false in the manifest)")
+                  for path in repo["project_order"]:
+                      run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
+                           f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
+                           "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
+                  for path in repo["project_order"]:
+                      project = next(p for p in repo["projects"] if p["path"] == path)
+                      packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
+                  log("::endgroup::")
+                  log(f"{name}: {len(repo['project_order'])} package(s) at {version}")
+              plan["packages"] = packages
+              PLAN.write_text(json.dumps(plan, indent=2))
+
+
+          def cmd_publish():
+              plan = json.loads(PLAN.read_text())
+              source = f"https://nuget.pkg.github.com/{plan['org']}/index.json"
+              for package in plan["packages"]:
+                  run(["dotnet", "nuget", "push", FEED / package["file"], "--source", source,
+                       "--api-key", os.environ["PACKAGES_TOKEN"], "--skip-duplicate", "--no-symbols"], env=dotnet_env())
+
+
+          def cmd_promote():
+              plan = json.loads(PLAN.read_text())
+              tag = f"train/{plan['version']}"
+              for name in plan["selected"]:
+                  repo, dest = plan["repos"][name], SRC / name
+                  if repo["main"] != repo["sha"]:
+                      # A plain push: the remote refuses anything but a fast-forward. Never forced.
+                      git(["push", "origin", f"{repo['sha']}:refs/heads/main"], cwd=dest)
+                  run(["git", "-c", "user.name=release-train", "-c", "user.email=release-train@users.noreply.github.com",
+                       "tag", "-a", tag, repo["sha"], "-m", f"Release train {plan['version']}"], cwd=dest)
+                  git(["push", "origin", f"refs/tags/{tag}"], cwd=dest)
+                  plan["promoted"].append(name)
+                  PLAN.write_text(json.dumps(plan, indent=2))
+
+
+          def cmd_record():
+              if not PLAN.exists():
+                  log("No plan was written; nothing to record.")
+                  return
+              plan = json.loads(PLAN.read_text())
+              mode = "dry run" if plan["dry_run"] else "live"
+              lines = [f"## Release train {plan['version']} ({mode})", "",
+                       f"Ref `{plan['ref']}`. Order: {' → '.join(plan['repo_order'])}.", "",
+                       "| repo | in train | why | depends on | items |", "|---|---|---|---|---|"]
+              for name in plan["repo_order"]:
+                  repo = plan["repos"][name]
+                  lines.append(f"| {name} | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
+                               f"{', '.join(plan['repo_edges'][name]) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
+              if plan["packages"]:
+                  lines += ["", "| package | version | in-train dependencies |", "|---|---|---|"]
+                  lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
+              if plan["promoted"]:
+                  lines += ["", f"Promoted (main fast-forwarded, tagged `train/{plan['version']}`): {', '.join(plan['promoted'])}."]
+              text = "\n".join(lines) + "\n"
+              log(text)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write(text)
+              url = os.environ.get("MERRYN_URL", "")
+              # Only a train that published AND promoted is a release; a failed or dry run is reported in the summary only.
+              if url and not plan["dry_run"] and os.environ.get("TRAIN_JOB_STATUS", "success") == "success" and plan["promoted"]:
+                  record = {"release": plan["version"], "org": plan["org"], "ref": plan["ref"],
+                            "repos": [{"repo": n, "sha": plan["repos"][n]["sha"], "items": plan["repos"][n].get("items", [])}
+                                      for n in plan["selected"]],
+                            "packages": [{"id": p["id"], "version": p["version"]} for p in plan["packages"]],
+                            "promoted": plan["promoted"], "run": os.environ.get("TRAIN_RUN_URL", "")}
+                  request = urllib.request.Request(url, data=json.dumps(record).encode(), method="POST", headers={
+                      "Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('MERRYN_TOKEN', '')}"})
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          log(f"Recorded in Merryn: HTTP {response.status}")
+                  except Exception as error:  # the record is a report; a failure to file it must not fail a published train
+                      log(f"::warning::Could not record the train in Merryn: {error}")
+
+
+          def output(key, value):
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(f"{key}={value}\n")
+
+
+          COMMANDS = {"plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote, "record": cmd_record}
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+                  sys.exit(f"usage: train.py {{{'|'.join(COMMANDS)}}}")
+              try:
+                  COMMANDS[sys.argv[1]]()
+              except TrainError as error:
+                  print(f"::error::{redact(str(error))}", flush=True)
+                  sys.exit(1)
+          TRAIN_PY
+
+      - name: Plan (clone, sort, select, stamp)
+        id: plan
+        env:
+          TRAIN_MANIFEST: caller/${{ inputs.manifest }}
+          REPOS_TOKEN: ${{ secrets.repos-token }}
+          PACKAGES_TOKEN: ${{ secrets.packages-token }}
+        run: python3 "$RUNNER_TEMP/train.py" plan
+
+      # Keyed on the cloned repositories' project files (no packages.lock.json: a lock file would pin every
+      # Version="*" float to its last resolution).
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
-          key: nuget-train-${{ runner.os }}-${{ hashFiles(inputs.manifest) }}-${{ github.run_id }}
-          restore-keys: |
-            nuget-train-${{ runner.os }}-${{ hashFiles(inputs.manifest) }}-
-            nuget-train-${{ runner.os }}-
+          key: nuget-${{ runner.os }}-train-${{ hashFiles('_train/src/**/*.csproj', '_train/src/**/Directory.Build.*', '_train/src/**/nuget.config') }}
+          restore-keys: nuget-${{ runner.os }}-train-
 
-      - name: Read the manifest
-        id: manifest
-        env:
-          MANIFEST: ${{ inputs.manifest }}
-        run: |
-          set -euo pipefail
-          [ -f "$MANIFEST" ] || { echo "::error::no such manifest: $MANIFEST"; exit 2; }
-          jq -e '.repos | length > 0' "$MANIFEST" >/dev/null || { echo "::error::$MANIFEST has no repos"; exit 2; }
-          org=$(jq -r '.org // empty' "$MANIFEST"); [ -n "$org" ] || org="${GITHUB_REPOSITORY_OWNER}"
-          echo "org=$org" >> "$GITHUB_OUTPUT"
-          echo "count=$(jq '.repos | length' "$MANIFEST")" >> "$GITHUB_OUTPUT"
-          mkdir -p "$WORK/repos" "$FEED_DIR"
-          cp "$MANIFEST" "$WORK/manifest.json"
-
-      - name: Clone every repository at the train branch
-        env:
-          GH_TOKEN: ${{ secrets.repos-token }}
-          ORG: ${{ steps.manifest.outputs.org }}
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          set -euo pipefail
-          gh auth setup-git
-          for name in $(jq -r '.repos[] | if type == "string" then . else .repo end' "$WORK/manifest.json"); do
-            echo "::group::clone $ORG/$name@$BRANCH"
-            git clone --quiet --branch "$BRANCH" "https://github.com/$ORG/$name" "$WORK/repos/$name" \
-              || { echo "::error::$ORG/$name has no branch '$BRANCH' (create it from main, or pass branch: main for a dry run)"; exit 2; }
-            git -C "$WORK/repos/$name" fetch --quiet --tags origin
-            echo "::endgroup::"
-          done
-
-      - name: Compute the dependency order
-        id: graph
-        run: |
-          set -euo pipefail
-          cat > "$WORK/graph.py" <<'PY'
-          import json, os, re, sys, xml.etree.ElementTree as ET
-          work, manifest_path, out_path = sys.argv[1:4]
-          manifest = json.load(open(manifest_path))
-          repos = []
-          for entry in manifest["repos"]:
-              e = {"repo": entry} if isinstance(entry, str) else dict(entry)
-              e.setdefault("test", True); e.setdefault("pack", True); e.setdefault("solution", "")
-              repos.append(e)
-          SKIP = re.compile(r"(^|/)(bin|obj|\.git|\.worktrees|_wt|node_modules)(/|$)")
-          projects = {}            # (repo, csproj path) -> {id, refs, test, packable}
-          package_owner = {}       # package id -> (repo, csproj)
-          for e in repos:
-              root = os.path.join(work, "repos", e["repo"])
-              for dirpath, dirnames, filenames in os.walk(root):
-                  rel = os.path.relpath(dirpath, root)
-                  if SKIP.search(rel.replace(os.sep, "/") + "/"): dirnames[:] = []; continue
-                  for f in filenames:
-                      if not f.endswith(".csproj"): continue
-                      path = os.path.join(dirpath, f)
-                      try: tree = ET.parse(path)
-                      except ET.ParseError as ex: print(f"::warning::{path}: {ex}"); continue
-                      r = tree.getroot()
-                      text = lambda tag: next((x.text.strip() for x in r.iter(tag) if x.text), "")
-                      stem = f[:-7]
-                      # PackageId is usually absent (the stem) or the expression $(MSBuildProjectName); any other
-                      # expression cannot be evaluated here and falls back to the stem.
-                      pkg_id = text("PackageId").replace("$(MSBuildProjectName)", stem) or stem
-                      if "$(" in pkg_id: pkg_id = stem
-                      refs = [x.get("Include") for x in r.iter("PackageReference") if x.get("Include")]
-                      projrefs = [x.get("Include") for x in r.iter("ProjectReference") if x.get("Include")]
-                      is_test = (text("IsTestProject").lower() == "true" or "Microsoft.NET.Test.Sdk" in refs
-                                 or "/Tests/" in ("/" + rel.replace(os.sep, "/") + "/"))
-                      # A host (web app or executable) is not a package unless it says IsPackable=true itself.
-                      is_host = ".Web" in (r.get("Sdk") or "") or text("OutputType").lower() == "exe"
-                      packable_said = text("IsPackable").lower()
-                      packable = e["pack"] and not is_test and packable_said != "false" and (not is_host or packable_said == "true")
-                      projects[(e["repo"], os.path.relpath(path, root))] = {
-                          "id": pkg_id, "refs": refs, "projrefs": projrefs, "test": is_test, "packable": packable}
-                      if packable:
-                          if pkg_id in package_owner and package_owner[pkg_id][0] != e["repo"]:
-                              print(f"::error::package {pkg_id} is produced by two repositories: {package_owner[pkg_id][0]} and {e['repo']}"); sys.exit(2)
-                          package_owner[pkg_id] = (e["repo"], os.path.relpath(path, root))
-          # repo graph
-          names = [e["repo"] for e in repos]
-          edges = {n: set() for n in names}
-          for (repo, path), p in projects.items():
-              if not p["packable"] and p["test"]: continue
-              for ref in p["refs"]:
-                  owner = package_owner.get(ref)
-                  if owner and owner[0] != repo: edges[repo].add(owner[0])
-          def topo(nodes, deps):
-              order, state = [], {n: 0 for n in nodes}
-              def visit(n, stack):
-                  if state[n] == 2: return
-                  if state[n] == 1:
-                      cycle = stack[stack.index(n):] + [n]
-                      print("::error::dependency cycle: " + " -> ".join(cycle)); sys.exit(2)
-                  state[n] = 1; stack.append(n)
-                  for d in sorted(deps[n], key=lambda x: nodes.index(x) if x in nodes else 1e9): visit(d, stack)
-                  stack.pop(); state[n] = 2; order.append(n)
-              for n in nodes: visit(n, [])
-              return order
-          repo_order = topo(names, edges)
-          # project order within each repo (sibling edges: PackageReference to a sibling id, or ProjectReference)
-          result = []
-          for name in repo_order:
-              e = next(x for x in repos if x["repo"] == name)
-              mine = {path: p for (r, path), p in projects.items() if r == name and p["packable"]}
-              id_to_path = {p["id"]: path for path, p in mine.items()}
-              deps = {}
-              for path, p in mine.items():
-                  d = set()
-                  for ref in p["refs"]:
-                      if ref in id_to_path and id_to_path[ref] != path: d.add(id_to_path[ref])
-                  for pr in p["projrefs"]:
-                      target = os.path.normpath(os.path.join(os.path.dirname(path), pr.replace("\\", "/")))
-                      if target in mine and target != path: d.add(target)
-                  deps[path] = d
-              proj_order = topo(sorted(mine), deps)
-              root = os.path.join(work, "repos", name)
-              sol = e["solution"]
-              if not sol:
-                  cands = sorted(f for f in os.listdir(root) if f.endswith((".slnx", ".sln")))
-                  sol = cands[0] if cands else ""
-              targets = os.path.join(root, "Directory.Build.targets")
-              has_switch = os.path.exists(targets) and "UseProjectReferences" in open(targets, encoding="utf-8", errors="ignore").read()
-              result.append({"repo": name, "solution": sol, "test": bool(e["test"]) and bool(sol), "switch": has_switch,
-                             "depends_on": sorted(edges[name]),
-                             "projects": [{"path": p, "id": mine[p]["id"]} for p in proj_order]})
-          all_ids = sorted(package_owner)
-          json.dump({"order": result, "packages": all_ids}, open(out_path, "w"), indent=2)
-          print("Repository order: " + " -> ".join(r["repo"] for r in result))
-          for r in result:
-              print(f"  {r['repo']}: {len(r['projects'])} packages; solution={r['solution'] or '<none>'}; source-graph switch={r['switch']}; depends on {r['depends_on'] or 'nothing in the manifest'}")
-          PY
-          python3 -I "$WORK/graph.py" "$WORK" "$WORK/manifest.json" "$WORK/graph.json"
-          echo "packages=$(jq -r '.packages | join(" ")' "$WORK/graph.json")" >> "$GITHUB_OUTPUT"
-
-      - name: Select the repositories in this train
-        id: select
-        env:
-          SELECT: ${{ inputs.select }}
-        run: |
-          set -euo pipefail
-          selected=""
-          for name in $(jq -r '.order[].repo' "$WORK/graph.json"); do
-            r="$WORK/repos/$name"
-            head=$(git -C "$r" rev-parse HEAD)
-            last=$(git -C "$r" tag -l 'train/*' --sort=-v:refname | head -1)
-            if [ "$SELECT" = "all" ]; then why="select=all"
-            elif [ -z "$last" ]; then why="no train tag yet"
-            elif [ "$(git -C "$r" rev-parse "$last^{commit}")" = "$head" ]; then echo "  $name: unchanged since $last"; continue
-            else why="changed since $last ($(git -C "$r" rev-list --count "$last..HEAD") commits)"; fi
-            echo "  $name: IN ($why)"; selected="$selected $name"
-          done
-          selected=${selected# }
-          echo "repositories=$selected" >> "$GITHUB_OUTPUT"
-          [ -n "$selected" ] || echo "::notice::Nothing has changed since the last train; nothing to build."
-
-      - name: Stamp the train
-        id: stamp
-        if: ${{ steps.select.outputs.repositories != '' }}
-        run: |
-          set -euo pipefail
-          now=$(date -u +%s); epoch=$(date -u -d 2020-01-01T00:00:00Z +%s)
-          secs=$(( now - epoch )); build=$(( secs / 86400 )); revision=$(( (secs % 86400) / 2 ))
-          echo "build=$build" >> "$GITHUB_OUTPUT"; echo "revision=$revision" >> "$GITHUB_OUTPUT"
-          echo "train=0.0.$build.$revision" >> "$GITHUB_OUTPUT"
-          echo "Train 0.0.$build.$revision"
-
-      - name: Build, test and pack, bottom-up, into the local feed
-        if: ${{ steps.select.outputs.repositories != '' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.packages-token }}
-          SELECTED: ${{ steps.select.outputs.repositories }}
-          VBUILD: ${{ steps.stamp.outputs.build }}
-          VREVISION: ${{ steps.stamp.outputs.revision }}
-          PACKAGES: ${{ steps.graph.outputs.packages }}
-        run: |
-          set -euo pipefail
-          cat > "$WORK/feedconfig.py" <<'PY'
-          # Add the local train feed to a repository's nuget.config as a mapped source for every manifest package,
-          # so restore resolves a sibling packed a minute ago before it looks at the public feed. Not committed.
-          import os, sys, xml.etree.ElementTree as ET
-          root, feed, packages = sys.argv[1], sys.argv[2], sys.argv[3].split()
-          path = os.path.join(root, "nuget.config")
-          if not os.path.exists(path): path = os.path.join(root, "NuGet.Config")
-          if os.path.exists(path):
-              tree = ET.parse(path); cfg = tree.getroot()
-          else:
-              cfg = ET.Element("configuration"); tree = ET.ElementTree(cfg); path = os.path.join(root, "nuget.config")
-              ps = ET.SubElement(cfg, "packageSources"); ET.SubElement(ps, "add", key="nuget.org", value="https://api.nuget.org/v3/index.json")
-          sources = cfg.find("packageSources")
-          if sources is None: sources = ET.SubElement(cfg, "packageSources")
-          for a in list(sources.findall("add")):
-              if a.get("key") == "train": sources.remove(a)
-          ET.SubElement(sources, "add", key="train", value=feed)
-          mapping = cfg.find("packageSourceMapping")
-          if mapping is not None:
-              for s in list(mapping.findall("packageSource")):
-                  if s.get("key") == "train": mapping.remove(s)
-              s = ET.SubElement(mapping, "packageSource", key="train")
-              prefixes = sorted({p.split(".")[0] + ".*" for p in packages})
-              for pat in prefixes + packages: ET.SubElement(s, "package", pattern=pat)
-          tree.write(path, encoding="utf-8", xml_declaration=True)
-          PY
-          for name in $SELECTED; do
-            r="$WORK/repos/$name"
-            cfg=$(jq -c --arg n "$name" '.order[] | select(.repo == $n)' "$WORK/graph.json")
-            sol=$(jq -r '.solution' <<<"$cfg"); test=$(jq -r '.test' <<<"$cfg"); switch=$(jq -r '.switch' <<<"$cfg")
-            echo "::group::$name: feed config"
-            python3 -I "$WORK/feedconfig.py" "$r" "$FEED_DIR" "$PACKAGES"
-            echo "::endgroup::"
-            if [ "$test" = "true" ]; then
-              echo "::group::$name: test ($sol, source graph: $switch)"
-              if [ "$switch" = "true" ]; then
-                (cd "$r" && dotnet test "$sol" --configuration Release -p:UseProjectReferences=true --nologo)
-              else
-                (cd "$r" && dotnet test "$sol" --configuration Release --nologo)
-              fi
-              echo "::endgroup::"
-              # Never pack from a tree built with the switch: a switched obj/ records never-published sibling versions.
-              (cd "$r" && git clean -xdfq -e nuget.config -e NuGet.Config)
-            fi
-            for proj in $(jq -r '.projects[].path' <<<"$cfg"); do
-              echo "::group::$name: pack $proj"
-              (cd "$r" && dotnet pack "$proj" --configuration Release --nologo --output "$FEED_DIR" \
-                 -p:VersionBuild="$VBUILD" -p:VersionRevision="$VREVISION" -p:ContinuousIntegrationBuild=true)
-              echo "::endgroup::"
-            done
-          done
-          echo "Local feed:"; ls -1 "$FEED_DIR"
-
-      - name: Upload the local feed (dry run)
-        if: ${{ inputs.dry-run && steps.select.outputs.repositories != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: train-${{ steps.stamp.outputs.train }}-feed
-          path: ${{ env.FEED_DIR }}
-          retention-days: 7
-
-      - name: Publish every package, in order
-        if: ${{ !inputs.dry-run && steps.select.outputs.repositories != '' }}
+      - name: Build, test and pack into the local feed
+        if: ${{ steps.plan.outputs.selected != '' }}
         env:
           PACKAGES_TOKEN: ${{ secrets.packages-token }}
-          FEED: ${{ inputs.feed }}
-          SELECTED: ${{ steps.select.outputs.repositories }}
-          TRAIN: ${{ steps.stamp.outputs.train }}
-        run: |
-          set -euo pipefail
-          [ -n "$FEED" ] || FEED="https://nuget.pkg.github.com/${GITHUB_REPOSITORY_OWNER}/index.json"
-          for name in $SELECTED; do
-            for id in $(jq -r --arg n "$name" '.order[] | select(.repo == $n) | .projects[].id' "$WORK/graph.json"); do
-              f="$FEED_DIR/$id.$TRAIN.nupkg"
-              [ -f "$f" ] || { echo "::error::expected $f after packing $name"; exit 2; }
-              dotnet nuget push "$f" --source "$FEED" --api-key "$PACKAGES_TOKEN" --skip-duplicate
-            done
-          done
+        run: python3 "$RUNNER_TEMP/train.py" build
 
-      - name: Promote release to main and tag the train
-        if: ${{ !inputs.dry-run && steps.select.outputs.repositories != '' }}
+      - name: Upload the local feed (dry run)
+        if: ${{ inputs.dry-run && steps.plan.outputs.selected != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-train-${{ steps.plan.outputs.version }}
+          path: _train/feed/*.nupkg
+          retention-days: 7
+
+      - name: Publish
+        if: ${{ !inputs.dry-run && steps.plan.outputs.selected != '' }}
         env:
-          GH_TOKEN: ${{ secrets.repos-token }}
-          SELECTED: ${{ steps.select.outputs.repositories }}
-          TRAIN: ${{ steps.stamp.outputs.train }}
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          set -euo pipefail
-          for name in $SELECTED; do
-            r="$WORK/repos/$name"
-            git -C "$r" fetch --quiet origin main
-            if ! git -C "$r" merge-base --is-ancestor origin/main HEAD; then
-              echo "::error::$name: main has commits that are not on $BRANCH; main is written only by the train. Merge main into $BRANCH and run again."; exit 2
-            fi
-            git -C "$r" -c user.name="release-train" -c user.email="release-train@users.noreply.github.com" tag -a "train/$TRAIN" -m "Release train $TRAIN"
-            git -C "$r" push --quiet origin "HEAD:refs/heads/main" "refs/tags/train/$TRAIN"
-            echo "$name: main -> $(git -C "$r" rev-parse --short HEAD), tagged train/$TRAIN"
-          done
+          PACKAGES_TOKEN: ${{ secrets.packages-token }}
+        run: python3 "$RUNNER_TEMP/train.py" publish
+
+      - name: Promote (fast-forward main, tag train/<version>)
+        if: ${{ !inputs.dry-run && steps.plan.outputs.selected != '' }}
+        env:
+          REPOS_TOKEN: ${{ secrets.repos-token }}
+        run: python3 "$RUNNER_TEMP/train.py" promote
 
       - name: Record
         if: ${{ always() }}
         env:
-          SELECTED: ${{ steps.select.outputs.repositories }}
-          TRAIN: ${{ steps.stamp.outputs.train }}
-          DRY: ${{ inputs.dry-run }}
-        run: |
-          {
-            echo "## Release train ${TRAIN:-<nothing selected>}$([ "$DRY" = "true" ] && echo ' (dry run)')"
-            echo
-            if [ -f "$WORK/graph.json" ]; then
-              echo "| repository | in train | packages | depends on |"; echo "|---|---|---|---|"
-              for name in $(jq -r '.order[].repo' "$WORK/graph.json"); do
-                in=no; case " $SELECTED " in *" $name "*) in=yes;; esac
-                echo "| $name | $in | $(jq -r --arg n "$name" '.order[] | select(.repo == $n) | .projects | map(.id) | join(", ")' "$WORK/graph.json") | $(jq -r --arg n "$name" '.order[] | select(.repo == $n) | .depends_on | join(", ")' "$WORK/graph.json") |"
-              done
-              echo
-              if [ -d "$FEED_DIR" ] && [ -n "$(ls -A "$FEED_DIR" 2>/dev/null)" ]; then
-                echo "Packed:"; echo; for f in "$FEED_DIR"/*.nupkg; do echo "- $(basename "$f")"; done; echo
-              fi
-              hosts=$(jq -r '(.hosts // []) | map(.repo) | join(", ")' "$WORK/manifest.json")
-              [ -n "$hosts" ] && echo "Hosts listed, not acted on in this phase: $hosts"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          TRAIN_JOB_STATUS: ${{ job.status }}
+          TRAIN_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MERRYN_URL: ${{ secrets.merryn-url }}
+          MERRYN_TOKEN: ${{ secrets.merryn-token }}
+        run: python3 "$RUNNER_TEMP/train.py" record

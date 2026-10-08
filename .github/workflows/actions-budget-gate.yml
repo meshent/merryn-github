@@ -1,142 +1,146 @@
-# Reusable: read the organization's GitHub Actions usage for the current billing month and publish a throttle
-# state that every workflow in the organization can read for free.
-#
-# GitHub bills each job rounded up to a whole minute and stops starting jobs the moment the included minutes
-# plus the spending limit are spent: a lockout that also stops the hotfix that would fix it. This workflow makes
-# the organization slow down first. It reads used and included minutes, sets one organization-level Actions
-# variable (default ACTIONS_BUDGET_STATE) to ok, soft or hard, and every other workflow's jobs carry
-#
-#   if: ${{ vars.ACTIONS_BUDGET_STATE != 'hard' }}          (PR validation also adds  != 'soft')
-#
-# which GitHub evaluates without starting a runner. A skipped job is not billed; an unset variable reads as the
-# empty string, so a repository that has never seen the gate keeps running. Call this from one small scheduled
-# wrapper per organization (see README.md); the wrapper itself must NOT carry the guard, or a hard state can
-# never be lifted.
-#
-# Usage sources, in order: the legacy endpoint GET /orgs/{org}/settings/billing/actions (total and included
-# minutes; organizations moved to the enhanced billing platform may report stale totals there) and the
-# enhanced endpoint GET /organizations/{org}/settings/billing/usage for the month (Actions line items in
-# minutes; no allowance, so `included-minutes` supplies it when the legacy value is missing). The larger of
-# the two totals wins. If neither answers, the variable is left exactly as it was and the run warns.
 name: Actions budget gate (reusable)
-
 on:
   workflow_call:
     inputs:
       org:
-        description: The organization whose usage is read and whose variable is set, e.g. meshent
         type: string
         required: true
       soft-percent:
-        description: Percent of included minutes at which the state becomes soft (optional work stops)
         type: number
         default: 70
       hard-percent:
-        description: Percent of included minutes at which the state becomes hard (only overrides run)
         type: number
         default: 90
       included-minutes:
-        description: The plan's included minutes per month; 0 reads it from the legacy endpoint (Free 2000, Team 3000)
+        description: Monthly standard-runner allowance; zero reads the organization plan
         type: number
         default: 0
-      variable:
-        description: Name of the organization variable that carries the state
+      dry-run:
+        description: Report only; never change variables or notify Merryn
+        type: boolean
+        default: false
+      merryn-api-url:
+        description: REST base, e.g. https://meshnet.merryn.dev/api/v1; token must be scoped to its project
         type: string
-        default: ACTIONS_BUDGET_STATE
+        default: ''
+      merryn-domain:
+        type: string
+        default: coordinator
     secrets:
       billing-token:
-        description: A token of an organization owner or billing manager that can read billing and write organization Actions variables (classic scopes admin:org; the default GITHUB_TOKEN cannot do either)
         required: true
+      merryn-token:
+        required: false
     outputs:
       state:
-        description: ok | soft | hard, or unknown when no usage source answered
-        value: ${{ jobs.gate.outputs.state }}
+        value: ${{ jobs.budget.outputs.state }}
       used-percent:
-        description: Whole percent of included minutes used this month
-        value: ${{ jobs.gate.outputs.used-percent }}
-
-permissions: {}
-
+        value: ${{ jobs.budget.outputs.used-percent }}
+permissions:
+  contents: read
+concurrency:
+  group: actions-budget-${{ inputs.org }}
+  cancel-in-progress: false
 jobs:
-  gate:
+  # The observer must run even at hard, so a new month can reopen the gate.
+  budget:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      state: ${{ steps.read.outputs.state }}
-      used-percent: ${{ steps.read.outputs.percent }}
+      state: ${{ steps.gate.outputs.state }}
+      used-percent: ${{ steps.gate.outputs.used-percent }}
     steps:
-      - name: Read usage and set the state
-        id: read
+      - id: gate
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.billing-token }}
-          ORG: ${{ inputs.org }}
-          SOFT: ${{ inputs.soft-percent }}
-          HARD: ${{ inputs.hard-percent }}
-          INCLUDED_INPUT: ${{ inputs.included-minutes }}
-          VAR: ${{ inputs.variable }}
-        run: |
-          set -u
-          used=""; included="${INCLUDED_INPUT:-0}"; source=""
-
-          # 1. Legacy endpoint: total and included minutes.
-          if legacy=$(gh api "orgs/$ORG/settings/billing/actions" 2>/dev/null); then
-            u=$(jq -r '.total_minutes_used // empty' <<<"$legacy")
-            i=$(jq -r '.included_minutes // empty' <<<"$legacy")
-            [ -n "$u" ] && { used="$u"; source="legacy"; }
-            if [ "$included" = "0" ] && [ -n "$i" ] && [ "$i" != "0" ]; then included="$i"; fi
-          fi
-
-          # 2. Enhanced billing usage endpoint: Actions minutes this month. The larger total wins.
-          year=$(date -u +%Y); month=$(date -u +%-m)
-          if usage=$(gh api "organizations/$ORG/settings/billing/usage?year=$year&month=$month" 2>/dev/null); then
-            u=$(jq -r '[.usageItems[]? | select(((.product // "") | ascii_downcase) == "actions" and ((.unitType // "") | ascii_downcase) == "minutes") | (.quantity // 0)] | add // empty' <<<"$usage")
-            if [ -n "$u" ]; then
-              u=${u%.*}
-              if [ -z "$used" ] || [ "$u" -gt "${used%.*}" ]; then used="$u"; source="usage"; fi
-            fi
-          fi
-
-          if [ -z "$used" ]; then
-            echo "::warning::No usage source answered for $ORG (both billing endpoints failed or returned nothing). The variable $VAR is left as it was."
-            echo "state=unknown" >> "$GITHUB_OUTPUT"; echo "percent=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          used=${used%.*}
-          if [ "$included" = "0" ] || [ -z "$included" ]; then
-            echo "::warning::Included minutes unknown for $ORG: the legacy endpoint gave none and included-minutes is 0. Pass included-minutes (Free 2000, Team 3000). The variable $VAR is left as it was."
-            echo "state=unknown" >> "$GITHUB_OUTPUT"; echo "percent=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          percent=$(( used * 100 / included ))
-          if [ "$percent" -ge "${HARD%.*}" ]; then state=hard
-          elif [ "$percent" -ge "${SOFT%.*}" ]; then state=soft
-          else state=ok; fi
-
-          day=$(date -u +%-d); days_in_month=$(date -u -d "$(date -u +%Y-%m-01) +1 month -1 day" +%-d)
-          days_left=$(( days_in_month - day ))
-          burn=$(( used / day ))
-          projected=$(( burn * days_in_month ))
-
-          previous=$(gh variable get "$VAR" --org "$ORG" 2>/dev/null || echo "")
-
-          # Write the state and the percent. A failure here is loud: a gate that cannot write is not a gate.
-          gh variable set "$VAR" --org "$ORG" --visibility all --body "$state"
-          gh variable set "${VAR}_USED_PERCENT" --org "$ORG" --visibility all --body "$percent"
-
-          {
-            echo "## Actions budget: $ORG"
-            echo
-            echo "| used | included | percent | state | day | days left | burn/day | projected month |"
-            echo "|---|---|---|---|---|---|---|---|"
-            echo "| $used | $included | $percent% | **$state** | $day/$days_in_month | $days_left | $burn | $projected |"
-            echo
-            echo "Source: $source. Thresholds: soft ${SOFT%.*}%, hard ${HARD%.*}%. Previous state: ${previous:-<unset>}."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$previous" != "$state" ]; then
-            echo "::warning::Actions budget state for $ORG changed: ${previous:-<unset>} -> $state ($used of $included minutes, $percent%, $days_left days left in the month, projected $projected at the current burn)."
-          fi
-          if [ "$state" = "hard" ]; then
-            echo "::error::Actions budget for $ORG is HARD: $percent% of $included included minutes used with $days_left days left. Every guarded job now skips; only a dispatched run with an override runs. Raise the allowance or wait for the reset."
-          fi
-          echo "state=$state" >> "$GITHUB_OUTPUT"; echo "percent=$percent" >> "$GITHUB_OUTPUT"
+          BUDGET_ORG: ${{ inputs.org }}
+          BUDGET_SOFT: ${{ inputs.soft-percent }}
+          BUDGET_HARD: ${{ inputs.hard-percent }}
+          BUDGET_INCLUDED: ${{ inputs.included-minutes }}
+          BUDGET_DRY_RUN: ${{ inputs.dry-run }}
+          MERRYN_API_URL: ${{ inputs.merryn-api-url }}
+          MERRYN_DOMAIN: ${{ inputs.merryn-domain }}
+          MERRYN_TOKEN: ${{ secrets.merryn-token }}
+        with:
+          github-token: ${{ secrets.billing-token }}
+          script: |
+            const env = process.env;
+            const org = env.BUDGET_ORG;
+            if (!org || !/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(org)) throw new Error('Invalid organization');
+            const soft = Number(env.BUDGET_SOFT), hard = Number(env.BUDGET_HARD);
+            if (!(Number.isFinite(soft) && Number.isFinite(hard) && soft > 0 && soft < hard && hard <= 100)) throw new Error('Require 0 < soft < hard <= 100');
+            const now = new Date(), year = now.getUTCFullYear(), month = now.getUTCMonth() + 1;
+            const finite = (n, name) => {
+              if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) throw new Error(`Invalid ${name}`);
+              return n;
+            };
+            let included = finite(Number(env.BUDGET_INCLUDED), 'included minutes'), used;
+            let usage;
+            try {
+              usage = (await github.request('GET /organizations/{org}/settings/billing/usage', {org, year, month})).data;
+            } catch (e) {
+              if (![404, 410].includes(e.status)) throw e;
+              const legacy = (await github.request('GET /orgs/{org}/settings/billing/actions', {org})).data;
+              used = finite(legacy.total_minutes_used, 'legacy used minutes');
+              if (!included) included = finite(legacy.included_minutes, 'legacy included minutes');
+            }
+            if (usage) {
+              if (!Array.isArray(usage.usageItems)) throw new Error('Missing usageItems; refusing a false zero');
+              used = 0;
+              for (const row of usage.usageItems) {
+                if (!row || typeof row.product !== 'string' || !row.product.trim() || typeof row.unitType !== 'string' || !row.unitType.trim()) throw new Error('Malformed usage row; refusing a false zero');
+                if (String(row.product).toLowerCase() !== 'actions' || String(row.unitType).toLowerCase() !== 'minutes') continue;
+                if (!String(row.date).startsWith(`${year}-${String(month).padStart(2, '0')}-`)) throw new Error('Usage outside requested month');
+                // Enhanced billing reports physical minutes by SKU, not legacy total_minutes_used.
+                // These allowance multipliers follow the approved train plan, not runner dollar prices.
+                const sku = String(row.sku).toLowerCase().replace(/[_ -]+/g, ' ');
+                const multiplier = {'actions linux': 1, 'actions windows': 2, 'actions macos': 10}[sku];
+                if (!multiplier) throw new Error(`Unsupported minute SKU: ${row.sku}; configure the allowance accounting before activation`);
+                used += finite(row.quantity, 'runner quantity') * multiplier;
+              }
+              if (!included) {
+                const plan = (await github.request('GET /orgs/{org}', {org})).data.plan?.name;
+                included = {free: 2000, team: 3000, enterprise: 50000}[plan];
+                if (!included) throw new Error('Unknown included allowance; supply included-minutes');
+              }
+            }
+            if (!(included > 0 && Number.isFinite(used))) throw new Error('No usable allowance or usage');
+            const percent = used / included * 100;
+            const state = percent >= hard ? 'hard' : percent >= soft ? 'soft' : 'ok';
+            const start = Date.UTC(year, month - 1, 1), end = Date.UTC(year, month, 1);
+            const daysLeft = Math.ceil((end - now.getTime()) / 86400000);
+            const rate = used / Math.max(1, (now.getTime() - start) / 86400000);
+            const message = `${org}: ${used} / ${included} included minutes (${percent.toFixed(2)}%), ${daysLeft} days left, ${rate.toFixed(2)} minutes/day; state=${state}`;
+            core.info(message);
+            if (state !== 'ok') core.warning(message);
+            core.setOutput('state', state);
+            core.setOutput('used-percent', percent.toFixed(2));
+            if (env.BUDGET_DRY_RUN === 'true') return;
+            const readVariable = async name => {
+              try { return (await github.request('GET /orgs/{org}/actions/variables/{name}', {org, name})).data; }
+              catch (e) { if (e.status === 404) return null; throw e; }
+            };
+            const setVariable = async (name, value, existing) => {
+              await github.request(existing ? 'PATCH /orgs/{org}/actions/variables/{name}' : 'POST /orgs/{org}/actions/variables', {org, name, value, visibility: 'all'});
+            };
+            const old = await readVariable('ACTIONS_BUDGET_STATE');
+            const oldPercent = await readVariable('ACTIONS_BUDGET_USED_PERCENT');
+            await setVariable('ACTIONS_BUDGET_USED_PERCENT', percent.toFixed(2), oldPercent);
+            await setVariable('ACTIONS_BUDGET_STATE', state, old);
+            if (!env.MERRYN_API_URL && !env.MERRYN_TOKEN) return;
+            if (!env.MERRYN_API_URL || !env.MERRYN_TOKEN) throw new Error('Merryn URL and token must both be configured');
+            const base = new URL(env.MERRYN_API_URL);
+            if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash) throw new Error('Merryn REST base must be an HTTPS URL without credentials/query/fragment');
+            const notified = await readVariable('ACTIONS_BUDGET_NOTIFIED_STATE');
+            if (notified?.value === state) return;
+            const post = async (path, body) => {
+              const response = await fetch(base.href.replace(/\/$/, '') + path, {method: 'POST', redirect: 'error', headers: {'Authorization': `Bearer ${env.MERRYN_TOKEN}`, 'Content-Type': 'application/json'}, body: JSON.stringify(body), signal: AbortSignal.timeout(15000)});
+              if (response.status === 409 && body.kind === 'question') {
+                const conflict = await response.json();
+                if (conflict.code === 'exists' && conflict.key === body.id) return;
+              }
+              if (!response.ok) throw new Error(`Merryn notification failed (${response.status}); next observation retries`);
+            };
+            await post(`/items/${encodeURIComponent(env.MERRYN_DOMAIN + ':journal')}/events`, {kind: 'journal', summary: message});
+            if (state === 'hard') await post('/items', {id: `q-actions-budget-${org.toLowerCase()}-${year}-${month}-hard`, domain: env.MERRYN_DOMAIN, kind: 'question', title: `Actions budget is hard for ${org}`, question: 'Keep the reserve protected, or authorize an override hotfix train?', body: message, options: [{n: 1, label: 'Keep the reserve', recommended: true, text: 'Keep hard; wait for the next cycle.'}, {n: 2, label: 'Authorize hotfix override', recommended: false, text: 'An owner can dispatch the specific required train with override=true.'}]});
+            await setVariable('ACTIONS_BUDGET_NOTIFIED_STATE', state, notified);
