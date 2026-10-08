@@ -81,6 +81,8 @@ For each selected repository, bottom-up, the train:
    before anything was built.
 4. Checks each package before moving on. Every package must carry the train version, and every in-train dependency
    in its nuspec must name that same version. A package that restored a sibling from outside the train fails here.
+   The one exception is a deliberate pin: a `PackageReference` to a sibling at a literal version (no `*`, no
+   `$(...)`) must name exactly that pinned version instead.
 
 Only when every selected repository has passed does the train push the packages, in the same order, with
 `--skip-duplicate`. It then fast-forwards `main` to `ref` in each repository (a plain push, never forced) and tags
