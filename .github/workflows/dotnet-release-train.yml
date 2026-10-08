@@ -130,6 +130,14 @@ jobs:
 
           WORK = Path(os.environ.get("TRAIN_WORK", "train")).resolve()
           SRC, PACK, FEED = WORK / "src", WORK / "pack", WORK / "feed"
+
+
+          def checkout_dir(base, name):
+              """Where a repository's checkout lives under SRC or PACK: <base>/<name>/<name>. The extra parent keeps each
+              checkout alone in its folder, so a project that switches to a sibling checkout when one sits next to it (a
+              ProjectReference conditioned on Exists('../../<repo>/...')) never sees the train's other repositories and builds
+              and packs exactly as it does on its own."""
+              return base / name / name
           PLAN = WORK / "plan.json"
           LOCAL_SOURCE = "train-local"
           SWITCH = "UseProjectReferences"
@@ -454,7 +462,7 @@ jobs:
               repos = {}
               for repo in manifest["repos"]:
                   name = repo["repo"]
-                  dest = SRC / name
+                  dest = checkout_dir(SRC, name)
                   sha = clone(manifest["org"], name, ref, dest)
                   tag = latest_train_tag(dest)
                   main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
@@ -489,15 +497,15 @@ jobs:
               selected = [n for n in repo_order if repos[n]["selected"]]
               for name in selected:
                   repo = repos[name]
-                  if not is_ancestor(SRC / name, repo["main"], repo["sha"]):
+                  if not is_ancestor(checkout_dir(SRC, name), repo["main"], repo["sha"]):
                       raise TrainError(f"{name}: main ({repo['main'][:12]}) is not an ancestor of {ref} ({repo['sha'][:12]}), "
                                        f"so the train could publish it but never fast-forward main. Merge main into {ref} first.")
-                  repo["solution_file"] = find_solution(SRC / name, repo) if repo["test"] else ""
-                  repo["source_graph"] = SWITCH in ((SRC / name / "Directory.Build.targets").read_text()
-                                                    if (SRC / name / "Directory.Build.targets").exists() else "")
+                  repo["solution_file"] = find_solution(checkout_dir(SRC, name), repo) if repo["test"] else ""
+                  repo["source_graph"] = SWITCH in ((checkout_dir(SRC, name) / "Directory.Build.targets").read_text()
+                                                    if (checkout_dir(SRC, name) / "Directory.Build.targets").exists() else "")
                   repo["items"] = sorted(set(ITEM_KEY.findall(git(
                       ["log", "--format=%B", f"{repo['tag']['sha']}..{repo['sha']}" if repo["tag"] else repo["sha"],
-                       *([] if repo["tag"] else ["-n", "200"])], cwd=SRC / name, capture=True))))
+                       *([] if repo["tag"] else ["-n", "200"])], cwd=checkout_dir(SRC, name), capture=True))))
 
               build, revision = stamp()
               version = normalized_version(build, revision)
@@ -527,7 +535,7 @@ jobs:
               packages = []
               for name in plan["selected"]:
                   repo = plan["repos"][name]
-                  src, pack = SRC / name, PACK / name
+                  src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
                   log(f"::group::{name}")
                   # Exact pins on in-train packages move to the train version first, in the source tree, before any copy: the
                   # train is the one place that knows the version it is about to publish. On a live train that edit is
@@ -586,7 +594,7 @@ jobs:
               plan = json.loads(PLAN.read_text())
               tag = f"train/{plan['version']}"
               for name in plan["selected"]:
-                  repo, dest = plan["repos"][name], SRC / name
+                  repo, dest = plan["repos"][name], checkout_dir(SRC, name)
                   if repo.get("pinned"):
                       # The pin commit sits on top of the ref in the runner's clone; the ref takes it first (a fast-forward),
                       # then main, so the ref never falls behind main after a train.

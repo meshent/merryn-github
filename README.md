@@ -71,6 +71,10 @@ or when it has no tag yet. A selected repository republishes all of its packages
 from the clock with the `Directory.Build.props` formula (UTC, one reading), passes it to every pack as
 `VersionBuild`/`VersionRevision`, and uses it as the train id. It never types a version.
 
+Each repository is cloned alone in its own folder, so a project that switches to a sibling checkout when one sits
+next to it (a `ProjectReference` conditioned on `Exists('../../<repo>/...')`) builds and packs in the train exactly
+as it does on its own.
+
 For each selected repository, bottom-up, the train:
 1. Adds a runner-local feed to the repository's `nuget.config`. The edit is never committed, and under
    `packageSourceMapping` each train package id maps to both the local feed and the GitHub source. A downstream
