@@ -163,6 +163,14 @@ would strand half a train on the feed. The script lives inside the workflow file
 `tests/release-train/test_train.py` extracts it from there and tests it: run it with Python 3 and PyYAML, and add
 `TRAIN_DOTNET=1` to also run the end-to-end cases on throwaway git repositories.
 
+**Exact pins.** A repository that pins an in-train package to an exact version (`Version="0.0.2460.13471"`, the
+"tracked, never discovered" convention) is handled by the train: before packing, every such pin on a package this
+train produces moves to the train version, so the packed nuspec names the version being published; a float
+(`Version="*"`) is left alone and resolves through the local feed. On a live train the pin edit is committed on top of
+the ref and pushed to the ref and to `main` with the promote; a dry run keeps it in the runner's copy. Inside a
+repository the train packs first and tests after, so a bumped pin restores the sibling packed moments earlier;
+publishing stays gated on the tests. The run summary lists every pin the train moved.
+
 ## `dotnet-validate.yml`: the one opt-in PR job
 
 PRs run nothing by default. A PR labelled `ci:validate` runs this workflow once, in one job:
