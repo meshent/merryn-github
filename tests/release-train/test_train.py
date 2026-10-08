@@ -56,6 +56,20 @@ class Unit(unittest.TestCase):
             self.train.toposort(["a", "b", "c"], edges, "repository")
         self.assertIn("repository dependency cycle: a -> b -> c -> a", str(raised.exception))
 
+    def test_ref_overrides_parse_repo_equals_ref_entries_split_on_newlines_and_commas(self):
+        os.environ["TRAIN_REF_OVERRIDES"] = "meshNet.Pay=wip/pay, meshNet.Common = wip/common\n\nmeshNet.Users=feature/x\n"
+        try:
+            self.assertEqual(self.train.ref_overrides(),
+                             {"meshNet.Pay": "wip/pay", "meshNet.Common": "wip/common", "meshNet.Users": "feature/x"})
+            os.environ["TRAIN_REF_OVERRIDES"] = ""
+            self.assertEqual(self.train.ref_overrides(), {})
+            os.environ["TRAIN_REF_OVERRIDES"] = "meshNet.Pay"
+            with self.assertRaises(self.train.TrainError) as raised:
+                self.train.ref_overrides()
+            self.assertIn("not of the form repo=ref", str(raised.exception))
+        finally:
+            os.environ.pop("TRAIN_REF_OVERRIDES", None)
+
     def test_stamp_is_the_directory_build_props_formula_from_one_reading(self):
         # 2026-10-08 08:40:56 UTC: 2472 whole days since 2020-01-01, 31256 seconds into the day -> 15628.
         self.assertEqual(self.train.stamp(datetime(2026, 10, 8, 8, 40, 56, tzinfo=timezone.utc)), (2472, 15628))
@@ -250,6 +264,25 @@ class EndToEnd(unittest.TestCase):
         bare.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", "-q", "--bare", work, bare], check=True)
 
+    def commit_to(self, name, branch, files, new=False):
+        """Commit files on a branch of a throwaway repo (creating it from the current branch with new=True) and push it."""
+        work = self.root / "make" / name
+        subprocess.run(["git", "checkout", "-q", *(["-b"] if new else []), branch], cwd=work, check=True)
+        for rel, text in files.items():
+            (work / rel).write_text(text)
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"{name} on {branch}"],
+                       cwd=work, check=True)
+        subprocess.run(["git", "push", "-q", str(self.server / "o" / f"{name}.git"), branch], cwd=work, check=True)
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True, check=True).stdout.strip()
+
+    def two_repos(self):
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
+                         "Up.slnx": '<Solution><Project Path="Up.Lib/Up.Lib.csproj" /></Solution>'})
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": csproj(["Up.Lib"]),
+                           "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}",
+                           "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
+
     def manifest(self, repos):
         path = self.root / "manifest.json"
         path.write_text(json.dumps({"org": "o", "repos": repos}))
@@ -360,6 +393,65 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Failed!", build.stdout)  # the test gate failed, not a restore
         # publish reads the package list build writes only after EVERY repo passed: it is still empty.
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["packages"], [])
+
+    def test_a_dry_run_ref_override_takes_that_repository_at_its_branch_and_warns_once_main_moves_past_it(self):
+        self.two_repos()
+        lane = self.commit_to("Down", "lane", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"}, new=True)
+        self.manifest(["Down", "Up"])
+        self.feed_env["TRAIN_REF_OVERRIDES"] = "Down=lane"
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["repos"]["Down"]["ref"], state["repos"]["Down"]["sha"]), ("lane", lane))
+        self.assertEqual(state["repos"]["Up"]["ref"], "main")
+        self.assertEqual((state["overrides"], state["warnings"]), ({"Down": "lane"}, []))
+        self.assertIn("Down: lane " + lane[:12] + " (override)", plan.stdout)
+        # main moves past the lane branch: a dry run warns, still builds the branch, and the summary carries both facts.
+        self.commit_to("Down", "main", {"Down.Lib/Main.cs": "namespace Down; public class M {}"})
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(len(state["warnings"]), 1, state["warnings"])
+        self.assertIn("Down: main (", state["warnings"][0])
+        self.assertIn("is not an ancestor of lane", state["warnings"][0])
+        self.assertIn("A live train refuses this repository.", state["warnings"][0])
+        self.assertIn("WARNING Down: main (", plan.stdout)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        record = self.train("record")
+        self.assertEqual(record.returncode, 0, record.stdout)
+        self.assertIn("Overrides (dry run only): `Down=lane`.", record.stdout)
+        self.assertIn("- ⚠️ Down: main (", record.stdout)
+
+    def test_ref_overrides_are_refused_on_a_live_train_and_for_a_repository_outside_the_manifest(self):
+        self.two_repos()
+        self.manifest(["Down", "Up"])
+        self.feed_env["TRAIN_REF_OVERRIDES"] = "Down=lane"
+        self.feed_env["TRAIN_DRY_RUN"] = "false"
+        plan = self.train("plan")
+        self.assertNotEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("ref overrides are for dry runs only", plan.stdout)
+        work = self.root / "train"
+        self.assertEqual(list(work.rglob(".git")) if work.exists() else [], [], "a refused plan must clone nothing")
+        self.feed_env["TRAIN_DRY_RUN"] = "true"
+        self.feed_env["TRAIN_REF_OVERRIDES"] = "Nope=lane"
+        plan = self.train("plan")
+        self.assertNotEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("not in the manifest: Nope", plan.stdout)
+
+    def test_a_live_train_still_refuses_a_repository_whose_main_is_not_an_ancestor_of_the_ref(self):
+        self.two_repos()
+        for name in ("Up", "Down"):
+            self.commit_to(name, "lane", {f"{name}.Lib/Lane.cs": f"namespace {name}; public class Lane {{}}"}, new=True)
+        self.commit_to("Down", "main", {"Down.Lib/Main.cs": "namespace Down; public class M {}"})
+        self.manifest(["Down", "Up"])
+        self.feed_env["TRAIN_REF"] = "lane"
+        self.feed_env["TRAIN_DRY_RUN"] = "false"
+        plan = self.train("plan")
+        self.assertNotEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("Down: main (", plan.stdout)
+        self.assertIn("is not an ancestor of lane", plan.stdout)
+        self.assertNotIn("WARNING", plan.stdout)
 
 
 if __name__ == "__main__":
