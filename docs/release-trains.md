@@ -1,6 +1,8 @@
 # Release trains and an Actions budget for meshNet (and the other Merryn tenants)
 
-*Plan, 2026-10-08. Status: proposed; filed as work on the meshNet board (coordinator) and the Mira board (mira). The
+*Plan, 2026-10-08. Status: proposed. Filed as work: meshNet board FEAT-0147 (coordinator:C26 Phase 0, C27 Phase 1a,
+C28 Phase 1b, C29 Phase 2a, C30 Phase 2b) and the owner question
+`q-coordinator-release-trains-accept-the-five-recommended-setti`; Mira board FEAT-0148 (the Merryn half). The
 mechanics land here, in merryn-github, as reusable workflows; each tenant keeps a thin wrapper and a manifest.*
 
 ## Why
