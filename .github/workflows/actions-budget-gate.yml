@@ -1,0 +1,146 @@
+name: Actions budget gate (reusable)
+on:
+  workflow_call:
+    inputs:
+      org:
+        type: string
+        required: true
+      soft-percent:
+        type: number
+        default: 70
+      hard-percent:
+        type: number
+        default: 90
+      included-minutes:
+        description: Monthly standard-runner allowance; zero reads the organization plan
+        type: number
+        default: 0
+      dry-run:
+        description: Report only; never change variables or notify Merryn
+        type: boolean
+        default: false
+      merryn-api-url:
+        description: REST base, e.g. https://meshnet.merryn.dev/api/v1; token must be scoped to its project
+        type: string
+        default: ''
+      merryn-domain:
+        type: string
+        default: coordinator
+    secrets:
+      billing-token:
+        required: true
+      merryn-token:
+        required: false
+    outputs:
+      state:
+        value: ${{ jobs.budget.outputs.state }}
+      used-percent:
+        value: ${{ jobs.budget.outputs.used-percent }}
+permissions:
+  contents: read
+concurrency:
+  group: actions-budget-${{ inputs.org }}
+  cancel-in-progress: false
+jobs:
+  # The observer must run even at hard, so a new month can reopen the gate.
+  budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      state: ${{ steps.gate.outputs.state }}
+      used-percent: ${{ steps.gate.outputs.used-percent }}
+    steps:
+      - id: gate
+        uses: actions/github-script@v7
+        env:
+          BUDGET_ORG: ${{ inputs.org }}
+          BUDGET_SOFT: ${{ inputs.soft-percent }}
+          BUDGET_HARD: ${{ inputs.hard-percent }}
+          BUDGET_INCLUDED: ${{ inputs.included-minutes }}
+          BUDGET_DRY_RUN: ${{ inputs.dry-run }}
+          MERRYN_API_URL: ${{ inputs.merryn-api-url }}
+          MERRYN_DOMAIN: ${{ inputs.merryn-domain }}
+          MERRYN_TOKEN: ${{ secrets.merryn-token }}
+        with:
+          github-token: ${{ secrets.billing-token }}
+          script: |
+            const env = process.env;
+            const org = env.BUDGET_ORG;
+            if (!org || !/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(org)) throw new Error('Invalid organization');
+            const soft = Number(env.BUDGET_SOFT), hard = Number(env.BUDGET_HARD);
+            if (!(Number.isFinite(soft) && Number.isFinite(hard) && soft > 0 && soft < hard && hard <= 100)) throw new Error('Require 0 < soft < hard <= 100');
+            const now = new Date(), year = now.getUTCFullYear(), month = now.getUTCMonth() + 1;
+            const finite = (n, name) => {
+              if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) throw new Error(`Invalid ${name}`);
+              return n;
+            };
+            let included = finite(Number(env.BUDGET_INCLUDED), 'included minutes'), used;
+            let usage;
+            try {
+              usage = (await github.request('GET /organizations/{org}/settings/billing/usage', {org, year, month})).data;
+            } catch (e) {
+              if (![404, 410].includes(e.status)) throw e;
+              const legacy = (await github.request('GET /orgs/{org}/settings/billing/actions', {org})).data;
+              used = finite(legacy.total_minutes_used, 'legacy used minutes');
+              if (!included) included = finite(legacy.included_minutes, 'legacy included minutes');
+            }
+            if (usage) {
+              if (!Array.isArray(usage.usageItems)) throw new Error('Missing usageItems; refusing a false zero');
+              used = 0;
+              for (const row of usage.usageItems) {
+                if (!row || typeof row.product !== 'string' || !row.product.trim() || typeof row.unitType !== 'string' || !row.unitType.trim()) throw new Error('Malformed usage row; refusing a false zero');
+                if (String(row.product).toLowerCase() !== 'actions' || String(row.unitType).toLowerCase() !== 'minutes') continue;
+                if (!String(row.date).startsWith(`${year}-${String(month).padStart(2, '0')}-`)) throw new Error('Usage outside requested month');
+                // Enhanced billing reports physical minutes by SKU, not legacy total_minutes_used.
+                // These allowance multipliers follow the approved train plan, not runner dollar prices.
+                const sku = String(row.sku).toLowerCase().replace(/[_ -]+/g, ' ');
+                const multiplier = {'actions linux': 1, 'actions windows': 2, 'actions macos': 10}[sku];
+                if (!multiplier) throw new Error(`Unsupported minute SKU: ${row.sku}; configure the allowance accounting before activation`);
+                used += finite(row.quantity, 'runner quantity') * multiplier;
+              }
+              if (!included) {
+                const plan = (await github.request('GET /orgs/{org}', {org})).data.plan?.name;
+                included = {free: 2000, team: 3000, enterprise: 50000}[plan];
+                if (!included) throw new Error('Unknown included allowance; supply included-minutes');
+              }
+            }
+            if (!(included > 0 && Number.isFinite(used))) throw new Error('No usable allowance or usage');
+            const percent = used / included * 100;
+            const state = percent >= hard ? 'hard' : percent >= soft ? 'soft' : 'ok';
+            const start = Date.UTC(year, month - 1, 1), end = Date.UTC(year, month, 1);
+            const daysLeft = Math.ceil((end - now.getTime()) / 86400000);
+            const rate = used / Math.max(1, (now.getTime() - start) / 86400000);
+            const message = `${org}: ${used} / ${included} included minutes (${percent.toFixed(2)}%), ${daysLeft} days left, ${rate.toFixed(2)} minutes/day; state=${state}`;
+            core.info(message);
+            if (state !== 'ok') core.warning(message);
+            core.setOutput('state', state);
+            core.setOutput('used-percent', percent.toFixed(2));
+            if (env.BUDGET_DRY_RUN === 'true') return;
+            const readVariable = async name => {
+              try { return (await github.request('GET /orgs/{org}/actions/variables/{name}', {org, name})).data; }
+              catch (e) { if (e.status === 404) return null; throw e; }
+            };
+            const setVariable = async (name, value, existing) => {
+              await github.request(existing ? 'PATCH /orgs/{org}/actions/variables/{name}' : 'POST /orgs/{org}/actions/variables', {org, name, value, visibility: 'all'});
+            };
+            const old = await readVariable('ACTIONS_BUDGET_STATE');
+            const oldPercent = await readVariable('ACTIONS_BUDGET_USED_PERCENT');
+            await setVariable('ACTIONS_BUDGET_USED_PERCENT', percent.toFixed(2), oldPercent);
+            await setVariable('ACTIONS_BUDGET_STATE', state, old);
+            if (!env.MERRYN_API_URL && !env.MERRYN_TOKEN) return;
+            if (!env.MERRYN_API_URL || !env.MERRYN_TOKEN) throw new Error('Merryn URL and token must both be configured');
+            const base = new URL(env.MERRYN_API_URL);
+            if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash) throw new Error('Merryn REST base must be an HTTPS URL without credentials/query/fragment');
+            const notified = await readVariable('ACTIONS_BUDGET_NOTIFIED_STATE');
+            if (notified?.value === state) return;
+            const post = async (path, body) => {
+              const response = await fetch(base.href.replace(/\/$/, '') + path, {method: 'POST', redirect: 'error', headers: {'Authorization': `Bearer ${env.MERRYN_TOKEN}`, 'Content-Type': 'application/json'}, body: JSON.stringify(body), signal: AbortSignal.timeout(15000)});
+              if (response.status === 409 && body.kind === 'question') {
+                const conflict = await response.json();
+                if (conflict.code === 'exists' && conflict.key === body.id) return;
+              }
+              if (!response.ok) throw new Error(`Merryn notification failed (${response.status}); next observation retries`);
+            };
+            await post(`/items/${encodeURIComponent(env.MERRYN_DOMAIN + ':journal')}/events`, {kind: 'journal', summary: message});
+            if (state === 'hard') await post('/items', {id: `q-actions-budget-${org.toLowerCase()}-${year}-${month}-hard`, domain: env.MERRYN_DOMAIN, kind: 'question', title: `Actions budget is hard for ${org}`, question: 'Keep the reserve protected, or authorize an override hotfix train?', body: message, options: [{n: 1, label: 'Keep the reserve', recommended: true, text: 'Keep hard; wait for the next cycle.'}, {n: 2, label: 'Authorize hotfix override', recommended: false, text: 'An owner can dispatch the specific required train with override=true.'}]});
+            await setVariable('ACTIONS_BUDGET_NOTIFIED_STATE', state, notified);
