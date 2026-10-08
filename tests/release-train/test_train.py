@@ -263,6 +263,25 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(result["packages"][1]["dependencies"], [f"Up.Lib {version}"])
         self.assertEqual(result["repos"]["Down"]["items"], ["test:T1"])
 
+    def test_a_sibling_checkout_switch_never_sees_the_other_train_repos(self):
+        # Like meshNet.Commerce: a project that builds against a sibling checkout when one sits next to it must build
+        # and pack in the train exactly as it does alone, against the package.
+        probe = "$(MSBuildThisFileDirectory)../../Up/Up.Lib/Up.Lib.csproj"
+        down = (f'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup Condition="Exists(\'{probe}\')">'
+                f'<DefineConstants>$(DefineConstants);SIBLING</DefineConstants></PropertyGroup><ItemGroup>'
+                f'<PackageReference Include="Up.Lib" Version="*" /></ItemGroup></Project>\n')
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
+                         "Up.slnx": '<Solution><Project Path="Up.Lib/Up.Lib.csproj" /></Solution>'})
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": down,
+                           "Down.Lib/Class.cs": "#if SIBLING\n#error the train exposed a sibling checkout\n#endif\n"
+                                                "namespace Down; public class B : Up.A {}",
+                           "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
+        self.manifest(["Up", "Down"])
+        self.assertEqual(self.train("plan").returncode, 0)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        self.assertNotIn("the train exposed a sibling checkout", build.stdout)
+
     def test_a_repo_unchanged_since_its_train_tag_is_not_selected(self):
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.slnx": "<Solution />"})
         self.repo("Down", {"Down.Lib/Down.Lib.csproj": csproj(["Up.Lib"]), "Down.slnx": "<Solution />"})
