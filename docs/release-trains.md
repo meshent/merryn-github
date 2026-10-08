@@ -139,7 +139,7 @@ Mira gets the same shape with `Mira` as the one package repo and its tenant host
 
 ### 4. The one PR validation job (when asked for)
 
-`dotnet-validate.yml` here: checkout, `setup-dotnet`, restore with cache, the repo's source-graph test, and a
+`dotnet-validate.yml` here: checkout, `setup-dotnet`, restore with the section 7 cache, the repo's source-graph test, and a
 `dotnet pack` of every project into a throwaway folder (proves the nuspecs, publishes nothing). One job. It replaces the
 16-way PR fan-out in Common's publish workflow and the shared `dotnet-publish.yml`'s PR mode. The private-PR sibling
 mechanism (meshent/.github PR #2, `pr-dependency-projects`) solved the "PR builds against last published sibling"
@@ -185,14 +185,50 @@ Three layers, built in this order:
    `release != main`, items, open questions), cut a hotfix train, re-run a failed one, read the last record. Thin: it
    calls the Merryn tools and the dispatch API; the rules live in the workflow and the board.
 
+### 7. Two habits in every workflow that survives: cancel superseded runs, cache the restore
+
+Both are cheap and both go into the Phase 0 pass, so they land before the train exists.
+
+**Concurrency.** Every workflow that runs on a branch or a PR carries
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+A second push 30 seconds after the first cancels the first run instead of paying for both; on a PR, `github.ref` is the
+PR's own merge ref, so the group is per PR. Two workflows must **not** cancel in progress: the per-repo publish
+workflows while they still exist (C32 part 3: a killed half-finished publish strands a mixed feed) and the train
+(same reason, one org-wide group, `cancel-in-progress: false`). Everything else can.
+
+**Caching.** A cold NuGet restore of a meshNet host is most of its one-minute build, and the train restores twenty repos
+in one job. Cache `~/.nuget/packages`:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: ~/.nuget/packages
+    key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.*', '**/nuget.config') }}
+    restore-keys: nuget-${{ runner.os }}-
+```
+
+Two .NET-specific points. First, `actions/setup-dotnet`'s own `cache: true` needs `packages.lock.json` files, and a
+lock file **pins a `Version="*"` reference to whatever it resolved last time**: restore then ignores newer feed packages
+unless `--force-evaluate` is passed. For repos that float (every meshNet consumer today) that silently defeats the
+float, so use `actions/cache` on the packages folder as above and no lock files until exact pins land (Phase 2).
+Second, GitHub bills a job rounded up to the minute, so a cache that turns a 50-second job into a 20-second one saves
+nothing on that job; it pays on the train (one long job, every repo) and on anything that runs over a minute. The
+cache is per repository (10 GB, entries dropped after 7 days unused), so a train that runs twice a week keeps it warm.
+
 ## Rollout
 
 **Phase 0, this week, before any new mechanism (stops the burn).**
 - Fix billing once (C25) and set a small spending limit.
 - In every repo: scope `push:` to `[main, release]` (meshNet's `build-meshnet-api.yml` and Common's
   `test-source-graph.yml` lose their any-branch trigger); drop `pull_request` from the publish workflows, or gate it on
-  the `ci:validate` label; add `concurrency: cancel-in-progress: true` to PR workflows. Twenty one-file PRs; a lane can
-  do them as one item with a checklist.
+  the `ci:validate` label; add the concurrency group and the NuGet cache from section 7 to every workflow that stays
+  (never `cancel-in-progress` on a publish workflow). Twenty one-file PRs; a lane can do them as one item with a checklist.
 - Pull the usage report per repo and workflow (the `usage` endpoint, or Settings › Billing › Usage report CSV) so the
   next phase has a before number. Expected: Common's source-graph pushes and the host build are most of it.
 
