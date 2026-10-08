@@ -12,10 +12,6 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:validate' && format('-{0}', github.run_id) || '' }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   packages: read
@@ -24,6 +20,11 @@ jobs:
   train:
     if: ${{ github.event.action != 'labeled' }}
     runs-on: ubuntu-latest
+    # Job-level, not workflow-level: a `labeled` run (which skips this job) must not cancel a push's test run.
+    # dotnet-validate.yml carries its own per-ref group.
+    concurrency:
+      group: ${{ github.workflow }}-train-${{ github.ref }}${{ github.event.action == 'labeled' && format('-{0}', github.run_id) || '' }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
