@@ -58,11 +58,62 @@ the site, not the subscription. While `AZURE_CLIENT_ID` is unset the deploy job 
 The workflow refuses to deploy when the bundle's subscription differs from `AZURE_SUBSCRIPTION_ID`: the identity was
 granted in one subscription, and a bundle pointing elsewhere is a mistake, not a request.
 
+## `actions-budget-gate.yml` — throttle before GitHub locks the organization out
+
+Reads the organization's Actions usage for the month and sets one organization-level variable,
+`ACTIONS_BUDGET_STATE`, to `ok`, `soft` (70 % of included minutes) or `hard` (90 %). Every workflow's jobs then
+carry a condition GitHub evaluates without starting a runner, so a skipped job costs nothing and a repository that
+has never seen the gate keeps running (an unset variable reads as empty):
+
+```yaml
+jobs:
+  build:
+    if: ${{ vars.ACTIONS_BUDGET_STATE != 'hard' }}            # PR validation jobs also add: && vars.ACTIONS_BUDGET_STATE != 'soft'
+```
+
+One scheduled wrapper per organization, in whichever repository holds the organization's automation. It must not
+carry the guard itself, or a hard state could never be lifted. Twice a day is about 60 billed minutes a month:
+
+```yaml
+# .github/workflows/actions-budget.yml
+name: Actions budget
+on:
+  schedule:
+    - cron: "17 5,17 * * *"
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  gate:
+    uses: meshent/merryn-github/.github/workflows/actions-budget-gate.yml@main
+    with:
+      org: meshent
+    secrets:
+      billing-token: ${{ secrets.MESHENT_BILLING_PAT }}
+```
+
+| input | meaning |
+|---|---|
+| `org` | the organization whose usage is read and whose variable is set |
+| `soft-percent`, `hard-percent` | thresholds; default 70 and 90 |
+| `included-minutes` | the plan's monthly allowance; default 0 reads it from the legacy billing endpoint (Free 2000, Team 3000). Set it when that endpoint reports nothing |
+| `variable` | the variable name; default `ACTIONS_BUDGET_STATE`. A second variable, `<name>_USED_PERCENT`, carries the percent |
+| secret `billing-token` | a token of an organization owner or billing manager: it reads billing and writes organization Actions variables (classic scopes `admin:org`); the default `GITHUB_TOKEN` can do neither |
+
+**Sources.** The legacy endpoint (`GET /orgs/{org}/settings/billing/actions`) gives used and included minutes;
+organizations moved to the enhanced billing platform may report stale totals there, so the enhanced usage endpoint
+(`GET /organizations/{org}/settings/billing/usage` for the month) is read too and the larger total wins. If neither
+answers, the variable is left as it was and the run warns. The run summary carries used, included, percent, days
+left in the month and the projected month at the current burn; a change of state is a warning annotation and a hard
+state is an error annotation, so it shows in the run list.
+
+**Outputs.** `state` and `used-percent`, so a release train can read the gate in its first step and refuse to
+start on `hard` unless dispatched with an override.
+
 ## Planned: release trains and an Actions budget
 
 [docs/release-trains.md](docs/release-trains.md) is the plan for `dotnet-release-train.yml` (one scheduled run that
 builds, tests, packs and publishes every repository of a tenant in dependency order, then pins and deploys its hosts),
-`dotnet-validate.yml` (the one opt-in PR check) and `actions-budget-gate.yml` (throttle before GitHub locks the org out).
+`dotnet-validate.yml` (the one opt-in PR check); `actions-budget-gate.yml` above is the first piece to land.
 Filed as work on the meshNet and Mira boards.
 
 ## Versioning
