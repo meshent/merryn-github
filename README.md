@@ -152,6 +152,9 @@ runs dry until you change that line.
 A repository entry is a name, or an object with `repo` plus any of three optional fields:
 - `solution`: the solution to test. By default the train uses the single `*.slnx`/`*.sln` at the root, then
   `<repo>.slnx`.
+- `test-env`: variables passed to `dotnet test`, for the acknowledgements a suite expects from a runner (a Cosmos
+  integration suite's `COSMOS_EMULATOR_OPTIONAL=1` where the train has no emulator). A top-level `test-env` applies to
+  every repository; a repository's own entries overlay it.
 - `test-args`: extra arguments for `dotnet test`.
 - `test: false`: skip the tests. Use it only for a repository with none.
 
