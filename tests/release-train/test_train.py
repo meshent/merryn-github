@@ -8,6 +8,7 @@ The script is extracted from the workflow file itself, so these always test the 
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,11 +25,11 @@ WORKFLOW = ROOT / ".github/workflows/dotnet-release-train.yml"
 
 
 def load_train(work):
-    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["train"]["steps"]
+    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["train"]["steps"]
     run = next(s for s in steps if s.get("name") == "Write the train script")["run"]
     script = run.split("<<'TRAIN_PY'\n", 1)[1].rsplit("TRAIN_PY", 1)[0]
     path = Path(work) / "train.py"
-    path.write_text(script)
+    path.write_text(script, encoding="utf-8")
     os.environ["TRAIN_WORK"] = str(Path(work) / "train")
     spec = importlib.util.spec_from_file_location("train", path)
     module = importlib.util.module_from_spec(spec)
@@ -74,6 +75,16 @@ class Unit(unittest.TestCase):
         # 2026-10-08 08:40:56 UTC: 2472 whole days since 2020-01-01, 31256 seconds into the day -> 15628.
         self.assertEqual(self.train.stamp(datetime(2026, 10, 8, 8, 40, 56, tzinfo=timezone.utc)), (2472, 15628))
         self.assertEqual(self.train.stamp(datetime(2026, 10, 8, 0, 0, 1, tzinfo=timezone.utc)), (2472, 0))
+
+    def test_conflicting_ref_overrides_are_rejected_in_either_order_and_identical_repeats_are_accepted(self):
+        from unittest.mock import patch
+        for entries in ("Down=lane,Down=main", "Down=main\nDown=lane"):
+            with self.subTest(entries=entries), patch.dict(os.environ, TRAIN_REF_OVERRIDES=entries):
+                with self.assertRaises(self.train.TrainError) as raised:
+                    self.train.ref_overrides()
+                self.assertIn("conflicting ref overrides for Down", str(raised.exception))
+        with patch.dict(os.environ, TRAIN_REF_OVERRIDES=" Down = lane,\nDown=lane,Up=main"):
+            self.assertEqual(self.train.ref_overrides(), {"Down": "lane", "Up": "main"})
 
     def test_a_zero_revision_is_named_the_way_nuget_normalizes_it(self):
         self.assertEqual(self.train.normalized_version(2472, 15628), "0.0.2472.15628")
@@ -160,7 +171,7 @@ class Unit(unittest.TestCase):
         (repo / "obj").mkdir()
         (repo / "obj" / "Stale.csproj").write_text('<PackageReference Include="Patterns.Messaging.Sms" Version="1" />')
         changed = self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms", "meshNet.Common"}, "0.0.2472.17298")
-        self.assertEqual(sorted(c[0] for c in changed), ["Adapter/Adapter.csproj", "Directory.Packages.props"])
+        self.assertEqual(sorted(Path(c[0]).as_posix() for c in changed), ["Adapter/Adapter.csproj", "Directory.Packages.props"])
         self.assertEqual({(c[1], c[2], c[3]) for c in changed},
                          {("Patterns.Messaging.Sms", "0.0.2460.13471", "0.0.2472.17298")})
         text = (repo / "Adapter" / "Adapter.csproj").read_text()
@@ -242,7 +253,7 @@ class EndToEnd(unittest.TestCase):
         _, self.script = load_train(self.tmp.name)
         self.server = self.root / "server"
         self.feed_env = dict(os.environ, GITHUB_SERVER_URL=f"file://{self.server}", TRAIN_WORK=str(self.root / "train"),
-                             TRAIN_REF="main", TRAIN_DRY_RUN="true")
+                             TRAIN_REF="main", TRAIN_DRY_RUN="true", PYTHONUTF8="1")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -289,8 +300,14 @@ class EndToEnd(unittest.TestCase):
         self.feed_env["TRAIN_MANIFEST"] = str(path)
 
     def train(self, command):
+        # Git creates read-only pack files on Windows. Make this throwaway fixture writable before
+        # a second plan removes it; production Actions runs on Linux. Do not change train behavior.
+        if os.name == "nt" and command == "plan":
+            for path in (self.root / "train").rglob("*"):
+                if path.is_file():
+                    path.chmod(path.stat().st_mode | stat.S_IWRITE)
         return subprocess.run([sys.executable, self.script, command], env=self.feed_env, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                              encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     def test_two_repos_pack_in_order_with_one_version_and_downstream_depends_on_the_train_version(self):
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
@@ -330,7 +347,8 @@ class EndToEnd(unittest.TestCase):
         state = json.loads((self.root / "train" / "plan.json").read_text())
         version = state["version"]
         self.assertIn("Down: pinned 1 reference(s) to " + version, build.stdout)
-        self.assertEqual(state["repos"]["Down"]["pins"], [["Down.Lib/Down.Lib.csproj", "Up.Lib", "0.0.1.1", version]])
+        pins = [[Path(path).as_posix(), package, old, new] for path, package, old, new in state["repos"]["Down"]["pins"]]
+        self.assertEqual(pins, [["Down.Lib/Down.Lib.csproj", "Up.Lib", "0.0.1.1", version]])
         down = next(p for p in state["packages"] if p["id"] == "Down.Lib")
         self.assertEqual(down["dependencies"], [f"Up.Lib {version}"])
         self.assertIn(f'Include="Up.Lib" Version="{version}"',
@@ -438,6 +456,33 @@ class EndToEnd(unittest.TestCase):
         plan = self.train("plan")
         self.assertNotEqual(plan.returncode, 0, plan.stdout)
         self.assertIn("not in the manifest: Nope", plan.stdout)
+
+    def test_conflicting_ref_overrides_fail_before_any_checkout_or_existing_work_deletion(self):
+        self.two_repos()
+        self.manifest(["Down", "Up"])
+        work = self.root / "train"
+        work.mkdir()
+        sentinel = work / "keep.txt"
+        sentinel.write_text("existing work")
+        for entries in ("Down=lane,Down=main", "Down=main\nDown=lane"):
+            self.feed_env["TRAIN_REF_OVERRIDES"] = entries
+            plan = self.train("plan")
+            self.assertNotEqual(plan.returncode, 0, plan.stdout)
+            self.assertIn("conflicting ref overrides for Down", plan.stdout)
+            self.assertEqual(sentinel.read_text(), "existing work")
+            self.assertEqual(list(work.rglob(".git")), [], "conflicting overrides must clone nothing")
+            self.assertNotIn("git clone", plan.stdout)
+
+    def test_identical_ref_override_repeats_plan_the_requested_ref_once(self):
+        self.two_repos()
+        self.manifest(["Down", "Up"])
+        self.feed_env["TRAIN_REF_OVERRIDES"] = " Down = main,\nDown=main"
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["overrides"], {"Down": "main"})
+        self.assertEqual(state["repos"]["Down"]["ref"], "main")
+        self.assertEqual(plan.stdout.count("Down: main "), 1)
 
     def test_a_live_train_still_refuses_a_repository_whose_main_is_not_an_ancestor_of_the_ref(self):
         self.two_repos()

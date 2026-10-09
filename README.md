@@ -126,7 +126,7 @@ runs dry until you change that line.
 |---|---|
 | `manifest` | path to the manifest in the calling repository; default `release-train.json` |
 | `ref` | the branch the train assembles from in every manifest repository; default `release`. A repository without it fails the run |
-| `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
+| `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). Conflicting refs for the same repository fail before checkout or deletion of existing work; identical repeated assignments are accepted. A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
 | `dry-run` | build, test and pack only, then upload the local feed; default `true` |
 | `override` | run even when the org variable `ACTIONS_BUDGET_STATE` is `hard`. The train runs at `soft`; at `hard` only an override runs |
 | `dotnet-version` | default `10.0.x` |
