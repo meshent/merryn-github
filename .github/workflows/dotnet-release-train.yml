@@ -33,7 +33,7 @@ on:
         type: string
         default: release
       ref-overrides:
-        description: "Dry runs only: repo=ref entries (one per line or comma-separated) taken at that branch instead of ref; a live train refuses them"
+        description: "Dry runs only: repo=ref entries (one per line or comma-separated); conflicting refs for one repo fail before checkout, identical repeats are accepted; a live train refuses overrides"
         type: string
         default: ""
       dry-run:
@@ -462,7 +462,7 @@ jobs:
           # --- Subcommands -------------------------------------------------------------------------------------------------
 
           def ref_overrides():
-              """TRAIN_REF_OVERRIDES: `repo=ref` entries separated by newlines or commas, as {repo: ref}."""
+              """TRAIN_REF_OVERRIDES as {repo: ref}; reject conflicting refs, accept identical repeats."""
               overrides = {}
               for entry in re.split(r"[,\n]", os.environ.get("TRAIN_REF_OVERRIDES", "")):
                   entry = entry.strip()
@@ -471,6 +471,8 @@ jobs:
                   name, sep, ref = (part.strip() for part in entry.partition("="))
                   if not sep or not name or not ref:
                       raise TrainError(f"ref override '{entry}' is not of the form repo=ref")
+                  if name in overrides and overrides[name] != ref:
+                      raise TrainError(f"conflicting ref overrides for {name}: '{overrides[name]}' and '{ref}'")
                   overrides[name] = ref
               return overrides
 
