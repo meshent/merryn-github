@@ -131,10 +131,24 @@ promote step stopped there, leaving Commerce, Pay and the four External.* repos 
 - **Recovery: promote-only.** Dispatch with `promote-only: <repo>=<sha>, …` and `version: <train id>` (packages already on
   the feed). It clones the manifest, checks every entry before pushing anything (the sha is on `release` or already on
   `main`; `main` is its ancestor or ahead by train commits only; the repo is not already tagged with that train),
-  re-derives that train's pins on the sha (packages of repos tagged with it plus the named ones), fast-forwards `main`,
-  tags `train/<version>`, and pushes the pin commit to `release` only as a fast-forward. With `dry-run: true` it checks
-  and reports, pushing nothing. It never promotes a lane's later merge under an old train's stamp: the sha names exactly
-  what was built.
+  re-derives that train's pins on the sha, fast-forwards `main`, tags `train/<version>`, and pushes the pin commit to
+  `release` only as a fast-forward. With `dry-run: true` it checks and reports, pushing nothing. It never promotes a
+  lane's later merge under an old train's stamp: the sha names exactly what was built.
+  - **The pins are the ones that were packed.** It rebuilds what that train's plan knew: the train's packages are those
+    of the repos tagged with it (read at the tag, not at today's `release`) plus the named ones (read at the given sha),
+    and every other manifest repo's packages map to its newest `train/*` tag older than the version, so an exact pin on a
+    package outside the train moves exactly as the build moved it. A repo that is on the feed at the version but neither
+    tagged nor named (stranded and left out of this dispatch) still counts as in the train, with a warning to finish it
+    too.
+  - **The version must be published.** Every package a named repo produces must be on the org feed at the version
+    (read from the NuGet v3 flat container with the packages token, fail-closed; `TRAIN_FEED` may name another service
+    index or a folder), so a typo or a dry run's stamp is refused before anything is tagged.
+  - **Which sha.** Use the sha the stranded summary prints (also in the Merryn release record as `strandedFrom`): it is
+    the one the train built. The checks above refuse a sha off `release`, but cannot tell an older or newer sha on
+    `release` from the built one.
+- **A `release` that refuses the push without moving** (branch protection, the token's rights) is named on its own line
+  in the summary, apart from the expected "moved while the train ran", so it cannot quietly leave `release` behind on
+  every train.
 
 The `main` push that step 7 makes must not start the old per-repo publish workflows. Those workflows are retired in
 the cutover (kept as `workflow_dispatch` only for the first month, then deleted), so a `main` push triggers nothing but

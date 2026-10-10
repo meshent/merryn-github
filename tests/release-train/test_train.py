@@ -256,6 +256,66 @@ class Unit(unittest.TestCase):
         self.assertIn("**Stranded** (published at 0.0.9.1, main not moved, not tagged): C.", text)
         self.assertIn("promote-only `C=" + "d" * 40 + "`", text)
 
+    def test_the_feed_is_read_from_a_folder_or_the_v3_flat_container_and_an_unreadable_feed_fails_closed(self):
+        import io
+        import urllib.error
+        from unittest.mock import patch
+        folder = Path(self.tmp.name) / "feed"
+        folder.mkdir()
+        for name in ("Up.Lib.0.0.9.1.nupkg", "up.lib.0.0.9.2.nupkg", "Up.Lib.Extra.0.0.9.3.nupkg"):
+            (folder / name).write_bytes(b"x")
+        with patch.dict(os.environ, TRAIN_FEED=str(folder)):
+            versions = self.train.feed_versions("o", "Up.Lib")
+        self.assertEqual(versions & {"0.0.9.1", "0.0.9.2", "0.0.9.3"}, {"0.0.9.1", "0.0.9.2"})
+        seen = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append(request.get_header("Authorization"))
+                answer = answers[request.full_url]
+                if isinstance(answer, int):
+                    raise urllib.error.HTTPError(request.full_url, answer, "no", {}, None)
+                return Response(json.dumps(answer).encode())
+
+        index = "https://feed.test/o/index.json"
+        answers = {index: {"resources": [{"@id": "https://feed.test/o/download", "@type": "PackageBaseAddress/3.0.0"}]},
+                   "https://feed.test/o/download/up.lib/index.json": {"versions": ["0.0.9.1", "0.0.9.2"]},
+                   "https://feed.test/o/download/gone/index.json": 404,
+                   "https://feed.test/o/download/broken/index.json": 500}
+        with patch.dict(os.environ, TRAIN_FEED=index, PACKAGES_TOKEN="s3cret-token"), \
+                patch.object(self.train.urllib.request, "build_opener", lambda *handlers: Opener()):
+            self.assertEqual(self.train.feed_versions("o", "Up.Lib"), {"0.0.9.1", "0.0.9.2"})
+            self.assertEqual(self.train.feed_versions("o", "Gone"), set())                    # 404: not on the feed
+            with self.assertRaises(self.train.TrainError) as raised:
+                self.train.feed_versions("o", "Broken")                                        # anything else fails closed
+            self.assertIn("could not read the package feed", str(raised.exception))
+            self.assertNotIn("s3cret-token", str(raised.exception))
+        self.assertEqual(set(seen), {"Basic " + self.train.basic_auth("s3cret-token")})
+        # A redirect is never followed with the token on it.
+        self.assertIsNone(self.train._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/"))
+
+    def test_the_summary_names_a_ref_that_refused_the_train_s_push_without_moving(self):
+        import contextlib, io
+        self.train.WORK.mkdir(parents=True, exist_ok=True)
+        plan = {"org": "o", "ref": "release", "version": "0.0.9.1", "dry_run": False, "repo_order": ["A"],
+                "repo_edges": {"A": []}, "selected": ["A"], "packages": [], "promoted": ["A"], "stranded": [],
+                "repos": {"A": {"selected": True, "reason": "release moved", "sha": "a" * 40, "items": []}},
+                "release_behind": [], "release_refused": ["A"]}
+        self.train.PLAN.write_text(json.dumps(plan))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.train.cmd_record()
+        self.assertIn("refused although `release` did not move** (branch protection or the token's rights?); main took "
+                      "them: A.", out.getvalue())
+        self.assertNotIn("moved while the train ran", out.getvalue())
+
     def test_a_package_that_restored_a_sibling_from_outside_the_train_fails(self):
         self._nupkg("A", "0.0.9.1", [("B", "0.0.9.1"), ("Newtonsoft.Json", "13.0.3")])
         self.assertEqual(self.train.check_package("A", "0.0.9.1", {"A", "B"})["dependencies"], ["B 0.0.9.1"])
@@ -328,7 +388,8 @@ class EndToEnd(unittest.TestCase):
         _, self.script = load_train(self.tmp.name)
         self.server = self.root / "server"
         self.feed_env = dict(os.environ, GITHUB_SERVER_URL=f"file://{self.server}", TRAIN_WORK=str(self.root / "train"),
-                             TRAIN_REF="main", TRAIN_DRY_RUN="true", PYTHONUTF8="1")
+                             TRAIN_REF="main", TRAIN_DRY_RUN="true", PYTHONUTF8="1",
+                             TRAIN_FEED=str(self.root / "orgfeed"))  # promote-only reads the 'org' feed folder
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -358,6 +419,7 @@ class EndToEnd(unittest.TestCase):
         work = self.root / "make" / name
         subprocess.run(["git", "checkout", "-q", *(["-b"] if new else []), branch], cwd=work, check=True)
         for rel, text in files.items():
+            (work / rel).parent.mkdir(parents=True, exist_ok=True)
             (work / rel).write_text(text)
         subprocess.run(["git", "add", "-A"], cwd=work, check=True)
         subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", f"{name} on {branch}"],
@@ -392,9 +454,13 @@ class EndToEnd(unittest.TestCase):
     def live(self, ref="release"):
         self.feed_env.update(TRAIN_REF=ref, TRAIN_DRY_RUN="false")
 
+    @staticmethod
+    def pinned_lib(*pins):
+        refs = "".join(f'<PackageReference Include="{package}" Version="{version}" />' for package, version in pins)
+        return f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>{refs}</ItemGroup></Project>\n'
+
     def pinned_repo(self, name, up, version="0.0.1.1"):
-        lib = (f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="{up}.Lib" Version="{version}" />'
-               f'</ItemGroup></Project>\n')
+        lib = self.pinned_lib((f"{up}.Lib", version))
         self.repo(name, {f"{name}.Lib/{name}.Lib.csproj": lib,
                          f"{name}.Lib/Class.cs": f"namespace {name}; public class B : {up}.A {{}}"}, org_feed=True)
 
@@ -702,9 +768,12 @@ class EndToEnd(unittest.TestCase):
         to the sha the train built from plus that train's pins, and the tag goes on it. Every entry is checked first."""
         version = "0.0.2474.11566"
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
-        self.pinned_repo("Down", "Up")
+        # Down also pins Up.New, a package Up only gains after that train: it was never published at the version.
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1"), ("Up.New", "0.0.1.1")),
+                           "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}"}, org_feed=True)
         self.release_branches("Up", "Down")
         subprocess.run(["git", "tag", f"train/{version}", "main"], cwd=self.bare("Up"), check=True)  # Up was promoted
+        self.commit_to("Up", "release", {"Up.New/Up.New.csproj": csproj([])})                    # added after the train
         built = self.rev("Down", "release")                                                        # what the train built
         lane = self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
         stray = self.commit_to("Down", "stray", {"Down.Lib/Stray.cs": "namespace Down; public class S {}"}, new=True)
@@ -722,8 +791,13 @@ class EndToEnd(unittest.TestCase):
         # A repository already tagged with that train is refused too.
         self.feed_env["TRAIN_PROMOTE"] = f"Up={self.rev('Up', 'main')}"
         self.assertIn("already exists; that repository was promoted", self.train("promote-only").stdout)
-        # A dry run checks and reports, pushing nothing.
+        # A version whose packages are not on the feed (a typo, a dry-run stamp) is refused before anything is pushed.
         self.feed_env.update(TRAIN_PROMOTE=f"Down={built}", TRAIN_DRY_RUN="true")
+        unpublished = self.train("promote-only")
+        self.assertNotEqual(unpublished.returncode, 0, unpublished.stdout)
+        self.assertIn(f"Down: Down.Lib not on the feed at {version}", unpublished.stdout)
+        (self.root / "orgfeed" / f"Down.Lib.{version}.nupkg").write_bytes(b"published by the stranded train")
+        # A dry run checks and reports, pushing nothing.
         dry = self.train("promote-only")
         self.assertEqual(dry.returncode, 0, dry.stdout)
         self.assertIn("Dry run: nothing pushed.", dry.stdout)
@@ -735,12 +809,77 @@ class EndToEnd(unittest.TestCase):
         main = self.rev("Down", "main")
         self.assertEqual(self.rev("Down", f"{main}^"), built)                                     # the pin commit on built
         self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        # Up is read at its train tag, not at its release tip: Up.New was not in that train, so its pin is left alone.
+        self.assertIn('Include="Up.New" Version="0.0.1.1"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
         self.assertEqual(self.rev("Down", f"train/{version}^{{commit}}"), main)
         self.assertEqual(self.rev("Down", "release"), lane)                                       # the lane's merge stays
         self.assertNotIn("Lane", subprocess.run(["git", "ls-tree", "-r", "--name-only", "main"], cwd=self.bare("Down"),
                                                 capture_output=True, text=True).stdout)          # untested work stays off main
         state = json.loads((self.root / "train/plan.json").read_text())
         self.assertEqual((state["promoted"], state["release_behind"]), (["Down"], ["Down"]))
+
+    def test_promote_only_re_derives_the_out_of_train_pins_the_train_packed(self):
+        """Step D's probe (review of fa42553): a train that rebuilt only Down packed Down's exact pin on Up.Lib moved to Up's
+        latest train tag; promote-only must commit that same pin, so main and the tag carry what was published."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")
+        self.release_branches("Up", "Down")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        first = json.loads((self.root / "train/plan.json").read_text())["version"]
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        # A lane on Down's release (which now carries train 1's pin commit) writes the old exact pin back.
+        work = self.root / "make" / "Down"
+        subprocess.run(["git", "checkout", "-q", "release"], cwd=work, check=True)
+        subprocess.run(["git", "fetch", "-q", str(self.bare("Down")), "release"], cwd=work, check=True)
+        subprocess.run(["git", "reset", "-q", "--hard", "FETCH_HEAD"], cwd=work, check=True)
+        self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}",
+                                           "Down.Lib/Down.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1"))})
+        # Train 2 rebuilds Down only and publishes it; its promotion never happens (stranded).
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        second = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(second["selected"], ["Down"])
+        self.assertEqual([p[1:] for p in second["repos"]["Down"]["pins"]], [["Up.Lib", "0.0.1.1", first]])
+        self.publish()
+        self.feed_env.update(TRAIN_VERSION=second["version"], TRAIN_PROMOTE=f"Down={second['repos']['Down']['base']}")
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn(f'Include="Up.Lib" Version="{first}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        self.assertEqual(self.rev("Down", f"train/{second['version']}^{{commit}}"), self.rev("Down", "main"))
+        self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["latest"], {"Up.Lib": first})
+
+    def test_a_ref_push_refused_although_the_ref_did_not_move_is_named_apart_from_a_moved_ref(self):
+        """A ref that refuses the train's fast-forward push (branch protection, the token's rights) is reported as such, not
+        as 'moved while the train ran'; main still takes the build."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")
+        self.release_branches("Up", "Down")
+        hook = self.bare("Down") / "hooks" / "pre-receive"
+        hook.write_text('#!/bin/sh\nwhile read old new ref; do\n  [ "$ref" = "refs/heads/release" ] && '
+                        '{ echo "release is protected" >&2; exit 1; }\ndone\nexit 0\n', newline="\n")
+        hook.chmod(0o755)
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        released = self.rev("Down", "release")
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["release_refused"], state["release_behind"], state["stranded"]), (["Down"], [], []))
+        self.assertEqual(self.rev("Down", "release"), released)
+        self.assertEqual(self.rev("Down", "main^"), released)                                      # main took the pin commit
+        record = self.train("record")
+        self.assertIn("was **refused although `release` did not move**", record.stdout)
 
 
 if __name__ == "__main__":
