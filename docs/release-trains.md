@@ -96,12 +96,45 @@ Phases, in the one job:
    person, and a host never again fails to compile against a float that moved under it (coordinator:C3, C6, P46).
    Repos still on floats need no pin step. **Owner decision** (filed): move consumers to exact pins now that the train
    can maintain them, or keep floats.
+   **Pins on packages outside the train** (coordinator:C44): an exact pin on a manifest package whose repo is NOT in
+   this train moves forward to the version of that repo's latest `train/*` tag (read from the clone, never the feed; a
+   tag only exists after its train published), never backwards, and a range or prerelease is left as written. So the
+   fleet converges on the newest train for every manifest package even when only some repos rebuild.
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
    host in the manifest with `deploy: true`, fire the existing shared `dispatch-deploy` (meshNet.Hosting azd) or the
    `deploy-host.yml` here (Merryn tenant hosts). Static web apps (Web.Vocab, Web.Pay) deploy themselves on the push to
    `main` as they do today; they simply get that push on the cadence.
 8. **Record.** Write the train summary (repos, packages and versions, items) to the run summary and `POST` it to
    Merryn as a release (the `list_releases` record FEAT-0114 added; today it is empty for meshNet).
+
+#### When `release` moves while the train runs (coordinator:C44, from train 0.0.2474.11566)
+
+Lanes merge into `release` continuously, so a merge landing between plan and promote is the common case, not an edge
+case. The first live train hit it: Commerce's `release` moved at 06:30Z, the pin commit's push was refused, and the
+promote step stopped there, leaving Commerce, Pay and the four External.* repos published but not promoted.
+
+- **Promotion never stops at the first repo.** Publication already happened, so each repo is promoted on its own; one
+  that cannot be (main moved by someone else, a refused tag) is recorded as **stranded** with the sha it was built from,
+  the others are still promoted, and the step fails at the end naming every stranded repo. The summary prints the
+  exact promote-only input to finish them.
+- **The pin commit vs a moved `release`: rule (a).** `main` always takes exactly what was built and tested (the pin
+  commit included) and is tagged; the pin commit goes to `release` only when that is still a fast-forward, otherwise the
+  summary warns and `release` keeps the lane's merge. The next plan accepts a repo whose `main` is ahead of `release` by
+  **train commits only** (author `release-train`, subject `[train …]`), and its build records `main` as merged with
+  `git merge -s ours` (the tree stays exactly `release`'s; the train re-derives the pins), so `release` and `main`
+  fast-forward together again. Anything else ahead on `main` is still refused.
+  - Rejected (b), runner-local pins with `main == release`: the owner's 2026-10-08 decision
+    (q-coordinator-release-trains-accept-the-five-recommended-setti, setting 4) is that the train commits the pins as
+    `[train <id>] pin …` on `release` and `main`; (b) would leave source pins one train behind the nuspecs.
+  - Rejected (c), rebase the pin commit onto the moved `release` and push both: the lane's merge would reach `main`
+    without having been built or tested by this train.
+- **Recovery: promote-only.** Dispatch with `promote-only: <repo>=<sha>, …` and `version: <train id>` (packages already on
+  the feed). It clones the manifest, checks every entry before pushing anything (the sha is on `release` or already on
+  `main`; `main` is its ancestor or ahead by train commits only; the repo is not already tagged with that train),
+  re-derives that train's pins on the sha (packages of repos tagged with it plus the named ones), fast-forwards `main`,
+  tags `train/<version>`, and pushes the pin commit to `release` only as a fast-forward. With `dry-run: true` it checks
+  and reports, pushing nothing. It never promotes a lane's later merge under an old train's stamp: the sha names exactly
+  what was built.
 
 The `main` push that step 7 makes must not start the old per-repo publish workflows. Those workflows are retired in
 the cutover (kept as `workflow_dispatch` only for the first month, then deleted), so a `main` push triggers nothing but

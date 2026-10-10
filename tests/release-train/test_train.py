@@ -181,6 +181,81 @@ class Unit(unittest.TestCase):
         self.assertIn('Version="1"', (repo / "obj" / "Stale.csproj").read_text())          # obj/ is never touched
         self.assertEqual(self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms"}, "0.0.2472.17298"), [])  # idempotent
 
+    def test_a_pin_on_a_package_outside_the_train_moves_forward_to_its_latest_train_tag_and_never_back(self):
+        repo = Path(self.tmp.name) / "latest"
+        (repo / "Host").mkdir(parents=True)
+        (repo / "Host" / "Host.csproj").write_text(textwrap.dedent("""\
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <PackageReference Include="meshNet.Common" Version="0.0.2470.100" />
+                <PackageReference Include="meshNet.Users" Version="0.0.2475.1" />
+                <PackageReference Include="meshNet.Shares" Version="[0.0.2470.1, )" />
+                <PackageReference Include="meshNet.Networks" Version="*" />
+                <PackageReference Include="meshNet.Commerce" Version="0.0.2470.100" />
+              </ItemGroup>
+            </Project>
+            """))
+        latest = {"meshNet.Common": "0.0.2474.11566", "meshNet.Users": "0.0.2474.11566",
+                  "meshNet.Shares": "0.0.2474.11566", "meshNet.Networks": "0.0.2474.11566"}
+        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce"}, "0.0.2476.9", latest)
+        self.assertEqual({(c[1], c[2], c[3]) for c in changed},
+                         {("meshNet.Common", "0.0.2470.100", "0.0.2474.11566"),     # outside the train: its latest tag
+                          ("meshNet.Commerce", "0.0.2470.100", "0.0.2476.9")})      # in the train: the train version
+        text = (repo / "Host" / "Host.csproj").read_text()
+        self.assertIn('Include="meshNet.Users" Version="0.0.2475.1"', text)            # never moved back
+        self.assertIn('Include="meshNet.Shares" Version="[0.0.2470.1, )"', text)       # a range is left as written
+        self.assertIn('Include="meshNet.Networks" Version="*"', text)                  # a float stays a float
+
+    def test_promote_only_entries_parse_like_ref_overrides(self):
+        self.assertEqual(self.train.repo_assignments("meshNet.Commerce=f16e4b1,\nmeshNet.Pay = 0b9a6ae",
+                                                     "promote-only entry", "sha"),
+                         {"meshNet.Commerce": "f16e4b1", "meshNet.Pay": "0b9a6ae"})
+        with self.assertRaises(self.train.TrainError) as raised:
+            self.train.repo_assignments("meshNet.Pay=1,meshNet.Pay=2", "promote-only entry", "sha")
+        self.assertIn("conflicting promote-only entrys for meshNet.Pay", str(raised.exception))
+        with self.assertRaises(self.train.TrainError) as raised:
+            self.train.repo_assignments("meshNet.Pay", "promote-only entry", "sha")
+        self.assertIn("is not of the form repo=sha", str(raised.exception))
+
+    def test_promote_only_refuses_anything_but_a_commit_id_before_touching_the_work_folder(self):
+        from unittest.mock import patch
+        manifest = Path(self.tmp.name) / "m.json"
+        manifest.write_text(json.dumps({"org": "o", "repos": ["Down"]}))
+        self.train.WORK.mkdir(parents=True, exist_ok=True)
+        sentinel = self.train.WORK / "keep.txt"
+        sentinel.write_text("existing work")
+        for value in ("--output=/tmp/x", "release", "HEAD~1", "f16e4b"):
+            with self.subTest(value=value), patch.dict(os.environ, TRAIN_MANIFEST=str(manifest),
+                                                       TRAIN_VERSION="0.0.2474.11566", TRAIN_PROMOTE=f"Down={value}"):
+                with self.assertRaises(self.train.TrainError) as raised:
+                    self.train.cmd_promote_only()
+                self.assertIn("promote-only takes commit ids", str(raised.exception))
+        with patch.dict(os.environ, TRAIN_MANIFEST=str(manifest), TRAIN_VERSION="latest", TRAIN_PROMOTE="Down=f16e4b1"):
+            with self.assertRaises(self.train.TrainError) as raised:
+                self.train.cmd_promote_only()
+            self.assertIn("needs the train version", str(raised.exception))
+        self.assertEqual(sentinel.read_text(), "existing work")
+
+    def test_the_summary_names_stranded_repositories_and_a_ref_left_behind(self):
+        import contextlib, io
+        self.train.WORK.mkdir(parents=True, exist_ok=True)
+        repo = lambda sha: {"selected": True, "reason": "release moved", "sha": sha, "items": []}
+        plan = {"org": "o", "ref": "release", "version": "0.0.9.1", "dry_run": False, "repo_order": ["A", "B", "C"],
+                "repo_edges": {"A": [], "B": [], "C": []}, "selected": ["A", "B", "C"], "packages": [],
+                "repos": {"A": repo("a" * 40), "B": repo("b" * 40), "C": repo("c" * 40)},
+                "promoted": ["A", "B"], "release_behind": ["B"],
+                "stranded": [{"repo": "C", "sha": "c" * 40, "base": "d" * 40, "reason": "command failed (1): git push"}]}
+        self.train.PLAN.write_text(json.dumps(plan))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.train.cmd_record()
+        text = out.getvalue()
+        self.assertIn("Promoted (main fast-forwarded, tagged `train/0.0.9.1`): A, B.", text)
+        self.assertIn("`release` moved while the train ran", text)
+        self.assertIn("(main does; the next train reconciles it): B.", text)
+        self.assertIn("**Stranded** (published at 0.0.9.1, main not moved, not tagged): C.", text)
+        self.assertIn("promote-only `C=" + "d" * 40 + "`", text)
+
     def test_a_package_that_restored_a_sibling_from_outside_the_train_fails(self):
         self._nupkg("A", "0.0.9.1", [("B", "0.0.9.1"), ("Newtonsoft.Json", "13.0.3")])
         self.assertEqual(self.train.check_package("A", "0.0.9.1", {"A", "B"})["dependencies"], ["B 0.0.9.1"])
@@ -258,13 +333,16 @@ class EndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def repo(self, name, files):
+    def repo(self, name, files, org_feed=False):
         work = self.root / "make" / name
         work.mkdir(parents=True)
         (work / "Directory.Build.props").write_text(PROPS)
+        # org_feed: a folder standing in for the org's package feed, which publish() below copies the local feed into.
+        org = f'<add key="org" value="{self.root / "orgfeed"}" />' if org_feed else ""
+        (self.root / "orgfeed").mkdir(exist_ok=True)
         (work / "nuget.config").write_text('<?xml version="1.0" encoding="utf-8"?><configuration><packageSources>'
                                            '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />'
-                                           '</packageSources></configuration>')
+                                           f'{org}</packageSources></configuration>')
         for rel, text in files.items():
             (work / rel).parent.mkdir(parents=True, exist_ok=True)
             (work / rel).write_text(text)
@@ -287,6 +365,39 @@ class EndToEnd(unittest.TestCase):
         subprocess.run(["git", "push", "-q", str(self.server / "o" / f"{name}.git"), branch], cwd=work, check=True)
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True, check=True).stdout.strip()
 
+    def bare(self, name):
+        return self.server / "o" / f"{name}.git"
+
+    def rev(self, name, ref):
+        return subprocess.run(["git", "rev-parse", ref], cwd=self.bare(name), capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def file_at(self, name, ref, path):
+        return subprocess.run(["git", "show", f"{ref}:{path}"], cwd=self.bare(name), capture_output=True, text=True,
+                              check=True).stdout
+
+    def is_ancestor(self, name, a, b):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=self.bare(name)).returncode == 0
+
+    def release_branches(self, *names):
+        for name in names:
+            subprocess.run(["git", "branch", "release", "main"], cwd=self.bare(name), check=True)
+            subprocess.run(["git", "branch", "release", "main"], cwd=self.root / "make" / name, check=True)
+
+    def publish(self):
+        """Stands in for the publish step: the local feed's packages land on the 'org' feed folder."""
+        for nupkg in (self.root / "train" / "feed").glob("*.nupkg"):
+            (self.root / "orgfeed" / nupkg.name).write_bytes(nupkg.read_bytes())
+
+    def live(self, ref="release"):
+        self.feed_env.update(TRAIN_REF=ref, TRAIN_DRY_RUN="false")
+
+    def pinned_repo(self, name, up, version="0.0.1.1"):
+        lib = (f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="{up}.Lib" Version="{version}" />'
+               f'</ItemGroup></Project>\n')
+        self.repo(name, {f"{name}.Lib/{name}.Lib.csproj": lib,
+                         f"{name}.Lib/Class.cs": f"namespace {name}; public class B : {up}.A {{}}"}, org_feed=True)
+
     def two_repos(self):
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
                          "Up.slnx": '<Solution><Project Path="Up.Lib/Up.Lib.csproj" /></Solution>'})
@@ -302,7 +413,7 @@ class EndToEnd(unittest.TestCase):
     def train(self, command):
         # Git creates read-only pack files on Windows. Make this throwaway fixture writable before
         # a second plan removes it; production Actions runs on Linux. Do not change train behavior.
-        if os.name == "nt" and command == "plan":
+        if os.name == "nt" and command in ("plan", "promote-only"):
             for path in (self.root / "train").rglob("*"):
                 if path.is_file():
                     path.chmod(path.stat().st_mode | stat.S_IWRITE)
@@ -346,14 +457,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(build.returncode, 0, build.stdout)
         state = json.loads((self.root / "train" / "plan.json").read_text())
         version = state["version"]
-        self.assertIn("Down: pinned 1 reference(s) to " + version, build.stdout)
+        self.assertIn(f"Down: pinned 1 reference(s): Up.Lib (0.0.1.1 -> {version})", build.stdout)
         pins = [[Path(path).as_posix(), package, old, new] for path, package, old, new in state["repos"]["Down"]["pins"]]
         self.assertEqual(pins, [["Down.Lib/Down.Lib.csproj", "Up.Lib", "0.0.1.1", version]])
         down = next(p for p in state["packages"] if p["id"] == "Down.Lib")
         self.assertEqual(down["dependencies"], [f"Up.Lib {version}"])
         self.assertIn(f'Include="Up.Lib" Version="{version}"',
                       (self.root / "train" / "src" / "Down" / "Down" / "Down.Lib" / "Down.Lib.csproj").read_text())
-        self.assertNotIn("pinned", state["repos"]["Down"])  # a dry run commits nothing
+        self.assertNotIn("train_commits", state["repos"]["Down"])  # a dry run commits nothing
 
     def test_a_sibling_checkout_switch_never_sees_the_other_train_repos(self):
         # Like meshNet.Commerce: a project that builds against a sibling checkout when one sits next to it must build
@@ -497,6 +608,139 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Down: main (", plan.stdout)
         self.assertIn("is not an ancestor of lane", plan.stdout)
         self.assertNotIn("WARNING", plan.stdout)
+
+    # --- coordinator:C44: a ref that moves between plan and promote, stranding, reconciling, promote-only -----------------
+
+    def test_a_ref_that_moves_during_the_train_keeps_the_lane_s_work_and_strands_nothing_else(self):
+        """The first live train (0.0.2474.11566): Commerce's release moved between plan and promote, its pin commit push
+        was refused, and every repository after it was left published but unpromoted. Now: the moved repository's main
+        still takes exactly what was built (pin commit included) and is tagged, its release keeps the lane's merge, a
+        repository whose main cannot move is reported as stranded, and every other repository is promoted."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")                                   # like Commerce: pins Up exactly, gets a pin commit
+        self.repo("Mid", {"Mid.Lib/Mid.Lib.csproj": csproj(["Up.Lib"]),
+                          "Mid.Lib/Class.cs": "namespace Mid; public class M : Up.A {}"})
+        self.repo("Side", {"Side.Lib/Side.Lib.csproj": csproj(["Up.Lib"]),
+                           "Side.Lib/Class.cs": "namespace Side; public class S : Up.A {}"})
+        self.release_branches("Up", "Down", "Mid", "Side")
+        # Side's release is ahead of its main, so its promotion has to push main (a main already equal to what was built
+        # needs no push, and a later commit on main then strands nothing: main still contains the built sha).
+        self.commit_to("Side", "release", {"Side.Lib/Feature.cs": "namespace Side; public class F {}"})
+        self.manifest([{"repo": n, "test": False} for n in ("Up", "Side", "Down", "Mid")])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        version, built = state["version"], state["repos"]
+        # While the train runs: a lane merges into Down's release, and someone pushes Side's main directly.
+        lane = self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
+        self.commit_to("Side", "main", {"Side.Lib/Hotfix.cs": "namespace Side; public class H {}"})
+        promote = self.train("promote")
+        self.assertNotEqual(promote.returncode, 0, promote.stdout)       # the job fails ...
+        self.assertIn("1 repository(ies) published at " + version + " but not promoted: Side", promote.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["promoted"], ["Up", "Down", "Mid"])       # ... but nothing after the failure is stranded
+        self.assertEqual([s["repo"] for s in state["stranded"]], ["Side"])
+        self.assertEqual(state["stranded"][0]["base"], built["Side"]["base"])
+        self.assertEqual(state["release_behind"], ["Down"])
+        # Down: main is the pin commit that was built, tagged; release still carries the lane's merge.
+        self.assertEqual(self.rev("Down", "main"), built["Down"]["sha"])
+        self.assertEqual(self.rev("Down", f"train/{version}^{{commit}}"), built["Down"]["sha"])
+        self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        self.assertEqual(self.rev("Down", "release"), lane)
+        # Side: untouched, untagged.
+        self.assertNotEqual(subprocess.run(["git", "rev-parse", "-q", "--verify", f"train/{version}"],
+                                           cwd=self.bare("Side"), capture_output=True).returncode, 0)
+        record = self.train("record")
+        self.assertIn("**Stranded** (published at " + version + ", main not moved, not tagged): Side.", record.stdout)
+        self.assertIn("(main does; the next train reconciles it): Down.", record.stdout)
+
+    def test_the_next_train_reconciles_main_s_pin_commit_and_moves_out_of_train_pins_to_the_latest_tag(self):
+        """Rule (a)'s second half: after a train left main ahead of release by its pin commit, the next live plan accepts
+        the repository instead of refusing it, and promotion fast-forwards both release and main again. An exact pin on a
+        package not rebuilt in that train moves to its repository's latest train tag version."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")
+        self.release_branches("Up", "Down")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        first = json.loads((self.root / "train/plan.json").read_text())["version"]
+        self.publish()
+        lane = self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        pin_commit = self.rev("Down", "main")
+        self.assertFalse(self.is_ancestor("Down", "main", "release"))  # main is ahead of release by the pin commit
+        # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved.
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("is ahead of release by train commits only; this train reconciles it", plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["selected"], ["Down"])
+        self.assertEqual(state["latest"], {"Up.Lib": first})
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        second = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual([p[1:] for p in second["repos"]["Down"]["pins"]], [["Up.Lib", "0.0.1.1", first]])
+        self.assertEqual(second["packages"][0]["id"], "Down.Lib")
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        self.assertEqual(self.rev("Down", "release"), self.rev("Down", "main"))  # both moved, as fast-forwards
+        for ancestor in (lane, pin_commit):
+            self.assertTrue(self.is_ancestor("Down", ancestor, "main"))
+        self.assertIn(f'Include="Up.Lib" Version="{first}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        self.assertIn("class Lane", self.file_at("Down", "main", "Down.Lib/Lane.cs"))
+        self.assertEqual(self.rev("Down", f"train/{second['version']}^{{commit}}"), self.rev("Down", "main"))
+
+    def test_promote_only_finishes_a_stranded_promotion_and_refuses_a_sha_that_is_not_on_release(self):
+        """Recovery for the first train's stranded repositories: packages already on the feed at the version; main moves
+        to the sha the train built from plus that train's pins, and the tag goes on it. Every entry is checked first."""
+        version = "0.0.2474.11566"
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")
+        self.release_branches("Up", "Down")
+        subprocess.run(["git", "tag", f"train/{version}", "main"], cwd=self.bare("Up"), check=True)  # Up was promoted
+        built = self.rev("Down", "release")                                                        # what the train built
+        lane = self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
+        stray = self.commit_to("Down", "stray", {"Down.Lib/Stray.cs": "namespace Down; public class S {}"}, new=True)
+        main_before = self.rev("Down", "main")
+        self.manifest(["Up", "Down"])
+        self.live()
+        self.feed_env.update(TRAIN_VERSION=version)
+        # A sha that is not on release (or main) is refused, and nothing is pushed.
+        self.feed_env["TRAIN_PROMOTE"] = f"Down={stray}"
+        refused = self.train("promote-only")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("promote-only refused, nothing was pushed", refused.stdout)
+        self.assertIn(f"Down: {stray[:12]} is not on release", refused.stdout)
+        self.assertEqual(self.rev("Down", "main"), main_before)
+        # A repository already tagged with that train is refused too.
+        self.feed_env["TRAIN_PROMOTE"] = f"Up={self.rev('Up', 'main')}"
+        self.assertIn("already exists; that repository was promoted", self.train("promote-only").stdout)
+        # A dry run checks and reports, pushing nothing.
+        self.feed_env.update(TRAIN_PROMOTE=f"Down={built}", TRAIN_DRY_RUN="true")
+        dry = self.train("promote-only")
+        self.assertEqual(dry.returncode, 0, dry.stdout)
+        self.assertIn("Dry run: nothing pushed.", dry.stdout)
+        self.assertEqual(self.rev("Down", "main"), main_before)
+        # The real thing.
+        self.feed_env["TRAIN_DRY_RUN"] = "false"
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        main = self.rev("Down", "main")
+        self.assertEqual(self.rev("Down", f"{main}^"), built)                                     # the pin commit on built
+        self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        self.assertEqual(self.rev("Down", f"train/{version}^{{commit}}"), main)
+        self.assertEqual(self.rev("Down", "release"), lane)                                       # the lane's merge stays
+        self.assertNotIn("Lane", subprocess.run(["git", "ls-tree", "-r", "--name-only", "main"], cwd=self.bare("Down"),
+                                                capture_output=True, text=True).stdout)          # untested work stays off main
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["promoted"], state["release_behind"]), (["Down"], ["Down"]))
 
 
 if __name__ == "__main__":
