@@ -70,8 +70,10 @@ one. A cycle fails the run and names the cycle.
 corresponding project has a change. Follow the build process and don't mess it up." A package is in the train when:
 - its project changed since its last publication. That means a file under its folder, under a project it references,
   or under a path outside its folder that its `.csproj` names (`../Shared/**/*.cs`, an `Import`). It also means a
-  `Directory.Build.props`/`.targets`, `Directory.Packages.props`, `nuget.config` or `global.json` in its folder or any
-  folder above it;
+  `Directory.Build.props`/`.targets`/`.rsp`, `Directory.Packages.props`, `nuget.config`, `global.json` or
+  `.editorconfig` in its folder or any folder above it, or a file one of those MSBuild files `<Import>`s (followed
+  through its own imports; an import that starts with a property such as `GetPathOfFileAbove` is not followed, since
+  the parent props it names are watched by name);
 - a package it depends on is in the train (the dependency's version moves, so its nuspec does too), or it is packed
   with one that is (a `ProjectReference` is packed as a dependency at the train version);
 - or it was never published (the org feed has no version of it).
@@ -84,8 +86,11 @@ the commit that the newest version on the org feed was packed from, which Source
 `<repository commit="…">`. Files are compared from the merge base (`baseline...ref`), so a train's own pin commit, which
 only `main` took, is not mistaken for a change. When the repository never received that commit (the first train's
 pin commits for Commerce and Pay were lost with its runner), the train uses `ref` as it stood 30 minutes before that
-version's stamp. That margin can only count more changes, never fewer. A feed version that names no commit counts as
-changed.
+version's stamp, by first-parent committer date. That margin covers the plan reading the repositories before the stamp.
+It can still undercount: a commit committed before the cutoff but fast-forwarded onto `ref` after the stamp keeps its
+old date, so it can fall behind the baseline and be treated as already published. Only a repository no train has
+tagged uses this fallback, and only until its first `train/*` tag; add an affected package to a train by hand if in
+doubt. A feed version that names no commit counts as changed.
 
 A repository is **in the train** when one of its packages is, or when `ref` has commits `main` lacks. A workflow-only
 or docs-only change is promoted and tagged with nothing published. A repository with `ref` equal to `main` and no
@@ -118,15 +123,15 @@ Only when every selected repository has passed does the train push the packages,
 publishes something it cannot promote; a dry run promotes nothing, so there it is a warning in the summary instead
 and the branch is still built and tested. A failure anywhere publishes nothing.
 
-Put the wrapper in the tenant's aggregator repository (meshNet for meshNet):
+Put the wrapper in the tenant's aggregator repository (meshNet for meshNet). It has **no schedule**: a release is
+proposed (when its planned group of work is done, or after a few days of accumulated work) and is dispatched live
+only on the owner's yes. A hotfix train is the same dispatch.
 
 ```yaml
 # .github/workflows/release-train.yml
 name: Release train
 on:
-  schedule:
-    - cron: "0 2 * * 2,5"          # Tue and Fri 02:00 UTC
-  workflow_dispatch:
+  workflow_dispatch:                # never a schedule: each release runs on the owner's yes
     inputs:
       dry-run: { type: boolean, default: true }
       override: { type: boolean, default: false, description: "Run even at ACTIONS_BUDGET_STATE=hard (hotfix)" }
@@ -137,16 +142,16 @@ jobs:
     uses: meshent/merryn-github/.github/workflows/dotnet-release-train.yml@main
     with:
       manifest: release-train.json
-      dry-run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
-      override: ${{ github.event_name == 'workflow_dispatch' && inputs.override }}
+      dry-run: ${{ inputs.dry-run }}
+      override: ${{ inputs.override }}
     secrets:
       repos-token: ${{ secrets.MESHENT_CI_PAT }}
       packages-token: ${{ secrets.MESHENT_CI_PAT }}
 ```
 
 While `dry-run` is true (the default until the first real train), the run stops after packing. It uploads the local
-feed as the artifact `release-train-<version>` and publishes and promotes nothing. The wrapper above keeps scheduled
-runs dry until you change that line.
+feed as the artifact `release-train-<version>` and publishes and promotes nothing. Rehearse a proposal with a dry run,
+then dispatch it with `dry-run: false` once the owner says yes.
 
 | input | meaning |
 |---|---|
