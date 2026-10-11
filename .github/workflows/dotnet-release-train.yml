@@ -1,18 +1,23 @@
-# Reusable: the release train. One run, one job, every repository in a manifest, in dependency order, one version.
+# Reusable: the release train. One run, one job, every repository in a manifest, in dependency order, one version stamp
+# for the packages that changed.
 #
 # Call it from a thin wrapper in the tenant's aggregator repository (see README.md), on a schedule plus a dispatch for a
 # hotfix train. The job:
 #
 #   plan     clones every manifest repository at `ref` (default `release`), reads every .csproj, and sorts the
 #            repositories (then the projects inside each) by their package edges: a PackageReference to a package
-#            another manifest repository produces is an edge. A cycle fails the run and names it. A repository is in
-#            the train when `ref` moved since its latest train/* tag (or it has none). The version is derived ONCE
-#            from the clock with Directory.Build.props' formula (UTC, one reading) and is the train id.
+#            another manifest repository produces is an edge. A cycle fails the run and names it. A PACKAGE is in the
+#            train only when its project changed since its last publication (the repository's latest train/* tag, else
+#            the commit its newest version on the org feed was packed from), a package it depends on is in the train, or
+#            it was never published; every other package is neither packed nor pushed. A repository is in the train when
+#            one of its packages is, or when `ref` has commits main lacks (main moves even when nothing is published).
+#            The version stamp is read ONCE from the clock with Directory.Build.props' formula (UTC, one reading) and is
+#            the train id; nothing sets Version*, PackageVersion or GITHUB_RUN_NUMBER by hand.
 #   build    bottom-up, per selected repository: adds the runner-local feed to its nuget.config (never committed), runs
 #            its tests from source (with -p:UseProjectReferences=true where Directory.Build.targets has that switch),
-#            then packs every packable project WITHOUT the switch, from a copy taken before anything was built, into
-#            the local feed. A downstream repository restores the upstream packed minutes earlier. Every package must
-#            carry the train version and every in-train dependency in its nuspec must name that same version.
+#            then packs every package of it that is in the train WITHOUT the switch, from a copy taken before anything
+#            was built, into the local feed. A downstream repository restores the upstream packed minutes earlier. Every
+#            package must carry the train stamp and every in-train dependency in its nuspec must name that same version.
 #   publish  only when every selected repository built and passed: pushes each package, in order, --skip-duplicate.
 #   promote  per repository: pushes the train's pin commit to `ref` when that still fast-forwards (when a lane merged
 #            into `ref` while the train ran, `ref` keeps the lane's work and the next plan reconciles), fast-forwards main
@@ -122,12 +127,13 @@ jobs:
           TRAIN_WORK):
 
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
-                      package edges (a cycle fails, naming it), select the repos whose TRAIN_REF moved since their latest
-                      train/* tag, derive the one version stamp, refuse a repo whose main is not an ancestor of TRAIN_REF
+                      package edges (a cycle fails, naming it), select the packages that changed since their last
+                      publication (select_packages) and the repos that carry one or are ahead of main, read the one
+                      version stamp from the clock, refuse a repo whose main is not an ancestor of TRAIN_REF
                       (a dry run warns instead: it promotes nothing). TRAIN_REF_OVERRIDES, dry runs only, takes the
                       repos it names at another branch, so a lane branch can ride a rehearsal before it merges
             build     per selected repo, bottom-up: bump every exact pin on an in-train package to the train version
-                      (committed on a live train), point its nuget.config at the local feed, pack every packable project
+                      (committed on a live train), point its nuget.config at the local feed, pack its in-train projects
                       (without the source-graph switch, from an untouched copy) into the local feed, check every package
                       carries the train version and every in-train dependency in its nuspec names that same version, then
                       run its test gate from source
@@ -145,6 +151,7 @@ jobs:
           REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL, MERRYN_TOKEN; GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and GITHUB_SERVER_URL as
           Actions sets them.
           """
+          import io
           import json
           import os
           import re
@@ -155,7 +162,7 @@ jobs:
           import xml.etree.ElementTree as ET
           import zipfile
           from base64 import b64encode
-          from datetime import datetime, timezone
+          from datetime import datetime, timedelta, timezone
           from pathlib import Path
 
           WORK = Path(os.environ.get("TRAIN_WORK", "train")).resolve()
@@ -313,6 +320,27 @@ jobs:
               return packages, projects
 
 
+          def outside_paths(dest, csproj):
+              """Repo-relative paths outside the project's folder that its .csproj names (an Import, a Compile or None
+              Include such as ../Shared/**/*.cs), each cut at its first wildcard or property: a change under one changes what
+              the project builds. A ProjectReference is followed through its own project instead."""
+              base, dest, found = Path(csproj).parent.resolve(), Path(dest).resolve(), set()
+              for el in ET.parse(csproj).getroot().iter():
+                  if el.tag.split("}")[-1] == "ProjectReference":
+                      continue
+                  for attr in ("Include", "Project", "Update"):
+                      for part in (el.get(attr) or "").replace("\\", "/").split(";"):
+                          part = re.sub(r"^\$\((MSBuildThisFileDirectory|MSBuildProjectDirectory)\)/?", "", part.strip())
+                          if not part.startswith("../"):
+                              continue
+                          static = re.split(r"[*?$%@]", part, maxsplit=1)
+                          prefix = static[0] if len(static) == 1 else static[0].rpartition("/")[0]
+                          target = (base / prefix).resolve()
+                          if target.is_relative_to(dest) and not target.is_relative_to(base):
+                              found.add(target.relative_to(dest).as_posix())
+              return sorted(found)
+
+
           def describe_project(dest, csproj):
               packages, projects = read_csproj(csproj)
               props = msbuild_properties(csproj, ["PackageId", "IsPackable", "IsTestProject"])
@@ -320,7 +348,8 @@ jobs:
               packable = props.get("IsPackable", "").lower() != "false" and not test
               return {"path": str(Path(csproj).relative_to(dest)), "id": props.get("PackageId") or Path(csproj).stem,
                       "packable": packable, "packages": sorted(packages),
-                      "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest))}
+                      "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest)),
+                      "outside": outside_paths(dest, csproj)}
 
 
           def find_solution(dest, repo):
@@ -378,6 +407,12 @@ jobs:
               return f"0.0.{build}.{revision}" if revision else f"0.0.{build}"
 
 
+          def stamp_time(version):
+              """The UTC moment a 0.0.<build>.<revision> stamp was read: stamp()'s inverse, to the second."""
+              parts = version_key(version) + (0, 0)
+              return EPOCH + timedelta(days=parts[2], seconds=parts[3] * 2)
+
+
           # --- nuget.config ------------------------------------------------------------------------------------------------
 
           def point_at_local_feed(dest, train_ids):
@@ -428,10 +463,10 @@ jobs:
               exact pins (dependencies tracked, never discovered) and one-version trains compatible: the train is the one place
               that knows the version it is about to publish, so it maintains the pins, and on a live train commits them.
 
-              latest maps a manifest package NOT in this train to the version of its repository's latest train/* tag (already
-              on the feed: a tag is only made after publish). An exact pin on one moves forward to that version, never back,
-              and a range or prerelease is left as written, so the fleet converges on the newest train for every manifest
-              package even when only some repositories rebuild."""
+              latest maps a package NOT in this train to a version a train already set for it on main (the pins carried over
+              when main is ahead of the ref by train commits only). An exact pin on one moves forward to that version, never
+              back, and a range or prerelease is left as written. Every other pin stays exactly as the source has it: the
+              train never moves a pin to a version of a package it did not publish."""
               latest = latest or {}
               changed = []
               for path in sorted(list(Path(dest).rglob("*.csproj")) + list(Path(dest).rglob("Directory.Packages.props"))):
@@ -499,7 +534,7 @@ jobs:
                       "dependencies": [f"{d} {v}" for d, v in deps if d in train_ids]}
 
 
-          # --- Reading the org feed (promote-only) -------------------------------------------------------------------------
+          # --- Reading the org feed (each package's last publication; promote-only) -----------------------------------------
 
           class _NoRedirect(urllib.request.HTTPRedirectHandler):
               # The feed request carries the packages token: never follow a redirect with it to another host.
@@ -510,11 +545,42 @@ jobs:
           _FEED = {}
 
 
+          def _feed_source(org):
+              """TRAIN_FEED names the feed: a NuGet v3 service index URL (default GitHub Packages for org) or a folder of
+              .nupkg files."""
+              return os.environ.get("TRAIN_FEED", "").strip() or f"https://nuget.pkg.github.com/{org}/index.json"
+
+
+          def _feed_get(source, url):
+              """GET url with the packages token. A redirect (GitHub Packages hands a download to blob storage) is followed
+              once, over https only, WITHOUT the token, so the token never leaves the feed's host."""
+              headers = {}
+              if os.environ.get("PACKAGES_TOKEN") and source.startswith("https://"):
+                  headers["Authorization"] = f"Basic {basic_auth(os.environ['PACKAGES_TOKEN'])}"
+              opener = urllib.request.build_opener(_NoRedirect)
+              try:
+                  with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
+                      return response.read()
+              except urllib.error.HTTPError as error:
+                  location = (error.headers.get("Location") or "") if error.code in (301, 302, 303, 307, 308) else ""
+                  if not location.startswith("https://"):
+                      raise
+                  with opener.open(urllib.request.Request(location), timeout=120) as response:
+                      return response.read()
+
+
+          def _feed_base(source):
+              if (source, None) not in _FEED:
+                  index = json.loads(_feed_get(source, source).decode("utf-8"))
+                  _FEED[(source, None)] = next(r["@id"].rstrip("/") for r in index.get("resources", [])
+                                               if str(r.get("@type", "")).startswith("PackageBaseAddress/3.0.0"))
+              return _FEED[(source, None)]
+
+
           def feed_versions(org, package_id):
-              """The versions of package_id on the org's feed, as NuGet normalizes them (lower case). TRAIN_FEED names the feed:
-              a NuGet v3 service index URL (default GitHub Packages for org) or a folder of .nupkg files. A package the feed
-              does not have is an empty set; a feed that cannot be read raises, so promote-only fails closed."""
-              source = os.environ.get("TRAIN_FEED", "").strip() or f"https://nuget.pkg.github.com/{org}/index.json"
+              """The versions of package_id on the org's feed, as NuGet normalizes them (lower case). A package the feed does
+              not have is an empty set; a feed that cannot be read raises, so the plan and promote-only fail closed."""
+              source = _feed_source(org)
               key = package_id.lower()
               if (source, key) in _FEED:
                   return _FEED[(source, key)]
@@ -523,23 +589,10 @@ jobs:
                   versions = {p.name.lower()[len(prefix):-len(".nupkg")] for p in Path(source).glob("*.nupkg")
                               if p.name.lower().startswith(prefix)}
               else:
-                  opener = urllib.request.build_opener(_NoRedirect)
-                  headers = {"Accept": "application/json"}
-                  if os.environ.get("PACKAGES_TOKEN") and source.startswith("https://"):
-                      headers["Authorization"] = f"Basic {basic_auth(os.environ['PACKAGES_TOKEN'])}"
-
-                  def get(url):
-                      with opener.open(urllib.request.Request(url, headers=headers), timeout=30) as response:
-                          return json.loads(response.read().decode("utf-8"))
-
                   try:
-                      if (source, None) not in _FEED:
-                          index = get(source)
-                          _FEED[(source, None)] = next(r["@id"].rstrip("/") for r in index.get("resources", [])
-                                                       if str(r.get("@type", "")).startswith("PackageBaseAddress/3.0.0"))
                       try:
-                          url = f"{_FEED[(source, None)]}/{urllib.parse.quote(key, safe='')}/index.json"
-                          versions = {v.lower() for v in get(url).get("versions", [])}
+                          url = f"{_feed_base(source)}/{urllib.parse.quote(key, safe='')}/index.json"
+                          versions = {v.lower() for v in json.loads(_feed_get(source, url).decode("utf-8")).get("versions", [])}
                       except urllib.error.HTTPError as error:
                           if error.code != 404:
                               raise
@@ -548,6 +601,174 @@ jobs:
                       raise TrainError(f"could not read the package feed {source} for {package_id}: {redact(str(error))}")
               _FEED[(source, key)] = versions
               return versions
+
+
+          def feed_commit(org, package_id, version):
+              """The commit a published package was packed from: the <repository commit> its nuspec carries (Source Link
+              writes it on every pack). None when the nuspec names none. A package that cannot be read raises."""
+              source, key, ver = _feed_source(org), package_id.lower(), version.lower()
+              try:
+                  if not re.match(r"https?://", source):
+                      found = [p for p in Path(source).glob("*.nupkg") if p.name.lower() == f"{key}.{ver}.nupkg"]
+                      if not found:
+                          raise TrainError(f"{package_id} {version} is not in the feed folder {source}")
+                      data = found[0].read_bytes()
+                  else:
+                      quoted = urllib.parse.quote(key, safe="")
+                      data = _feed_get(source, f"{_feed_base(source)}/{quoted}/{ver}/{quoted}.{ver}.nupkg")
+                  with zipfile.ZipFile(io.BytesIO(data)) as z:
+                      name = next(n for n in z.namelist() if n.endswith(".nuspec") and "/" not in n)
+                      root = ET.fromstring(z.read(name))
+              except (OSError, ValueError, StopIteration, KeyError, zipfile.BadZipFile, ET.ParseError) as error:
+                  raise TrainError(f"could not read {package_id} {version} from the package feed {source}: "
+                                   f"{redact(str(error))}")
+              repository = next((e for e in root.iter() if e.tag.split("}")[-1] == "repository"), None)
+              commit = (repository.get("commit") or "").strip() if repository is not None else ""
+              return commit if re.fullmatch(r"[0-9a-fA-F]{40}", commit) else None
+
+
+          # --- Which packages changed since their last publication (coordinator:C47) ------------------------------------
+
+          # Files a project's build reads from its own folder or any folder above it, up to the repository root.
+          IMPORTED = {"directory.build.props", "directory.build.targets", "directory.packages.props", "nuget.config",
+                      "global.json"}
+          # A plan reads every repository before it takes the stamp. A baseline inferred from a stamp's time steps back this
+          # far, so it can only count more changes than were really built, never fewer.
+          PLAN_MARGIN = timedelta(minutes=30)
+
+
+          def has_commit(dest, sha):
+              # A blobless clone must not ask the server for a commit it never received (GIT_NO_LAZY_FETCH, git 2.44+), and
+              # an older git that still tries must fail rather than prompt.
+              return subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=dest, capture_output=True,
+                                    env=dict(os.environ, GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0")).returncode == 0
+
+
+          def changed_files(dest, base, sha):
+              """Repo-relative paths that differ between base and sha, counted from their merge base (base...sha). A base off
+              the ref's history (a train's pin commit that only main took) counts from the ref commit it was made on, so
+              the pins that commit set are not mistaken for a change."""
+              out = git(["diff", "--name-only", "--no-renames", "-z", f"{base}...{sha}"], cwd=dest, capture=True)
+              return sorted(path for path in out.split("\0") if path)
+
+
+          def watched(project, by_path):
+              """What a project's build reads from its repository: its folder (and, for the files in IMPORTED, every folder
+              above it), the projects it references and theirs in turn, and the paths outside them their .csproj files name."""
+              folders, outside, seen, stack = set(), set(), set(), [project["path"]]
+              while stack:
+                  path = stack.pop()
+                  if path in seen:
+                      continue
+                  seen.add(path)
+                  folders.add(Path(path).parent.as_posix())
+                  if path in by_path:
+                      stack += by_path[path]["projects"]
+                      outside.update(by_path[path].get("outside", []))
+              return folders, outside
+
+
+          def touched(files, folders, outside):
+              """The paths among files that change what a project reading these folders and outside paths builds."""
+              def under(path, folder):
+                  return folder in ("", ".") or path == folder or path.startswith(folder + "/")
+              return [path for path in files
+                      if any(under(path, f) for f in folders) or any(under(path, o) for o in outside)
+                      or (Path(path).name.lower() in IMPORTED and any(under(f, Path(path).parent.as_posix()) for f in folders))]
+
+
+          def baseline(org, repo, dest, package_id, versions):
+              """Where a package's last publication was packed from, as (commit, how): its repository's latest train/* tag;
+              with none, the commit the newest version on the feed names in its nuspec. When the repository never received
+              that commit (an early train's pin commit, lost with its runner), the ref as it stood PLAN_MARGIN before that
+              version's stamp. (None, why) when there is no baseline: the package then counts as changed."""
+              if repo["tag"]:
+                  return repo["tag"]["sha"], f"since {repo['tag']['tag']}"
+              newest = max((v for v in versions if VERSION.fullmatch(v)), key=version_key, default=None)
+              if newest is None:
+                  return None, "never published (no release version on the feed)"
+              commit = feed_commit(org, package_id, newest)
+              if commit is None:
+                  return None, f"its newest version on the feed, {newest}, names no commit"
+              if has_commit(dest, commit):
+                  return commit, f"since {newest} ({commit[:12]})"
+              cutoff = stamp_time(newest) - PLAN_MARGIN
+              found = git(["rev-list", "--first-parent", "-n", "1", f"--before={cutoff.isoformat()}", repo["sha"]],
+                          cwd=dest, capture=True).strip()
+              if not found:
+                  return None, f"{newest} was packed from {commit[:12]}, which {repo['repo']} does not have"
+              return found, (f"since {newest}, packed from {commit[:12]} which {repo['repo']} does not have, so {repo['ref']} "
+                             f"as of {cutoff:%Y-%m-%d %H:%M}Z ({found[:12]})")
+
+
+          def select_packages(org, repos, repo_order, manifest_ids):
+              """The packages this train publishes, {id: reason}, and how every package was judged, {id: decision}. A package
+              is in when it was never published, when its project (or a file it imports, or a project it references) changed
+              since its baseline, when a package it depends on is in, or when it is packed with one that is (a project
+              reference is packed as a dependency at the train version, so the referenced package must ship too)."""
+              ship, decisions, links = {}, {}, {}
+              for name in repo_order:
+                  repo, dest = repos[name], checkout_dir(SRC, name)
+                  by_path = {p["path"]: p for p in repo["projects"]}
+                  diffs = {}
+                  for path in repo["project_order"]:
+                      project = by_path[path]
+                      versions = feed_versions(org, project["id"])
+                      base, how = baseline(org, repo, dest, project["id"], versions) if versions else (None, "never published")
+                      hits = []
+                      if base:
+                          if base not in diffs:
+                              diffs[base] = changed_files(dest, base, repo["sha"])
+                          hits = touched(diffs[base], *watched(project, by_path))
+                      decisions[project["id"]] = {"repo": name, "path": path, "baseline": base, "how": how, "files": hits[:20]}
+                      if not base:
+                          ship[project["id"]] = how
+                      elif hits:
+                          more = f" and {len(hits) - 3} more" if len(hits) > 3 else ""
+                          ship[project["id"]] = f"changed {how}: {', '.join(hits[:3])}{more}"
+                      # What its build takes from the manifest: package references (its own and its referenced projects'),
+                      # and the packable projects it references.
+                      packages, siblings, seen, stack = set(project["packages"]), set(), set(), list(project["projects"])
+                      while stack:
+                          ref = by_path.get(stack.pop())
+                          if ref is None or ref["path"] in seen:
+                              continue
+                          seen.add(ref["path"])
+                          packages.update(ref["packages"])
+                          if ref["packable"]:
+                              siblings.add(ref["id"])
+                          stack += ref["projects"]
+                      links[project["id"]] = (sorted(packages & manifest_ids - {project["id"]}), sorted(siblings))
+              moved = True
+              while moved:
+                  moved = False
+                  for package_id, (dependencies, siblings) in links.items():
+                      if package_id in ship:
+                          for sibling in siblings:
+                              if sibling not in ship:
+                                  ship[sibling] = f"packed with {package_id}, which references its project"
+                                  moved = True
+                      else:
+                          in_train = [d for d in dependencies + siblings if d in ship]
+                          if in_train:
+                              ship[package_id] = f"depends on {', '.join(in_train)}, in this train"
+                              moved = True
+              return ship, decisions
+
+
+          def pins_at(dest, commit, ids):
+              """The exact pins on ids at a commit, across its .csproj and Directory.Packages.props files: {id: highest}."""
+              found = {}
+              for path in git(["ls-tree", "-r", "--name-only", "-z", commit], cwd=dest, capture=True).split("\0"):
+                  if (not path or {"bin", "obj"} & set(path.split("/")) or
+                          not (path.endswith(".csproj") or path.rpartition("/")[2] == "Directory.Packages.props")):
+                      continue
+                  for m in PIN.finditer(git(["show", f"{commit}:{path}"], cwd=dest, capture=True)):
+                      package_id, version = m.group("id"), m.group("version")
+                      if package_id in ids and VERSION.fullmatch(version) and (
+                              package_id not in found or version_key(version) > version_key(found[package_id])):
+                          found[package_id] = version
+              return found
 
 
           # --- Subcommands -------------------------------------------------------------------------------------------------
@@ -627,10 +848,7 @@ jobs:
                   log(f"{name}: {repo_ref} {sha[:12]}{' (override)' if name in overrides else ''}, main {main[:12]}, "
                       f"latest train tag {tag['tag'] if tag else '(none)'}")
                   projects = [describe_project(dest, p) for p in find_projects(dest)]
-                  repos[name] = {**repo, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag, "projects": projects,
-                                 "selected": tag is None or tag["sha"] != sha,
-                                 "reason": "no train tag yet" if tag is None else
-                                           (f"{repo_ref} moved since {tag['tag']}" if tag["sha"] != sha else f"unchanged since {tag['tag']}")}
+                  repos[name] = {**repo, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag, "projects": projects}
 
               owner = {}
               for name, repo in repos.items():
@@ -653,6 +871,22 @@ jobs:
                   repo["project_order"] = [path for path in toposort(list(by_path), edges, f"{name} project")
                                            if by_path[path]["packable"]]
 
+              ship, decisions = select_packages(manifest["org"], repos, repo_order, set(owner))
+              for name in repo_order:
+                  repo = repos[name]
+                  ids = {p["path"]: p["id"] for p in repo["projects"]}
+                  repo["ships"] = [path for path in repo["project_order"] if ids[path] in ship]
+                  # The ref has commits main lacks: main moves (and the repository is tagged) even when no package changed,
+                  # since a workflow-only or docs-only change still belongs on main.
+                  ahead = not is_ancestor(checkout_dir(SRC, name), repo["sha"], repo["main"])
+                  repo["selected"] = bool(repo["ships"]) or ahead
+                  if repo["ships"]:
+                      repo["reason"] = f"{len(repo['ships'])} of {len(repo['project_order'])} package(s) changed"
+                  elif ahead:
+                      repo["reason"] = f"{repo['ref']} is ahead of main; no package changed, nothing to publish"
+                  else:
+                      repo["reason"] = "unchanged" + (f" since {repo['tag']['tag']}" if repo["tag"] else "")
+
               selected = [n for n in repo_order if repos[n]["selected"]]
               warnings = []
               for name in selected:
@@ -663,8 +897,10 @@ jobs:
                           # A previous train pushed main to its pin commit but could not push that commit to the ref, because a
                           # lane merged into the ref while the train ran. main is ahead by train commits only: the build step
                           # records main as merged into the ref (keeping the ref's tree; this train re-pins), so main
-                          # fast-forwards again and nothing a lane merged is lost.
+                          # fast-forwards again and nothing a lane merged is lost. The pins those commits set on packages
+                          # outside this train are carried over from main, so main never moves a pin back.
                           repo["reconcile"] = repo["main"]
+                          repo["carry"] = pins_at(dest, repo["main"], set(owner))
                           log(f"{name}: main ({repo['main'][:12]}) is ahead of {repo['ref']} by train commits only; "
                               f"this train reconciles it")
                       else:
@@ -684,14 +920,13 @@ jobs:
 
               build, revision = stamp()
               version = normalized_version(build, revision)
-              train_ids = sorted(p["id"] for n in selected for p in repos[n]["projects"] if p["packable"])
-              # Packages outside this train: their repository's latest train tag is the newest version on the feed.
-              latest = {p["id"]: repo["tag"]["tag"][len("train/"):]
-                        for repo in repos.values() if not repo["selected"] and repo["tag"]
-                        for p in repo["projects"] if p["packable"]}
+              # Only the packages that changed are in the train. A pin on any other package stays as the source has it: it
+              # names a version already on the feed, and this train publishes no other.
+              train_ids = sorted(ship)
               plan = {"org": manifest["org"], "ref": ref, "version": version, "build": build, "revision": revision,
                       "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
-                      "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "latest": latest,
+                      "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
+                      "decisions": decisions,
                       "repo_edges": repo_edges, "repos": repos, "hosts": manifest["hosts"], "packages": [], "promoted": [],
                       "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
@@ -702,10 +937,13 @@ jobs:
               for name in repo_order:
                   deps = ", ".join(repo_edges[name]) or "nothing in the manifest"
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name}: {repos[name]['reason']}; depends on {deps}")
+              log(f"Packages: {len(ship)} of {len(decisions)} in this train, across {len(repo_order)} repositories")
+              for package_id, reason in ship.items():
+                  log(f"  + {package_id}: {reason}")
               output("version", version)
               output("selected", ",".join(selected))
               if not selected:
-                  log("Nothing moved since the last train; nothing to build.")
+                  log("Nothing changed since the last train; nothing to build.")
 
 
           def cmd_build():
@@ -730,7 +968,7 @@ jobs:
                                                        f"[train {version}] reconcile main's train commits into {plan['ref']}",
                                                        repo["reconcile"]])
                       repo["train_commits"] = True
-                  pins = pin_train_versions(src, train_ids, version, plan.get("latest"))
+                  pins = pin_train_versions(src, train_ids, version, repo.get("carry"))
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
                       log(f"{name}: pinned {len(pins)} reference(s): " +
@@ -746,11 +984,11 @@ jobs:
                       point_at_local_feed(tree, train_ids)
                   # Pack before testing: a pin bumped to the train version can only restore once the upstream package is in
                   # the local feed, and the project order puts it there first. Publishing is still gated on the tests below.
-                  for path in repo["project_order"]:
+                  for path in repo["ships"]:
                       run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
                            f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
                            "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
-                  for path in repo["project_order"]:
+                  for path in repo["ships"]:
                       project = next(p for p in repo["projects"] if p["path"] == path)
                       packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
                   if repo["test"]:
@@ -763,7 +1001,9 @@ jobs:
                   else:
                       log(f"{name}: tests skipped (\"test\": false in the manifest)")
                   log("::endgroup::")
-                  log(f"{name}: {len(repo['project_order'])} package(s) at {version}")
+                  log(f"{name}: {len(repo['ships'])} package(s) at {version}" +
+                      (f"; {len(repo['project_order']) - len(repo['ships'])} unchanged, not packed"
+                       if len(repo["ships"]) < len(repo["project_order"]) else ""))
               plan["packages"] = packages
               PLAN.write_text(json.dumps(plan, indent=2))
 
@@ -844,10 +1084,10 @@ jobs:
               """Finish a stranded promotion with the train's identity instead of by hand: for an already-published train
               version, fast-forward main and tag train/<version> at the given shas. Builds and publishes nothing. Each sha must
               be on the ref (or already on main, which only the train moves) and main must be its ancestor; every entry is
-              checked before anything is pushed, including that every package a named repository produces is on the feed at
-              the version. The pins that train committed are re-derived on top of the sha from what its plan knew (its
-              packages: repositories tagged with it, read at the tag, plus the named ones; every other package: its
-              repository's newest train tag older than the version), so main carries what was packed."""
+              checked before anything is pushed, including that the version is a published train (some manifest package is on
+              the feed at it). The pins that train committed are re-derived on top of the sha: its packages are the ones on
+              the feed at the version (each repository read at its tag, at the given sha, or at the train tag before it), and
+              a pin on any other package moves only to what main already carries, so main carries what was packed."""
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
               ref = os.environ.get("TRAIN_REF", "release")
               dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
@@ -871,7 +1111,7 @@ jobs:
               SRC.mkdir(parents=True)
               tag = f"train/{version}"
 
-              repos, tagged_at, earlier, problems = {}, {}, {}, []
+              repos, tagged_at, others, problems = {}, {}, {}, []
               for entry in manifest["repos"]:
                   name = entry["repo"]
                   dest = checkout_dir(SRC, name)
@@ -880,8 +1120,8 @@ jobs:
                   if tagged:
                       tagged_at[name] = git(["rev-list", "-n", "1", tag], cwd=dest, capture=True).strip()
                   elif name not in targets:
-                      # The tag a plan for this train saw (None: no earlier train), and the tip, for a repo with none.
-                      earlier[name] = latest_train_tag(dest, before=version) or {"tag": None, "sha": tip}
+                      # Read at the train tag a plan for this train saw, or at the tip for a repository with none.
+                      others[name] = (latest_train_tag(dest, before=version) or {"sha": tip})["sha"]
                   if name not in targets:
                       continue
                   main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
@@ -901,6 +1141,8 @@ jobs:
                                       f"commits the train did not make, so main cannot fast-forward to it")
                   repos[name] = {"repo": name, "ref": ref, "sha": sha, "base": sha, "tip": tip, "main": main,
                                  "reason": f"promote-only at {sha[:12]}", "items": [], "selected": True}
+                  if not is_ancestor(dest, main, sha) and only_train_commits(dest, sha, main):
+                      repos[name]["carry_from"] = main
               if problems:
                   raise TrainError("promote-only refused, nothing was pushed:\n  " + "\n  ".join(problems))
 
@@ -911,34 +1153,25 @@ jobs:
                   git(["checkout", "-q", "--detach", sha], cwd=dest)
                   return sorted(p["id"] for p in (describe_project(dest, c) for c in find_projects(dest)) if p["packable"])
 
-              # Rebuild what that train's plan knew: train_ids (the packages it built) and latest (the newest train tag of
-              # every package it did not build), so the pins re-derived here are the pins that were packed.
-              member_ids = {name: packable_ids_at(name, sha) for name, sha in tagged_at.items()}
-              for name in targets:
-                  member_ids[name] = packable_ids_at(name, repos[name]["sha"])
-              latest, warnings = {}, []
-              for name, prior in earlier.items():
-                  ids = packable_ids_at(name, prior["sha"])
-                  if ids and version in feed_versions(manifest["org"], ids[0]):
-                      # In that train (its packages are on the feed at the version) but stranded and not named here.
-                      member_ids[name] = ids
+              # The train's packages are exactly the ones on the feed at its version: a train publishes only what changed, so
+              # a repository it tagged or stranded may have shipped some of its packages and not others.
+              at = {**tagged_at, **others, **{name: repos[name]["sha"] for name in targets}}
+              member_ids, manifest_ids, warnings = {}, set(), []
+              for name in [r["repo"] for r in manifest["repos"]]:
+                  ids = packable_ids_at(name, at[name])
+                  manifest_ids.update(ids)
+                  member_ids[name] = [i for i in ids if version in feed_versions(manifest["org"], i)]
+                  if name in others and member_ids[name]:
                       warnings.append(f"{name} was in train {version} but is neither tagged nor named; its packages are pinned "
                                       f"at {version} here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
-                  elif prior["tag"]:
-                      latest.update({i: prior["tag"][len("train/"):] for i in ids})
               train_ids = {i for ids in member_ids.values() for i in ids}
-
-              # The version must be a published train: every package a named repository produces is on the feed at it.
-              for name in [r["repo"] for r in manifest["repos"] if r["repo"] in targets]:
-                  missing = [i for i in member_ids[name] if version not in feed_versions(manifest["org"], i)]
+              if not train_ids:
+                  raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
+                                   f"feed at {version}; promote-only only finishes a train whose packages were published")
+              for name in targets:
                   if not member_ids[name]:
-                      problems.append(f"{name}: no packable project at {repos[name]['sha'][:12]}")
-                  elif missing:
-                      problems.append(f"{name}: {', '.join(missing)} not on the feed at {version}; promote-only only finishes "
-                                      f"a train whose packages were published")
-              if problems:
-                  raise TrainError("promote-only refused, nothing was pushed:\n  " + "\n  ".join(problems))
+                      log(f"{name}: none of its packages is in train {version}; main still moves and is tagged")
 
               names = [r["repo"] for r in manifest["repos"] if r["repo"] in targets]
               for name in names:
@@ -949,7 +1182,8 @@ jobs:
                       repo["sha"] = train_commit(dest, ["merge", "-q", "-s", "ours", "--no-ff", "-m",
                                                         f"[train {version}] reconcile main's train commits", repo["main"]])
                       repo["train_commits"] = True
-                  pins = pin_train_versions(dest, train_ids, version, latest)
+                  carry = pins_at(dest, repo["carry_from"], manifest_ids) if repo.get("carry_from") else {}
+                  pins = pin_train_versions(dest, train_ids, version, carry)
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
                       repo["sha"] = commit_pins(dest, pins, version)
@@ -958,7 +1192,7 @@ jobs:
                       f"{', with ' + str(len(pins)) + ' pin(s)' if pins else ''}), tag {tag}")
               plan = {"mode": "promote-only", "org": manifest["org"], "ref": ref, "version": version, "dry_run": dry_run,
                       "overrides": {}, "warnings": warnings, "repo_order": names, "selected": names,
-                      "repo_edges": {n: [] for n in names}, "train_ids": sorted(train_ids), "latest": latest,
+                      "repo_edges": {n: [] for n in names}, "train_ids": sorted(train_ids),
                       "repos": repos, "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
               output("version", version)
@@ -984,7 +1218,18 @@ jobs:
                   repo = plan["repos"][name]
                   lines.append(f"| {name} | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
                                f"{', '.join(plan['repo_edges'][name]) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
-              if plan["packages"]:
+              if plan.get("decisions") is not None:
+                  ship = plan.get("ship", {})
+                  lines += ["", f"Repositories: {len(plan['repo_order'])} considered, {len(plan['selected'])} in this train. "
+                                f"Packages: {len(plan['decisions'])} considered, {len(ship)} in this train; every other package "
+                                f"is unchanged since its last publication and is neither packed nor pushed."]
+              packed = {p["id"]: p for p in plan["packages"]}
+              if plan.get("ship"):
+                  lines += ["", "| package | why | version | in-train dependencies |", "|---|---|---|---|"]
+                  lines += [f"| {i} | {reason} | {packed[i]['version'] if i in packed else plan['version'] + ' (not packed)'} | "
+                            f"{', '.join(packed[i]['dependencies']) if i in packed and packed[i]['dependencies'] else '—'} |"
+                            for i, reason in plan["ship"].items()]
+              elif plan["packages"]:
                   lines += ["", "| package | version | in-train dependencies |", "|---|---|---|"]
                   lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
               if plan["promoted"]:

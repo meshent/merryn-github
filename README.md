@@ -66,10 +66,36 @@ train reads every `.csproj` in the manifest's repositories, and a `PackageRefere
 manifest repository produces counts as an edge. Repositories are sorted on those edges, then the projects inside each
 one. A cycle fails the run and names the cycle.
 
-A repository is **in the train** when its `ref` branch (default `release`) has moved since its latest `train/*` tag,
-or when it has no tag yet. A selected repository republishes all of its packages. The train derives **one version**
-from the clock with the `Directory.Build.props` formula (UTC, one reading), passes it to every pack as
-`VersionBuild`/`VersionRevision`, and uses it as the train id. It never types a version.
+**Only packages whose project changed are published.** In the owner's words: "We only deploy packages when the
+corresponding project has a change. Follow the build process and don't mess it up." A package is in the train when:
+- its project changed since its last publication. That means a file under its folder, under a project it references,
+  or under a path outside its folder that its `.csproj` names (`../Shared/**/*.cs`, an `Import`). It also means a
+  `Directory.Build.props`/`.targets`, `Directory.Packages.props`, `nuget.config` or `global.json` in its folder or any
+  folder above it;
+- a package it depends on is in the train (the dependency's version moves, so its nuspec does too), or it is packed
+  with one that is (a `ProjectReference` is packed as a dependency at the train version);
+- or it was never published (the org feed has no version of it).
+
+Every other package is **neither packed nor pushed**. Consumers restore it from the feed at the version they already
+name, and the train never moves a pin to a version of a package it did not publish.
+
+A package's **last publication** is its repository's latest `train/*` tag. For a repository no train has tagged, it is
+the commit that the newest version on the org feed was packed from, which Source Link writes into every nuspec as
+`<repository commit="…">`. Files are compared from the merge base (`baseline...ref`), so a train's own pin commit, which
+only `main` took, is not mistaken for a change. When the repository never received that commit (the first train's
+pin commits for Commerce and Pay were lost with its runner), the train uses `ref` as it stood 30 minutes before that
+version's stamp. That margin can only count more changes, never fewer. A feed version that names no commit counts as
+changed.
+
+A repository is **in the train** when one of its packages is, or when `ref` has commits `main` lacks. A workflow-only
+or docs-only change is promoted and tagged with nothing published. A repository with `ref` equal to `main` and no
+package change is skipped and reported "unchanged".
+
+**The version is the build's own stamp, read once.** The train reads the clock once (UTC) and applies the
+`Directory.Build.props` formula: `0.0.<days since 2020-01-01>.<half-seconds into the day>`. It passes the result to
+every pack as `VersionBuild`/`VersionRevision`, the inputs `Directory.Build.props` already takes from CI, and uses it
+as the train id. **Nothing sets `Version*`, `PackageVersion` or `GITHUB_RUN_NUMBER` by hand.** The packages in one
+train share the stamp because it was read once, not because anyone chose a version.
 
 Each repository is cloned alone in its own folder, so a project that switches to a sibling checkout when one sits
 next to it (a `ProjectReference` conditioned on `Exists('../../<repo>/...')`) builds and packs in the train exactly
@@ -81,8 +107,8 @@ For each selected repository, bottom-up, the train:
    repository therefore restores the upstream that was packed minutes earlier.
 2. Runs the repository's tests from source. It passes `-p:UseProjectReferences=true` when `Directory.Build.targets`
    defines that switch.
-3. Packs every packable project into the local feed, **without** the switch, from a copy of the repository taken
-   before anything was built.
+3. Packs its packages that are in the train into the local feed, **without** the switch, from a copy of the
+   repository taken before anything was built.
 4. Checks each package before moving on. Every package must carry the train version, and every in-train dependency
    in its nuspec must name that same version. A package that restored a sibling from outside the train fails here.
 

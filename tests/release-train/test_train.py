@@ -15,7 +15,7 @@ import tempfile
 import textwrap
 import unittest
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -301,6 +301,72 @@ class Unit(unittest.TestCase):
         # A redirect is never followed with the token on it.
         self.assertIsNone(self.train._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.test/"))
 
+    def test_the_summary_lists_the_train_s_packages_with_their_reasons_and_the_counts(self):
+        import contextlib, io
+        self.train.WORK.mkdir(parents=True, exist_ok=True)
+        repo = lambda reason, selected: {"selected": selected, "reason": reason, "sha": "a" * 40, "items": []}
+        plan = {"org": "o", "ref": "release", "version": "0.0.9.1", "dry_run": True, "repo_order": ["A", "B", "C"],
+                "repo_edges": {"A": [], "B": ["A"], "C": []}, "selected": ["A", "B"], "promoted": [], "stranded": [],
+                "repos": {"A": repo("1 of 2 package(s) changed", True), "B": repo("1 of 1 package(s) changed", True),
+                          "C": repo("unchanged since train/0.0.8.1", False)},
+                "decisions": {"A.Lib": {}, "A.Extra": {}, "B.Lib": {}, "C.Lib": {}},
+                "ship": {"A.Lib": "changed since train/0.0.8.1: A.Lib/Class.cs", "B.Lib": "depends on A.Lib, in this train"},
+                "packages": [{"id": "A.Lib", "version": "0.0.9.1", "dependencies": []},
+                             {"id": "B.Lib", "version": "0.0.9.1", "dependencies": ["A.Lib 0.0.9.1"]}]}
+        self.train.PLAN.write_text(json.dumps(plan))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.train.cmd_record()
+        text = out.getvalue()
+        self.assertIn("Repositories: 3 considered, 2 in this train. Packages: 4 considered, 2 in this train;", text)
+        self.assertIn("| A.Lib | changed since train/0.0.8.1: A.Lib/Class.cs | 0.0.9.1 | — |", text)
+        self.assertIn("| B.Lib | depends on A.Lib, in this train | 0.0.9.1 | A.Lib 0.0.9.1 |", text)
+        self.assertNotIn("A.Extra |", text)
+        self.assertIn("| C | no | unchanged since train/0.0.8.1 |", text)
+
+    def test_a_package_s_commit_is_read_from_its_nuspec_and_a_download_redirect_never_carries_the_token(self):
+        import io
+        import urllib.error
+        from unittest.mock import patch
+        commit = "fafafa7cc547b5d533dcddde08d10f5edf5e53bc"
+        nupkg = io.BytesIO()
+        with zipfile.ZipFile(nupkg, "w") as z:
+            z.writestr("meshNet.Pay.nuspec", '<?xml version="1.0"?><package xmlns="http://schemas.microsoft.com/packaging/'
+                       '2013/05/nuspec.xsd"><metadata><id>meshNet.Pay</id><version>0.0.2474.11566</version><repository '
+                       f'type="git" url="https://github.com/meshent/meshNet.Pay" commit="{commit}" /></metadata></package>')
+        seen = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append((request.full_url, request.get_header("Authorization")))
+                answer = answers[request.full_url]
+                if isinstance(answer, tuple):
+                    raise urllib.error.HTTPError(request.full_url, answer[0], "Found", {"Location": answer[1]}, None)
+                return Response(answer)
+
+        index, base = "https://feed.test/o/index.json", "https://feed.test/o/download"
+        blob = "https://blobs.test/meshnet.pay.nupkg?sig=x"
+        answers = {index: json.dumps({"resources": [{"@id": base, "@type": "PackageBaseAddress/3.0.0"}]}).encode(),
+                   f"{base}/meshnet.pay/0.0.2474.11566/meshnet.pay.0.0.2474.11566.nupkg": (302, blob),
+                   blob: nupkg.getvalue(),
+                   f"{base}/plain/1.0.0/plain.1.0.0.nupkg": (302, "http://blobs.test/plain.nupkg")}
+        with patch.dict(os.environ, TRAIN_FEED=index, PACKAGES_TOKEN="s3cret-token"), \
+                patch.object(self.train.urllib.request, "build_opener", lambda *handlers: Opener()):
+            self.assertEqual(self.train.feed_commit("o", "meshNet.Pay", "0.0.2474.11566"), commit)
+            with self.assertRaises(self.train.TrainError):                          # never follows to plain http
+                self.train.feed_commit("o", "Plain", "1.0.0")
+        auth = "Basic " + self.train.basic_auth("s3cret-token")
+        self.assertIn((blob, None), seen)                                          # the redirect carried no token
+        self.assertTrue(all(token == auth for url, token in seen if url.startswith("https://feed.test/")))
+        self.assertNotIn("http://blobs.test/plain.nupkg", [url for url, _ in seen])
+
     def test_the_summary_names_a_ref_that_refused_the_train_s_push_without_moving(self):
         import contextlib, io
         self.train.WORK.mkdir(parents=True, exist_ok=True)
@@ -340,6 +406,46 @@ class Unit(unittest.TestCase):
             self.assertIn("--api-key ***", shown)
         finally:
             del os.environ["REPOS_TOKEN"], os.environ["PACKAGES_TOKEN"]
+
+    def test_stamp_time_is_the_stamp_s_inverse(self):
+        moment = datetime(2026, 10, 10, 6, 25, 32, tzinfo=timezone.utc)
+        self.assertEqual(self.train.stamp_time(self.train.normalized_version(*self.train.stamp(moment))), moment)
+        self.assertEqual(self.train.stamp_time("0.0.2474"), datetime(2026, 10, 10, tzinfo=timezone.utc))
+
+    def test_a_change_touches_a_project_through_its_folder_imports_references_and_outside_paths(self):
+        lib = {"path": "src/Lib/Lib.csproj", "projects": ["src/Core/Core.csproj"], "outside": ["shared/Common"]}
+        core = {"path": "src/Core/Core.csproj", "projects": [], "outside": []}
+        other = {"path": "src/Other/Other.csproj", "projects": [], "outside": []}
+        by_path = {p["path"]: p for p in (lib, core, other)}
+        folders, outside = self.train.watched(lib, by_path)
+        self.assertEqual((folders, outside), ({"src/Lib", "src/Core"}, {"shared/Common"}))
+        files = ["src/Lib/A.cs", "src/Core/B.cs", "src/Other/C.cs", "src/LibX/D.cs", "shared/Common/E.cs",
+                 "shared/Other/F.cs", "Directory.Build.props", "src/Directory.Packages.props", "src/Other/nuget.config",
+                 "README.md", "docs/Directory.Build.props", ".github/workflows/ci.yml"]
+        self.assertEqual(self.train.touched(files, folders, outside),
+                         ["src/Lib/A.cs", "src/Core/B.cs", "shared/Common/E.cs", "Directory.Build.props",
+                          "src/Directory.Packages.props"])
+        self.assertEqual(self.train.touched(["README.md", "docs/x.md"], *self.train.watched(other, by_path)), [])
+        root = {"path": "Root.csproj", "projects": [], "outside": []}             # a project at the repository root
+        self.assertEqual(self.train.touched(["README.md"], *self.train.watched(root, {})), ["README.md"])
+
+    def test_outside_paths_are_the_static_prefixes_of_includes_above_the_project(self):
+        repo = Path(self.tmp.name) / "outside"
+        (repo / "src" / "Lib").mkdir(parents=True)
+        (repo / "src" / "Lib" / "Lib.csproj").write_text(textwrap.dedent("""\
+            <Project Sdk="Microsoft.NET.Sdk">
+              <Import Project="../../build/Common.targets" />
+              <ItemGroup>
+                <Compile Include="../../shared/Code/**/*.cs" />
+                <None Include="$(MSBuildThisFileDirectory)../../assets/logo.png" Pack="true" />
+                <Compile Include="Local/*.cs" />
+                <Compile Include="../../../Elsewhere/X.cs" />
+                <ProjectReference Include="../Core/Core.csproj" />
+              </ItemGroup>
+            </Project>
+            """))
+        self.assertEqual(self.train.outside_paths(repo, repo / "src" / "Lib" / "Lib.csproj"),
+                         ["assets/logo.png", "build/Common.targets", "shared/Code"])
 
     def test_a_package_that_did_not_take_the_stamp_fails(self):
         self._nupkg("A", "1.0.0", [])
@@ -385,7 +491,7 @@ class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        _, self.script = load_train(self.tmp.name)
+        self.module, self.script = load_train(self.tmp.name)
         self.server = self.root / "server"
         self.feed_env = dict(os.environ, GITHUB_SERVER_URL=f"file://{self.server}", TRAIN_WORK=str(self.root / "train"),
                              TRAIN_REF="main", TRAIN_DRY_RUN="true", PYTHONUTF8="1",
@@ -450,6 +556,15 @@ class EndToEnd(unittest.TestCase):
         """Stands in for the publish step: the local feed's packages land on the 'org' feed folder."""
         for nupkg in (self.root / "train" / "feed").glob("*.nupkg"):
             (self.root / "orgfeed" / nupkg.name).write_bytes(nupkg.read_bytes())
+
+    def feed_package(self, package_id, version, commit):
+        """A package on the 'org' feed folder whose nuspec names the commit it was packed from, as Source Link writes it."""
+        (self.root / "orgfeed").mkdir(exist_ok=True)
+        repository = f'<repository type="git" commit="{commit}" />' if commit else ""
+        nuspec = (f'<?xml version="1.0"?><package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">'
+                  f'<metadata><id>{package_id}</id><version>{version}</version>{repository}</metadata></package>')
+        with zipfile.ZipFile(self.root / "orgfeed" / f"{package_id}.{version}.nupkg", "w") as z:
+            z.writestr(f"{package_id}.nuspec", nuspec)
 
     def live(self, ref="release"):
         self.feed_env.update(TRAIN_REF=ref, TRAIN_DRY_RUN="false")
@@ -556,6 +671,7 @@ class EndToEnd(unittest.TestCase):
         self.repo("Down", {"Down.Lib/Down.Lib.csproj": csproj(["Up.Lib"]), "Down.slnx": "<Solution />"})
         bare = self.server / "o" / "Up.git"
         subprocess.run(["git", "tag", "train/0.0.1.1", "main"], cwd=bare, check=True)
+        self.feed_package("Up.Lib", "0.0.1.1", self.rev("Up", "main"))  # published by that train
         self.manifest(["Up", "Down"])
         plan = self.train("plan")
         self.assertEqual(plan.returncode, 0, plan.stdout)
@@ -563,6 +679,93 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(result["selected"], ["Down"])
         self.assertEqual(result["repos"]["Up"]["reason"], "unchanged since train/0.0.1.1")
         self.assertEqual(result["train_ids"], ["Down.Lib"])
+
+    # --- coordinator:C47: only packages whose project changed since their last publication ----------------------------
+
+    def test_a_train_publishes_only_the_packages_that_changed_and_still_promotes_a_docs_only_change(self):
+        """The owner's correction on Release 1: "We only deploy packages when the corresponding project has a change." After
+        a first train published everything, the second packs and pushes only a changed package, a never-published one and
+        a dependent of a changed one; a repository with only a docs change is promoted and tagged with nothing published;
+        unchanged repositories are skipped entirely."""
+        lib = lambda ns: f"namespace {ns}; public class A {{}}"
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": lib("Up"),
+                         "Up.Extra/Up.Extra.csproj": csproj([]), "Up.Extra/Class.cs": lib("UpExtra")})
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": csproj(["Up.Lib"]), "Down.Lib/Class.cs": lib("Down")})
+        self.repo("Side", {"Side.Lib/Side.Lib.csproj": csproj(["Up.Extra"]), "Side.Lib/Class.cs": lib("Side")})
+        self.repo("Docs", {"Docs.Lib/Docs.Lib.csproj": csproj([]), "Docs.Lib/Class.cs": lib("Docs"), "README.md": "v1"})
+        self.repo("Quiet", {"Quiet.Lib/Quiet.Lib.csproj": csproj([]), "Quiet.Lib/Class.cs": lib("Quiet")})
+        names = ["Up", "Down", "Side", "Docs", "Quiet"]
+        self.release_branches(*names)
+        self.manifest([{"repo": n, "test": False} for n in names])
+        self.live()
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        first = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(len(first["packages"]), 6)                            # nothing was published yet: all of it
+        self.assertTrue(all(reason == "never published" for reason in first["ship"].values()), first["ship"])
+        self.publish()
+        self.assertEqual(self.train("promote").returncode, 0)
+        # Lanes merge into release: Up.Lib's code, a new package in Up, and a README in Docs.
+        self.commit_to("Up", "release", {"Up.Lib/Class.cs": "namespace Up; public class A { public int B; }",
+                                         "Up.New/Up.New.csproj": csproj([]), "Up.New/Class.cs": lib("UpNew")})
+        self.commit_to("Docs", "release", {"README.md": "v2"})
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        second = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(sorted(second["ship"]), ["Down.Lib", "Up.Lib", "Up.New"])
+        self.assertEqual(second["ship"]["Up.Lib"], f"changed since train/{first['version']}: Up.Lib/Class.cs")
+        self.assertEqual(second["ship"]["Up.New"], "never published")
+        self.assertEqual(second["ship"]["Down.Lib"], "depends on Up.Lib, in this train")
+        self.assertEqual(second["selected"], ["Up", "Down", "Docs"])
+        self.assertEqual(second["repos"]["Docs"]["reason"], "release is ahead of main; no package changed, nothing to publish")
+        self.assertEqual(second["repos"]["Quiet"]["reason"], f"unchanged since train/{first['version']}")
+        self.assertEqual(sorted(p["id"] for p in second["packages"]), ["Down.Lib", "Up.Lib", "Up.New"])
+        packed = sorted(p.name for p in (self.root / "train" / "feed").glob("*.nupkg"))
+        self.assertEqual(packed, sorted(f"{i}.{second['version']}.nupkg" for i in ("Down.Lib", "Up.Lib", "Up.New")))
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        tag = f"train/{second['version']}"
+        self.assertEqual(self.rev("Docs", "main"), self.rev("Docs", "release"))    # the docs change reached main ...
+        self.assertEqual(self.rev("Docs", f"{tag}^{{commit}}"), self.rev("Docs", "main"))  # ... tagged, nothing published
+        for name in ("Side", "Quiet"):
+            self.assertNotEqual(subprocess.run(["git", "rev-parse", "-q", "--verify", tag], cwd=self.bare(name),
+                                               capture_output=True).returncode, 0, name)
+        record = self.train("record")
+        self.assertIn("Packages: 7 considered, 3 in this train;", record.stdout)
+        self.assertIn("| Down.Lib | depends on Up.Lib, in this train |", record.stdout)
+
+    def test_without_a_train_tag_the_baseline_is_the_commit_the_feed_s_newest_version_was_packed_from(self):
+        """A repository no train has tagged yet (the six the first train stranded): each package counts from the commit its
+        newest feed version names. When the repository never received that commit (an early train's pin commit), the ref
+        as it stood 30 minutes before that version's stamp stands in; with nothing that old, the package counts as
+        changed."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
+                         "Up.Two/Up.Two.csproj": csproj([]), "Up.Two/Class.cs": "namespace UpTwo; public class A {}",
+                         "Up.Three/Up.Three.csproj": csproj([]), "Up.Three/Class.cs": "namespace Up3; public class A {}"})
+        built = self.rev("Up", "main")
+        self.commit_to("Up", "main", {"Up.Two/More.cs": "namespace UpTwo; public class More {}"})
+        self.manifest([{"repo": "Up", "test": False}])
+        tomorrow = self.module.normalized_version(*self.module.stamp(datetime.now(timezone.utc) + timedelta(days=1)))
+        self.feed_package("Up.Lib", "0.0.2000.1", "e" * 40)                       # older, ignored
+        self.feed_package("Up.Lib", "0.0.2474.11566", built)                      # packed from a commit Up has
+        self.feed_package("Up.Two", tomorrow, "f" * 40)                           # an unpushed commit, stamped later
+        self.feed_package("Up.Three", "0.0.2000.1", "f" * 40)                     # an unpushed commit, before Up existed
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        decisions = state["decisions"]
+        self.assertEqual((decisions["Up.Lib"]["baseline"], decisions["Up.Lib"]["how"]),
+                         (built, f"since 0.0.2474.11566 ({built[:12]})"))
+        self.assertNotIn("Up.Lib", state["ship"])                                 # Up.Two's change is not Up.Lib's
+        self.assertEqual(decisions["Up.Two"]["baseline"], self.rev("Up", "main"))  # the ref before the stamp: no change
+        self.assertIn("which Up does not have, so main as of", decisions["Up.Two"]["how"])
+        self.assertNotIn("Up.Two", state["ship"])
+        self.assertIsNone(decisions["Up.Three"]["baseline"])
+        self.assertEqual(state["ship"]["Up.Three"], "0.0.2000.1 was packed from ffffffffffff, which Up does not have")
+        self.assertEqual(state["selected"], ["Up"])
 
     def test_a_repo_cycle_fails_the_plan_naming_it(self):
         self.repo("A", {"A.Lib/A.Lib.csproj": csproj(["B.Lib"])})
@@ -723,10 +926,10 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("**Stranded** (published at " + version + ", main not moved, not tagged): Side.", record.stdout)
         self.assertIn("(main does; the next train reconciles it): Down.", record.stdout)
 
-    def test_the_next_train_reconciles_main_s_pin_commit_and_moves_out_of_train_pins_to_the_latest_tag(self):
+    def test_the_next_train_reconciles_main_s_pin_commit_and_carries_its_pins(self):
         """Rule (a)'s second half: after a train left main ahead of release by its pin commit, the next live plan accepts
-        the repository instead of refusing it, and promotion fast-forwards both release and main again. An exact pin on a
-        package not rebuilt in that train moves to its repository's latest train tag version."""
+        the repository instead of refusing it, and promotion fast-forwards both release and main again. The pin commit set
+        a pin on a package this train does not publish: it is carried over from main, so main never moves a pin back."""
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
         self.pinned_repo("Down", "Up")
         self.release_branches("Up", "Down")
@@ -748,7 +951,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("is ahead of release by train commits only; this train reconciles it", plan.stdout)
         state = json.loads((self.root / "train/plan.json").read_text())
         self.assertEqual(state["selected"], ["Down"])
-        self.assertEqual(state["latest"], {"Up.Lib": first})
+        self.assertEqual(state["train_ids"], ["Down.Lib"])                 # Up.Lib is unchanged and already published
+        self.assertEqual(state["repos"]["Down"]["carry"], {"Up.Lib": first})
         build = self.train("build")
         self.assertEqual(build.returncode, 0, build.stdout)
         second = json.loads((self.root / "train/plan.json").read_text())
@@ -795,8 +999,9 @@ class EndToEnd(unittest.TestCase):
         self.feed_env.update(TRAIN_PROMOTE=f"Down={built}", TRAIN_DRY_RUN="true")
         unpublished = self.train("promote-only")
         self.assertNotEqual(unpublished.returncode, 0, unpublished.stdout)
-        self.assertIn(f"Down: Down.Lib not on the feed at {version}", unpublished.stdout)
-        (self.root / "orgfeed" / f"Down.Lib.{version}.nupkg").write_bytes(b"published by the stranded train")
+        self.assertIn(f"no package of any manifest repository is on the feed at {version}", unpublished.stdout)
+        for package_id in ("Up.Lib", "Down.Lib"):                     # what the stranded train published
+            (self.root / "orgfeed" / f"{package_id}.{version}.nupkg").write_bytes(b"published by the stranded train")
         # A dry run checks and reports, pushing nothing.
         dry = self.train("promote-only")
         self.assertEqual(dry.returncode, 0, dry.stdout)
@@ -818,9 +1023,10 @@ class EndToEnd(unittest.TestCase):
         state = json.loads((self.root / "train/plan.json").read_text())
         self.assertEqual((state["promoted"], state["release_behind"]), (["Down"], ["Down"]))
 
-    def test_promote_only_re_derives_the_out_of_train_pins_the_train_packed(self):
-        """Step D's probe (review of fa42553): a train that rebuilt only Down packed Down's exact pin on Up.Lib moved to Up's
-        latest train tag; promote-only must commit that same pin, so main and the tag carry what was published."""
+    def test_promote_only_takes_the_train_s_packages_from_the_feed_and_moves_no_other_pin(self):
+        """Step D's probe (review of fa42553), under per-package selection (coordinator:C47): a train that rebuilt only
+        Down left Down's exact pin on Up.Lib as the source has it, because Up.Lib did not ship in it; promote-only must
+        commit exactly that, so main and the tag carry what was published."""
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
         self.pinned_repo("Down", "Up")
         self.release_branches("Up", "Down")
@@ -833,27 +1039,29 @@ class EndToEnd(unittest.TestCase):
         self.publish()
         promote = self.train("promote")
         self.assertEqual(promote.returncode, 0, promote.stdout)
-        # A lane on Down's release (which now carries train 1's pin commit) writes the old exact pin back.
+        # A lane on Down's release (which now carries train 1's pin commit) changes Down's code, not its pin.
         work = self.root / "make" / "Down"
         subprocess.run(["git", "checkout", "-q", "release"], cwd=work, check=True)
         subprocess.run(["git", "fetch", "-q", str(self.bare("Down")), "release"], cwd=work, check=True)
         subprocess.run(["git", "reset", "-q", "--hard", "FETCH_HEAD"], cwd=work, check=True)
-        self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}",
-                                           "Down.Lib/Down.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1"))})
+        self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
         # Train 2 rebuilds Down only and publishes it; its promotion never happens (stranded).
         for step in ("plan", "build"):
             result = self.train(step)
             self.assertEqual(result.returncode, 0, result.stdout)
         second = json.loads((self.root / "train/plan.json").read_text())
-        self.assertEqual(second["selected"], ["Down"])
-        self.assertEqual([p[1:] for p in second["repos"]["Down"]["pins"]], [["Up.Lib", "0.0.1.1", first]])
+        self.assertEqual((second["selected"], second["train_ids"]), (["Down"], ["Down.Lib"]))
+        self.assertEqual(second["repos"]["Down"]["pins"], [])
         self.publish()
         self.feed_env.update(TRAIN_VERSION=second["version"], TRAIN_PROMOTE=f"Down={second['repos']['Down']['base']}")
         done = self.train("promote-only")
         self.assertEqual(done.returncode, 0, done.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["train_ids"], ["Down.Lib"])                       # Up.Lib is not on the feed at train 2
+        self.assertEqual(state["repos"]["Down"]["pins"], [])
         self.assertIn(f'Include="Up.Lib" Version="{first}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
         self.assertEqual(self.rev("Down", f"train/{second['version']}^{{commit}}"), self.rev("Down", "main"))
-        self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["latest"], {"Up.Lib": first})
+        self.assertEqual(self.rev("Down", "main"), second["repos"]["Down"]["base"])
 
     def test_a_ref_push_refused_although_the_ref_did_not_move_is_named_apart_from_a_moved_ref(self):
         """A ref that refuses the train's fast-forward push (branch protection, the token's rights) is reported as such, not
