@@ -75,14 +75,22 @@ Phases, in the one job:
 1. **Assemble.** Check out every manifest repo at `release`. Read every `.csproj`: a `PackageReference` whose id is a
    `PackageId` of another manifest repo is an edge. Topologically sort the repos (and the projects inside a repo; Common
    has nine chained edges today that `needs:` lists encode by hand). Fail loudly on a cycle.
-2. **Select.** A repo is in the train when `release` differs from its last `train/*` tag (or has no tag). Phase 1 rule:
-   a selected repo republishes **all** of its packages. This retires the C30/C32 catch-up baseline, the per-package
-   `paths-filter` lists and the stranding class of bug in one move. Per-project selection can come later if the version
-   churn bothers anyone.
-3. **Stamp.** One version for the whole train, derived once from the clock the way `Directory.Build.props` already does
-   (it accepts `VersionBuild`/`VersionRevision` from CI by design). Every package in a train carries the same
-   `0.0.<days>.<halfsecs>`, which is the train id. This is not the forbidden "set a version by hand"; it is the existing
-   stamp taken once instead of sixty times. **Owner decision** (filed): one stamp per train, or per-pack stamps as today.
+2. **Select, per package** (coordinator:C47, the owner's correction on Release 1: "We only deploy packages when the
+   corresponding project has a change"). A package is in the train when its project changed since its last publication,
+   when a package it depends on is in the train, or when it was never published. The project includes its folder, the
+   projects it references, the outside paths its `.csproj` names, and the `Directory.Build.*`, `Directory.Packages.props`,
+   `nuget.config` and `global.json` files above it. Its last publication is the repo's latest `train/*` tag. With no
+   tag, it is the commit that the newest feed version's nuspec names (`<repository commit>`). If the repo never
+   received that commit, it is the ref 30 minutes before that version's stamp. Every other package is neither packed
+   nor pushed, and no pin moves to a version of it. A repo is in the train when one of its packages is, or when
+   `release` has commits `main` lacks (promoted and tagged, nothing published). The first live train's Phase 1 rule
+   (a selected repo republishes all of its packages) published all 96 packages of 18 repos, 15 of them unchanged.
+   That is what this replaces.
+3. **Stamp.** The clock is read once, the way `Directory.Build.props` already reads it (it accepts
+   `VersionBuild`/`VersionRevision` from CI by design). Every package that ships in a train carries that
+   `0.0.<days>.<halfsecs>`, which is the train id. Nothing sets `Version*`, `PackageVersion` or `GITHUB_RUN_NUMBER` by
+   hand: it is the existing stamp taken once instead of once per pack. A proposal says it this way and never says "one
+   version for N packages".
 4. **Build and pack, bottom-up, into a local feed.** For each repo in order: `dotnet restore` with the local feed folder
    as an extra source (so a downstream resolves the upstream that was packed a minute ago, not the one on the public
    feed), run the repo's test gate from source (`-p:UseProjectReferences=true` where the repo has the switch; a plain
@@ -96,12 +104,61 @@ Phases, in the one job:
    person, and a host never again fails to compile against a float that moved under it (coordinator:C3, C6, P46).
    Repos still on floats need no pin step. **Owner decision** (filed): move consumers to exact pins now that the train
    can maintain them, or keep floats.
+   **Pins on packages outside the train** (coordinator:C44, narrowed by C47): an exact pin on a package this train
+   does not publish stays as the source has it. A repo's tag no longer means all its packages shipped at that version,
+   and moving a consumer's pin would itself be a change to the consumer. The one exception is reconciling `main`'s pin
+   commit (rule (a) below). Pins that commit set are carried over from `main`, forward only, so `main` never moves a
+   pin back.
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
    host in the manifest with `deploy: true`, fire the existing shared `dispatch-deploy` (meshNet.Hosting azd) or the
    `deploy-host.yml` here (Merryn tenant hosts). Static web apps (Web.Vocab, Web.Pay) deploy themselves on the push to
    `main` as they do today; they simply get that push on the cadence.
 8. **Record.** Write the train summary (repos, packages and versions, items) to the run summary and `POST` it to
    Merryn as a release (the `list_releases` record FEAT-0114 added; today it is empty for meshNet).
+
+#### When `release` moves while the train runs (coordinator:C44, from train 0.0.2474.11566)
+
+Lanes merge into `release` continuously, so a merge landing between plan and promote is the common case, not an edge
+case. The first live train hit it: Commerce's `release` moved at 06:30Z, the pin commit's push was refused, and the
+promote step stopped there, leaving Commerce, Pay and the four External.* repos published but not promoted.
+
+- **Promotion never stops at the first repo.** Publication already happened, so each repo is promoted on its own; one
+  that cannot be (main moved by someone else, a refused tag) is recorded as **stranded** with the sha it was built from,
+  the others are still promoted, and the step fails at the end naming every stranded repo. The summary prints the
+  exact promote-only input to finish them.
+- **The pin commit vs a moved `release`: rule (a).** `main` always takes exactly what was built and tested (the pin
+  commit included) and is tagged; the pin commit goes to `release` only when that is still a fast-forward, otherwise the
+  summary warns and `release` keeps the lane's merge. The next plan accepts a repo whose `main` is ahead of `release` by
+  **train commits only** (author `release-train`, subject `[train …]`), and its build records `main` as merged with
+  `git merge -s ours` (the tree stays exactly `release`'s; the train re-derives the pins), so `release` and `main`
+  fast-forward together again. Anything else ahead on `main` is still refused.
+  - Rejected (b), runner-local pins with `main == release`: the owner's 2026-10-08 decision
+    (q-coordinator-release-trains-accept-the-five-recommended-setti, setting 4) is that the train commits the pins as
+    `[train <id>] pin …` on `release` and `main`; (b) would leave source pins one train behind the nuspecs.
+  - Rejected (c), rebase the pin commit onto the moved `release` and push both: the lane's merge would reach `main`
+    without having been built or tested by this train.
+- **Recovery: promote-only.** Dispatch with `promote-only: <repo>=<sha>, …` and `version: <train id>` (packages already on
+  the feed). It clones the manifest, checks every entry before pushing anything (the sha is on `release` or already on
+  `main`; `main` is its ancestor or ahead by train commits only; the repo is not already tagged with that train),
+  re-derives that train's pins on the sha, fast-forwards `main`, tags `train/<version>`, and pushes the pin commit to
+  `release` only as a fast-forward. With `dry-run: true` it checks and reports, pushing nothing. It never promotes a
+  lane's later merge under an old train's stamp: the sha names exactly what was built.
+  - **The pins are the ones that were packed.** The train's packages are exactly the ones on the org feed at the
+    version (C47: a train publishes only what changed, so a repo it tagged or stranded may have shipped some packages
+    and not others). Each repo is read at its tag, at the given sha, or at the train tag before the version, never at
+    today's `release`. A pin on any other package moves only to what `main` already carries, when `main` is ahead by
+    train commits. A repo that has packages on the feed at the version but is neither tagged nor named (stranded and
+    left out of this dispatch) still counts as in the train, with a warning to finish it too.
+  - **The version must be published.** Some manifest package must be on the org feed at the version (read from the
+    NuGet v3 flat container with the packages token, fail-closed; `TRAIN_FEED` may name another service index or a
+    folder), so a typo or a dry run's stamp is refused before anything is tagged. A named repo none of whose packages
+    shipped in that train (a docs-only change) is still promoted and tagged.
+  - **Which sha.** Use the sha the stranded summary prints (also in the Merryn release record as `strandedFrom`): it is
+    the one the train built. The checks above refuse a sha off `release`, but cannot tell an older or newer sha on
+    `release` from the built one.
+- **A `release` that refuses the push without moving** (branch protection, the token's rights) is named on its own line
+  in the summary, apart from the expected "moved while the train ran", so it cannot quietly leave `release` behind on
+  every train.
 
 The `main` push that step 7 makes must not start the old per-repo publish workflows. Those workflows are retired in
 the cutover (kept as `workflow_dispatch` only for the first month, then deleted), so a `main` push triggers nothing but
