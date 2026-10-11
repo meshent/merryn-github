@@ -64,8 +64,9 @@ Matthew's rule as stated: merging to `release` does not trigger workflows, only 
 ### 3. The train: one run, every repo, dependency order
 
 A reusable workflow here, `dotnet-release-train.yml`, called by one wrapper in the tenant's aggregator repo
-(meshNet for meshNet; Mira for Mira). Scheduled (proposed: Tue and Fri 02:00 UTC) plus `workflow_dispatch` for a hotfix
-train. **One job**, so one runner, one `setup-dotnet`, one warm NuGet cache, no per-job rounding.
+(meshNet for meshNet; Mira for Mira). **Dispatched, never scheduled** (owner, 2026-10-11, "Keep proposals"): each
+release is proposed, with its repositories and what ships, when its planned group of work is done or after four or more
+days of accumulated work, and it runs live only on the owner's yes. A hotfix train is the same dispatch. **One job**, so one runner, one `setup-dotnet`, one warm NuGet cache, no per-job rounding.
 
 Inputs: a manifest of repositories and hosts (below), a token that can read every repo and write packages
 (`MESHENT_CI_PAT` already exists for this), and the dispatch-deploy secret for hosts.
@@ -236,8 +237,8 @@ Three layers, built in this order:
    train id, so "what is in the next train" is a board query; (b) the train's record call closes the loop: packages,
    versions, hosts, items, environment; (c) the **budget steward**: Merryn polls the usage endpoint on its existing
    correlation poll, sets the org variable, shows a gauge on the board, and files the owner question at `hard`; (d) the
-   **conductor**: on the cadence, Merryn checks the board for open blocking questions on items in the train, then
-   dispatches the train run and watches it. (d) is what lets "release" be a Merryn verb rather than a cron line.
+   **conductor**: when the owner says yes to a proposal, Merryn checks the board for open blocking questions on items
+   in the train, then dispatches the train run and watches it. (d) is what lets "release" be a Merryn verb rather than a cron line.
 3. **Skill (merryn-plugin).** `/merryn:train` for the coordinator lane: show the next train (repos with
    `release != main`, items, open questions), cut a hotfix train, re-run a failed one, read the last record. Thin: it
    calls the Merryn tools and the dispatch API; the rules live in the workflow and the board.
@@ -293,7 +294,8 @@ cache is per repository (10 GB, entries dropped after 7 days unused), so a train
 - `dotnet-release-train.yml` here, with the manifest format and the dependency sort. Dry-run mode (assemble, no
   publish) first, run against the real repos until it is green.
 - Create `release` in every manifest repo from `main`; protect `main`. Lanes retarget their PRs. Charters: one line.
-- Cut over: train publishes on Tue/Fri; per-repo publish workflows become dispatch-only. Record the first train on the
+- Cut over: the train publishes when the owner says yes to a proposal; per-repo publish workflows become
+  dispatch-only. Record the first train on the
   board as a release.
 
 **Phase 2: hosts, pins and the gate.**
@@ -306,7 +308,8 @@ cache is per repository (10 GB, entries dropped after 7 days unused), so a train
 
 ## Decisions for the owner (filed as one question on the meshNet board)
 
-1. Cadence: twice a week (Tue/Fri, recommended) or daily.
+1. Cadence: twice a week (Tue/Fri, recommended) or daily. **Decided 2026-10-11: neither.** No schedule; each release
+   is proposed and runs only on the owner's yes (see section 3).
 2. PR CI: none unless labelled (as stated, recommended) or one validation job on `ready_for_review`.
 3. One version stamp per train (recommended) or per-pack stamps as today.
 4. Consumers move to exact pins maintained by the train (recommended, matches the standing request) or keep floats.
@@ -323,4 +326,4 @@ cache is per repository (10 GB, entries dropped after 7 days unused), so a train
   `deploy-host.yml`; the private meshent/.github workflows rely on the org "accessible from repositories in the
   organization" setting. Keep both.
 - Native merge queues are Enterprise Cloud only for private repos, so the train does its own serialisation
-  (one scheduled run, `concurrency` group, `cancel-in-progress: false`).
+  (one run at a time, `concurrency` group, `cancel-in-progress: false`).

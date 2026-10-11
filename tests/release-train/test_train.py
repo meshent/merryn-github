@@ -447,6 +447,44 @@ class Unit(unittest.TestCase):
         self.assertEqual(self.train.outside_paths(repo, repo / "src" / "Lib" / "Lib.csproj"),
                          ["assets/logo.png", "build/Common.targets", "shared/Code"])
 
+    def test_editorconfig_and_build_rsp_above_a_project_touch_it(self):
+        folders, outside = self.train.watched({"path": "src/Lib/Lib.csproj", "projects": [], "outside": []}, {})
+        files = [".editorconfig", "src/.editorconfig", "Directory.Build.rsp", "docs/.editorconfig",
+                 "src/Other/Directory.Build.rsp"]
+        self.assertEqual(self.train.touched(files, folders, outside),
+                         [".editorconfig", "src/.editorconfig", "Directory.Build.rsp"])
+
+    def test_files_the_directory_build_props_above_a_project_import_are_followed(self):
+        repo = Path(self.tmp.name) / "imports"
+        for folder in ("src/Lib", "build", "eng", "tools", "docs"):
+            (repo / folder).mkdir(parents=True, exist_ok=True)
+        (repo / "Directory.Build.props").write_text(textwrap.dedent("""\
+            <Project>
+              <Import Project="build/Common.props" />
+              <Import Project="$(MSBuildThisFileDirectory)eng/Version.targets" Condition="Exists('eng/Version.targets')" />
+              <Import Project="$(RepoRoot)/elsewhere.props" />
+            </Project>
+            """))
+        (repo / "build" / "Common.props").write_text(
+            '<Project><Import Project="../tools/Analyzers.props" /><Import Project="../build/Common.props" /></Project>')
+        (repo / "eng" / "Version.targets").write_text("<Project />")
+        (repo / "tools" / "Analyzers.props").write_text("<Project />")
+        (repo / "src" / "Directory.Build.props").write_text(textwrap.dedent("""\
+            <Project>
+              <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+              <Import Project="../shared/*.props" />
+            </Project>
+            """))
+        (repo / "docs" / "Directory.Build.props").write_text('<Project><Import Project="docs.props" /></Project>')
+        (repo / "src" / "Lib" / "Lib.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk" />')
+        found = self.train.props_imports(repo, repo / "src" / "Lib" / "Lib.csproj")
+        self.assertEqual(found, ["build/Common.props", "eng/Version.targets", "shared", "tools/Analyzers.props"])
+        # And a change there touches the project.
+        lib = {"path": "src/Lib/Lib.csproj", "projects": [], "outside": found}
+        folders, outside = self.train.watched(lib, {lib["path"]: lib})
+        self.assertEqual(self.train.touched(["tools/Analyzers.props", "docs/docs.props", "shared/a.props"], folders, outside),
+                         ["tools/Analyzers.props", "shared/a.props"])
+
     def test_a_package_that_did_not_take_the_stamp_fails(self):
         self._nupkg("A", "1.0.0", [])
         with self.assertRaises(self.train.TrainError) as raised:

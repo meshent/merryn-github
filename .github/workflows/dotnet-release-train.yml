@@ -1,8 +1,8 @@
 # Reusable: the release train. One run, one job, every repository in a manifest, in dependency order, one version stamp
 # for the packages that changed.
 #
-# Call it from a thin wrapper in the tenant's aggregator repository (see README.md), on a schedule plus a dispatch for a
-# hotfix train. The job:
+# Call it from a thin wrapper in the tenant's aggregator repository (see README.md), dispatched only: each release is
+# proposed and runs on the owner's yes, never on a schedule. The job:
 #
 #   plan     clones every manifest repository at `ref` (default `release`), reads every .csproj, and sorts the
 #            repositories (then the projects inside each) by their package edges: a PackageReference to a package
@@ -341,6 +341,52 @@ jobs:
               return sorted(found)
 
 
+          # The MSBuild files in IMPORTED that can themselves <Import> more files. The build reads whatever they import too.
+          IMPORTING = ("directory.build.props", "directory.build.targets", "directory.packages.props")
+
+
+          def props_imports(dest, csproj):
+              """Repo-relative paths the Directory.Build.props / .targets / Directory.Packages.props above a project import,
+              followed through the files they import in turn. These files are watched by name (IMPORTED); what they import
+              can sit anywhere in the repository (build/Common.props), so a change there changes the build too. A path
+              that starts with a property other than $(MSBuildThisFileDirectory), such as GetPathOfFileAbove chaining to a
+              parent Directory.Build.props, is skipped: those parents are watched by name already."""
+              dest = Path(dest).resolve()
+              stack, seen, found = [], set(), set()
+              folder = Path(csproj).parent.resolve()
+              while folder.is_relative_to(dest):
+                  if folder.is_dir():
+                      stack += [f for f in folder.iterdir() if f.is_file() and f.name.lower() in IMPORTING]
+                  if folder == dest:
+                      break
+                  folder = folder.parent
+              while stack:
+                  file = stack.pop().resolve()
+                  if file in seen:
+                      continue
+                  seen.add(file)
+                  try:
+                      root = ET.parse(file).getroot()
+                  except (OSError, ET.ParseError):
+                      continue
+                  for el in root.iter():
+                      if el.tag.split("}")[-1] != "Import":
+                          continue
+                      for part in (el.get("Project") or "").replace("\\", "/").split(";"):
+                          part = re.sub(r"^\$\(MSBuildThisFileDirectory\)/?", "", part.strip())
+                          if not part or part.startswith(("$", "/")) or re.match(r"^[A-Za-z]:", part):
+                              continue
+                          static = re.split(r"[*?$%@]", part, maxsplit=1)
+                          prefix = static[0] if len(static) == 1 else static[0].rpartition("/")[0]
+                          target = (file.parent / prefix).resolve()
+                          if not target.is_relative_to(dest) or target == dest:
+                              continue
+                          found.add(target.relative_to(dest).as_posix())
+                          if len(static) == 1 and target.is_file():
+                              stack.append(target)
+              return sorted(found)
+
+
           def describe_project(dest, csproj):
               packages, projects = read_csproj(csproj)
               props = msbuild_properties(csproj, ["PackageId", "IsPackable", "IsTestProject"])
@@ -349,7 +395,7 @@ jobs:
               return {"path": str(Path(csproj).relative_to(dest)), "id": props.get("PackageId") or Path(csproj).stem,
                       "packable": packable, "packages": sorted(packages),
                       "projects": sorted(str(Path(p).relative_to(dest)) for p in projects if Path(p).is_relative_to(dest)),
-                      "outside": outside_paths(dest, csproj)}
+                      "outside": sorted(set(outside_paths(dest, csproj)) | set(props_imports(dest, csproj)))}
 
 
           def find_solution(dest, repo):
@@ -629,11 +675,15 @@ jobs:
 
           # --- Which packages changed since their last publication (coordinator:C47) ------------------------------------
 
-          # Files a project's build reads from its own folder or any folder above it, up to the repository root.
-          IMPORTED = {"directory.build.props", "directory.build.targets", "directory.packages.props", "nuget.config",
-                      "global.json"}
+          # Files a project's build reads from its own folder or any folder above it, up to the repository root. What the
+          # MSBuild ones import in turn is followed by props_imports.
+          IMPORTED = {"directory.build.props", "directory.build.targets", "directory.packages.props", "directory.build.rsp",
+                      "nuget.config", "global.json", ".editorconfig"}
           # A plan reads every repository before it takes the stamp. A baseline inferred from a stamp's time steps back this
-          # far, so it can only count more changes than were really built, never fewer.
+          # far, so it can only count more changes than were really built, never fewer, PROVIDED the ref's commits carry
+          # dates from when they landed on it. A commit committed before the cutoff but fast-forwarded onto the ref after the
+          # stamp keeps its old date, so it can land behind the baseline and be counted as already published. Only a
+          # repository no train has tagged yet uses this fallback, and only until its first train tag.
           PLAN_MARGIN = timedelta(minutes=30)
 
 
