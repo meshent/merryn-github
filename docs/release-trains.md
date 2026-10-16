@@ -83,7 +83,7 @@ Phases, in the one job:
    `nuget.config` and `global.json` files above it. Its last publication is the repo's latest `train/*` tag. With no
    tag, it is the commit that the newest feed version's nuspec names (`<repository commit>`). If the repo never
    received that commit, it is the ref 30 minutes before that version's stamp. Every other package is neither packed
-   nor pushed, and no pin moves to a version of it. A repo is in the train when one of its packages is, or when
+   nor pushed; an exact pin on it moves only forward, to its newest published release (6). A repo is in the train when one of its packages is, or when
    `release` has commits `main` lacks (promoted and tagged, nothing published). The first live train's Phase 1 rule
    (a selected repo republishes all of its packages) published all 96 packages of 18 repos, 15 of them unchanged.
    That is what this replaces.
@@ -105,11 +105,19 @@ Phases, in the one job:
    person, and a host never again fails to compile against a float that moved under it (coordinator:C3, C6, P46).
    Repos still on floats need no pin step. **Owner decision** (filed): move consumers to exact pins now that the train
    can maintain them, or keep floats.
-   **Pins on packages outside the train** (coordinator:C44, narrowed by C47): an exact pin on a package this train
-   does not publish stays as the source has it. A repo's tag no longer means all its packages shipped at that version,
-   and moving a consumer's pin would itself be a change to the consumer. The one exception is reconciling `main`'s pin
-   commit (rule (a) below). Pins that commit set are carried over from `main`, forward only, so `main` never moves a
-   pin back.
+   **Pins on packages outside the train: merge order** (coordinator:C44, C47; owner 2026-10-15: "things should
+   execute in merge order so dependencies should always work"). Packages are packed in dependency order, and every
+   package packs against what was merged and published ahead of it. An exact pin on a manifest package this train does
+   not publish moves **forward** to that package's newest release on the org feed below the train's version (the plan
+   reads it, `published` in `plan.json`), or to the pin `main` already carries when `main` is ahead by train commits
+   (rule (a) below), whichever is higher. It never moves back, and a range (`[x, )`), a float (`*`) or a prerelease pin
+   stays as written; a package the feed does not have keeps its pin. Nothing is bumped by hand and no package ships
+   only because a pin moved: the moved pins land in the train's pin commit with the in-train ones. Why: run
+   38710323286 (train 0.0.2475) failed at `dotnet pack` with NU1605. `meshNet.Common` was not in that train, so
+   `meshNet.Commerce.Models` kept its csproj pin `meshNet.Common 0.0.2455.8240` while its float on
+   `meshNet.Commerce.Types` resolved Types 0.0.2474.11566, whose nuspec names `meshNet.Common >= 0.0.2474.11566`
+   (the pin commit of train 0.0.2474.11566 that moved it never reached Commerce's `release`). Under this rule Models
+   packs against `meshNet.Common 0.0.2474.11566`.
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
    host in the manifest with `deploy: true`, fire the existing shared `dispatch-deploy` (meshNet.Hosting azd) or the
    `deploy-host.yml` here (Merryn tenant hosts). Static web apps (Web.Vocab, Web.Pay) deploy themselves on the push to
@@ -147,8 +155,8 @@ promote step stopped there, leaving Commerce, Pay and the four External.* repos 
   - **The pins are the ones that were packed.** The train's packages are exactly the ones on the org feed at the
     version (C47: a train publishes only what changed, so a repo it tagged or stranded may have shipped some packages
     and not others). Each repo is read at its tag, at the given sha, or at the train tag before the version, never at
-    today's `release`. A pin on any other package moves only to what `main` already carries, when `main` is ahead by
-    train commits. A repo that has packages on the feed at the version but is neither tagged nor named (stranded and
+    today's `release`. A pin on any other package moves forward exactly as the build moved it: to its newest release
+    on the feed below the version, or to what `main` already carries when `main` is ahead by train commits. A repo that has packages on the feed at the version but is neither tagged nor named (stranded and
     left out of this dispatch) still counts as in the train, with a warning to finish it too.
   - **The version must be published.** Some manifest package must be on the org feed at the version (read from the
     NuGet v3 flat container with the packages token, fail-closed; `TRAIN_FEED` may name another service index or a

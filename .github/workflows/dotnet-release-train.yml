@@ -18,6 +18,9 @@
 #            then packs every package of it that is in the train WITHOUT the switch, from a copy taken before anything
 #            was built, into the local feed. A downstream repository restores the upstream packed minutes earlier. Every
 #            package must carry the train stamp and every in-train dependency in its nuspec must name that same version.
+#            Before packing, an exact pin on an in-train package moves to the train version and one on any other manifest
+#            package moves forward (never back) to its newest release already on the feed, so nothing packs against a
+#            pin that a dependency published ahead of it has outpaced.
 #   publish  only when every selected repository built and passed: pushes each package, in order, --skip-duplicate.
 #   promote  per repository: pushes the train's pin commit to `ref` when that still fast-forwards (when a lane merged
 #            into `ref` while the train ran, `ref` keeps the lane's work and the next plan reconciles), fast-forwards main
@@ -133,6 +136,7 @@ jobs:
                       (a dry run warns instead: it promotes nothing). TRAIN_REF_OVERRIDES, dry runs only, takes the
                       repos it names at another branch, so a lane branch can ride a rehearsal before it merges
             build     per selected repo, bottom-up: bump every exact pin on an in-train package to the train version
+                      and every stale exact pin on another manifest package forward to its newest published release
                       (committed on a live train), point its nuget.config at the local feed, pack its in-train projects
                       (without the source-graph switch, from an untouched copy) into the local feed, check every package
                       carries the train version and every in-train dependency in its nuspec names that same version, then
@@ -509,10 +513,13 @@ jobs:
               exact pins (dependencies tracked, never discovered) and one-version trains compatible: the train is the one place
               that knows the version it is about to publish, so it maintains the pins, and on a live train commits them.
 
-              latest maps a package NOT in this train to a version a train already set for it on main (the pins carried over
-              when main is ahead of the ref by train commits only). An exact pin on one moves forward to that version, never
-              back, and a range or prerelease is left as written. Every other pin stays exactly as the source has it: the
-              train never moves a pin to a version of a package it did not publish."""
+              latest maps a package NOT in this train to the newest version already published ahead of it: its newest
+              release on the org feed below the train version (published_versions), or a pin a train already set for it on
+              main when that is higher (the pins carried over when main is ahead of the ref by train commits only). An exact
+              pin on one moves forward to that version, never back, and a range or prerelease is left as written. So a
+              package is never packed against a stale pin that a dependency packed after it already outpaces (a float on
+              a sibling resolves to its newest version, whose nuspec names the newer dependency: NU1605 otherwise). Every
+              other pin stays exactly as the source has it: a pin only ever names a version that is published."""
               latest = latest or {}
               changed = []
               for path in sorted(list(Path(dest).rglob("*.csproj")) + list(Path(dest).rglob("Directory.Packages.props"))):
@@ -821,6 +828,29 @@ jobs:
               return found
 
 
+          def published_versions(org, ids, before):
+              """{id: newest release version on the org feed below the train version before} for each of ids the feed has:
+              what was published (by an earlier train, in merge order) ahead of this train. Stamps grow with time, so a
+              promote-only for the same train reads the same map the plan did."""
+              found = {}
+              for package_id in sorted(ids):
+                  versions = [v for v in feed_versions(org, package_id)
+                              if VERSION.fullmatch(v) and version_key(v) < version_key(before)]
+                  if versions:
+                      found[package_id] = max(versions, key=version_key)
+              return found
+
+
+          def newest(*maps):
+              """The maps merged, keeping the highest version of each id."""
+              merged = {}
+              for versions in maps:
+                  for package_id, version in (versions or {}).items():
+                      if package_id not in merged or version_key(version) > version_key(merged[package_id]):
+                          merged[package_id] = version
+              return merged
+
+
           # --- Subcommands -------------------------------------------------------------------------------------------------
 
           def repo_assignments(text, what, value):
@@ -970,13 +1000,15 @@ jobs:
 
               build, revision = stamp()
               version = normalized_version(build, revision)
-              # Only the packages that changed are in the train. A pin on any other package stays as the source has it: it
-              # names a version already on the feed, and this train publishes no other.
+              # Only the packages that changed are in the train. An exact pin on any other manifest package moves forward to
+              # its newest version on the feed (published ahead of this train, in merge order), never back: a sibling's
+              # float resolves to its newest version, which may already name a newer one than a stale csproj pin.
               train_ids = sorted(ship)
+              published = published_versions(manifest["org"], set(owner) - set(ship), version)
               plan = {"org": manifest["org"], "ref": ref, "version": version, "build": build, "revision": revision,
                       "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
-                      "decisions": decisions,
+                      "decisions": decisions, "published": published,
                       "repo_edges": repo_edges, "repos": repos, "hosts": manifest["hosts"], "packages": [], "promoted": [],
                       "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
@@ -1018,7 +1050,7 @@ jobs:
                                                        f"[train {version}] reconcile main's train commits into {plan['ref']}",
                                                        repo["reconcile"]])
                       repo["train_commits"] = True
-                  pins = pin_train_versions(src, train_ids, version, repo.get("carry"))
+                  pins = pin_train_versions(src, train_ids, version, newest(plan.get("published"), repo.get("carry")))
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
                       log(f"{name}: pinned {len(pins)} reference(s): " +
@@ -1137,7 +1169,8 @@ jobs:
               checked before anything is pushed, including that the version is a published train (some manifest package is on
               the feed at it). The pins that train committed are re-derived on top of the sha: its packages are the ones on
               the feed at the version (each repository read at its tag, at the given sha, or at the train tag before it), and
-              a pin on any other package moves only to what main already carries, so main carries what was packed."""
+              an exact pin on any other package moves forward only to its newest release on the feed below the version, or
+              to what main already carries, as the build did, so main carries what was packed."""
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
               ref = os.environ.get("TRAIN_REF", "release")
               dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
@@ -1219,6 +1252,8 @@ jobs:
               if not train_ids:
                   raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
                                    f"feed at {version}; promote-only only finishes a train whose packages were published")
+              # The same forward moves the build made: each other package's newest release published before this train.
+              published = published_versions(manifest["org"], manifest_ids - train_ids, version)
               for name in targets:
                   if not member_ids[name]:
                       log(f"{name}: none of its packages is in train {version}; main still moves and is tagged")
@@ -1233,7 +1268,7 @@ jobs:
                                                         f"[train {version}] reconcile main's train commits", repo["main"]])
                       repo["train_commits"] = True
                   carry = pins_at(dest, repo["carry_from"], manifest_ids) if repo.get("carry_from") else {}
-                  pins = pin_train_versions(dest, train_ids, version, carry)
+                  pins = pin_train_versions(dest, train_ids, version, newest(published, carry))
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
                       repo["sha"] = commit_pins(dest, pins, version)
