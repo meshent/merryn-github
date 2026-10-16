@@ -206,6 +206,53 @@ class Unit(unittest.TestCase):
         self.assertIn('Include="meshNet.Shares" Version="[0.0.2470.1, )"', text)       # a range is left as written
         self.assertIn('Include="meshNet.Networks" Version="*"', text)                  # a float stays a float
 
+    def test_a_stale_pin_on_a_package_outside_the_train_moves_to_its_newest_release_on_the_feed(self):
+        """Release train 0.0.2475 (run 38710323286): meshNet.Common was not in the train, so meshNet.Commerce.Models
+        (in it) kept its csproj pin meshNet.Common 0.0.2455.8240 while its float on meshNet.Commerce.Types resolved
+        Types 0.0.2474.11566, whose nuspec names meshNet.Common >= 0.0.2474.11566: NU1605 at pack. The pin must move to
+        the newest release published ahead of the train: never back, never to a prerelease or to a later stamp, and a
+        package the feed does not have, a range and a float stay as written."""
+        from unittest.mock import patch
+        repo = Path(self.tmp.name) / "commerce"
+        (repo / "meshNet.Commerce.Models").mkdir(parents=True)
+        (repo / "meshNet.Commerce.Models" / "meshNet.Commerce.Models.csproj").write_text(textwrap.dedent("""\
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <PackageReference Include="meshNet.Commerce.Types" Version="*" />
+                <PackageReference Include="meshNet.Common" Version="0.0.2455.8240" />
+                <PackageReference Include="meshNet.Users" Version="0.0.2476.1" />
+                <PackageReference Include="meshNet.Shares" Version="[0.0.2400.1, )" />
+                <PackageReference Include="meshNet.Unlisted" Version="0.0.2400.1" />
+              </ItemGroup>
+            </Project>
+            """))
+        feed = Path(self.tmp.name) / "orgfeed"
+        feed.mkdir()
+        for name in ("meshNet.Common.0.0.2455.8240", "meshNet.Common.0.0.2474.11566", "meshNet.Common.0.0.2475.1-beta",
+                     "meshNet.Common.0.0.2490.1",            # stamped after this train: not published ahead of it
+                     "meshNet.Commerce.Types.0.0.2474.11566", "meshNet.Users.0.0.2474.11566",
+                     "meshNet.Shares.0.0.2474.11566"):
+            (feed / f"{name}.nupkg").write_bytes(b"")
+        version = "0.0.2476.9"
+        ids = {"meshNet.Common", "meshNet.Commerce.Types", "meshNet.Users", "meshNet.Shares", "meshNet.Unlisted"}
+        with patch.dict(os.environ, TRAIN_FEED=str(feed)):
+            published = self.train.published_versions("o", ids, version)
+        self.assertEqual(published, {"meshNet.Common": "0.0.2474.11566", "meshNet.Commerce.Types": "0.0.2474.11566",
+                                     "meshNet.Users": "0.0.2474.11566", "meshNet.Shares": "0.0.2474.11566"})
+        # main's carried pins and the feed merge to the higher of the two.
+        self.assertEqual(self.train.newest(published, {"meshNet.Common": "0.0.2470.1", "meshNet.Users": "0.0.2475.2"},
+                                           None)["meshNet.Users"], "0.0.2475.2")
+        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce.Models"}, version,
+                                                self.train.newest(published, {"meshNet.Common": "0.0.2470.1"}))
+        self.assertEqual({(c[1], c[2], c[3]) for c in changed},
+                         {("meshNet.Common", "0.0.2455.8240", "0.0.2474.11566")})
+        text = (repo / "meshNet.Commerce.Models" / "meshNet.Commerce.Models.csproj").read_text()
+        self.assertIn('Include="meshNet.Common" Version="0.0.2474.11566"', text)       # what Types already requires
+        self.assertIn('Include="meshNet.Commerce.Types" Version="*"', text)            # a float stays a float
+        self.assertIn('Include="meshNet.Users" Version="0.0.2476.1"', text)            # never moved back
+        self.assertIn('Include="meshNet.Shares" Version="[0.0.2400.1, )"', text)       # a range is left as written
+        self.assertIn('Include="meshNet.Unlisted" Version="0.0.2400.1"', text)         # not on the feed: as written
+
     def test_promote_only_entries_parse_like_ref_overrides(self):
         self.assertEqual(self.train.repo_assignments("meshNet.Commerce=f16e4b1,\nmeshNet.Pay = 0b9a6ae",
                                                      "promote-only entry", "sha"),
@@ -804,6 +851,48 @@ class EndToEnd(unittest.TestCase):
         self.assertIsNone(decisions["Up.Three"]["baseline"])
         self.assertEqual(state["ship"]["Up.Three"], "0.0.2000.1 was packed from ffffffffffff, which Up does not have")
         self.assertEqual(state["selected"], ["Up"])
+
+    def test_a_package_outside_the_train_whose_stale_pin_a_sibling_s_dependency_outpaces_still_packs(self):
+        """Run 38710323286's NU1605, end to end: Up.Lib is not in the train (unchanged since its newest release, 0.0.2.1),
+        Down.Types is not either and its published 0.0.2.1 names Up.Lib >= 0.0.2.1, and the never-published Down.Models
+        floats Down.Types while its csproj still pins Up.Lib 0.0.1.1. The train packs Down.Models against Up.Lib 0.0.2.1,
+        the newest release published ahead of it, and moves the stale pins forward in Down's tree, never back."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"},
+                  org_feed=True)
+        types = self.pinned_lib(("Up.Lib", "0.0.1.1"))
+        models = self.pinned_lib(("Down.Types", "*"), ("Up.Lib", "0.0.1.1"))
+        self.repo("Down", {"Down.Types/Down.Types.csproj": types, "Down.Types/Class.cs": "namespace DownTypes; class T {}",
+                           "Down.Models/Down.Models.csproj": models,
+                           "Down.Models/Class.cs": "namespace DownModels; class M {}"}, org_feed=True)
+
+        def released(package_id, version, commit, deps=()):
+            dependencies = "".join(f'<dependency id="{d}" version="{v}" />' for d, v in deps)
+            nuspec = (f'<?xml version="1.0"?><package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">'
+                      f'<metadata><id>{package_id}</id><version>{version}</version><authors>t</authors>'
+                      f'<description>t</description><repository type="git" commit="{commit}" />'
+                      f'<dependencies><group>{dependencies}</group></dependencies></metadata></package>')
+            with zipfile.ZipFile(self.root / "orgfeed" / f"{package_id}.{version}.nupkg", "w") as z:
+                z.writestr(f"{package_id}.nuspec", nuspec)
+
+        up, down = self.rev("Up", "main"), self.rev("Down", "main")
+        released("Up.Lib", "0.0.1.1", up)
+        released("Up.Lib", "0.0.2.1", up)                                       # published ahead, by an earlier train
+        released("Down.Types", "0.0.2.1", down, [("Up.Lib", "[0.0.2.1, )")])    # packed with the pin that train set
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["train_ids"], ["Down.Models"])
+        self.assertEqual(state["published"], {"Down.Types": "0.0.2.1", "Up.Lib": "0.0.2.1"})
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        self.assertNotIn("NU1605", build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        pins = sorted((Path(path).as_posix(), package, old, new) for path, package, old, new in state["repos"]["Down"]["pins"])
+        self.assertEqual(pins, [("Down.Models/Down.Models.csproj", "Up.Lib", "0.0.1.1", "0.0.2.1"),
+                                ("Down.Types/Down.Types.csproj", "Up.Lib", "0.0.1.1", "0.0.2.1")])
+        _, _, deps = self.module.nuspec_of(self.module.find_package("Down.Models", state["version"]))
+        self.assertIn(("Up.Lib", "0.0.2.1"), deps)
 
     def test_a_repo_cycle_fails_the_plan_naming_it(self):
         self.repo("A", {"A.Lib/A.Lib.csproj": csproj(["B.Lib"])})
