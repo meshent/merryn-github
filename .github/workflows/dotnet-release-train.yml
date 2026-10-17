@@ -36,8 +36,9 @@
 #   record   writes the run summary and, when merryn-url is set, POSTs the release record.
 #
 # promote-only (recovery, with `version`) skips plan, build and publish: for a train whose packages are already on the
-# feed (every package of a named repo must be there at that version) it fast-forwards main and tags train/<version> at the
-# repo=sha entries it is given, re-deriving the pins that train packed,
+# feed (every package of a named repo must be there at that version), or a host-only train that published nothing (every
+# entry a host), it fast-forwards main and tags train/<version> at the repo=sha entries it is given, re-deriving the pins
+# that train packed,
 # and refuses any sha that is not on `ref` (or main). dry-run with promote-only checks and reports, pushing nothing.
 #
 # dry-run (the default until the first real train) stops after build and uploads the local feed as an artifact.
@@ -497,7 +498,11 @@ jobs:
               """Add the local feed to the repo's nuget.config (in the runner's copy only) so a downstream restores the
               upstream packed minutes ago. Under packageSourceMapping, each train package id is mapped to the local feed
               AND to the GitHub source: an exact id pattern outranks `meshNet.*`, so without the second entry an exact pin
-              on an older version could no longer resolve. Floats take the highest version, which is the train's."""
+              on an older version could no longer resolve. Floats take the highest version, which is the train's. With no
+              package in the train (a host-only train) the nuget.config is left untouched: there is nothing to restore
+              locally, and under packageSourceMapping a source with no pattern fails restore."""
+              if not train_ids:
+                  return
               config = Path(dest) / "nuget.config"
               if not config.exists():
                   config.write_text('<?xml version="1.0" encoding="utf-8"?>\n<configuration><packageSources>'
@@ -1263,7 +1268,7 @@ jobs:
               version, fast-forward main and tag train/<version> at the given shas. Builds and publishes nothing. Each sha must
               be on the ref (or already on main, which only the train moves) and main must be its ancestor; every entry is
               checked before anything is pushed, including that the version is a published train (some manifest package is on
-              the feed at it). The pins that train committed are re-derived on top of the sha: its packages are the ones on
+              the feed at it), unless every entry is a host (a host-only train publishes nothing). The pins that train committed are re-derived on top of the sha: its packages are the ones on
               the feed at the version (each repository read at its tag, at the given sha, or at the train tag before it), and
               an exact pin on any other package moves forward only to its newest release on the feed below the version, or
               to what main already carries, as the build did, so main carries what was packed."""
@@ -1348,9 +1353,14 @@ jobs:
                                       f"at {version} here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
               train_ids = {i for ids in member_ids.values() for i in ids}
-              if not train_ids:
+              if not train_ids and not set(targets) <= host_names:
                   raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
                                    f"feed at {version}; promote-only only finishes a train whose packages were published")
+              if not train_ids:
+                  # A host-only train (no package changed) publishes nothing, so the feed cannot vouch for the version. Its
+                  # hosts are still finished: the sha checks above hold, and every pin re-derives from the releases below the
+                  # version (and main's carry), the same map that train built them against.
+                  log(f"No package is on the feed at {version}: finishing it as a host-only train")
               # The same forward moves the build made: each other package's newest release published before this train.
               published = published_versions(manifest["org"], manifest_ids - train_ids, version)
               for name in targets:

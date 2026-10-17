@@ -200,6 +200,23 @@ class Unit(unittest.TestCase):
         self.train.point_at_local_feed(repo, {"X"})
         self.assertIn('key="train-local"', (repo / "nuget.config").read_text())
 
+    def test_an_empty_train_leaves_the_nuget_config_untouched(self):
+        """A host-only train has no package to restore locally, and a packageSourceMapping source with no pattern fails
+        restore ("must have at least one package pattern"): the config is not touched, and none is created."""
+        repo = Path(self.tmp.name) / "mapped"
+        repo.mkdir()
+        config = ('<?xml version="1.0" encoding="utf-8"?><configuration><packageSources>'
+                  '<add key="github" value="https://nuget.pkg.github.com/meshent/index.json" /></packageSources>'
+                  '<packageSourceMapping><packageSource key="github"><package pattern="meshNet.*" /></packageSource>'
+                  '</packageSourceMapping></configuration>')
+        (repo / "nuget.config").write_text(config)
+        self.train.point_at_local_feed(repo, set())
+        self.assertEqual((repo / "nuget.config").read_text(), config)
+        bare = Path(self.tmp.name) / "none"
+        bare.mkdir()
+        self.train.point_at_local_feed(bare, set())
+        self.assertFalse((bare / "nuget.config").exists())
+
     def _nupkg(self, package_id, version, deps):
         self.train.FEED.mkdir(parents=True, exist_ok=True)
         path = self.train.FEED / f"{package_id}.{version}.nupkg"
@@ -1422,6 +1439,75 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout)
         self.assertEqual(self.rev("Host", "main^"), built)
         self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
+        self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
+        self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
+
+    def host_only_train(self):
+        """meshNet's next train: every package repository is unchanged since its train tag, only the host's release is
+        ahead of main, and the host's nuget.config maps its sources (packageSourceMapping), as meshNet's does."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.host_repo("Host", [("Up.Lib", "0.0.0.1")], code="namespace Host; public class B {}")
+        self.commit_to("Host", "main", {"nuget.config":
+            '<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear />'
+            '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />'
+            f'<add key="org" value="{self.root / "orgfeed"}" /></packageSources><packageSourceMapping>'
+            '<packageSource key="org"><package pattern="Up.*" /></packageSource>'
+            '<packageSource key="nuget.org"><package pattern="*" /></packageSource>'
+            '</packageSourceMapping></configuration>'})
+        self.release_branches("Up", "Host")
+        subprocess.run(["git", "tag", "train/0.0.1.1", "main"], cwd=self.bare("Up"), check=True)
+        self.released("Up.Lib", "0.0.1.1", self.rev("Up", "main"))
+        self.commit_to("Host", "release", {"README.md": "a host-only change"})
+        self.manifest(["Up"], [{"repo": "Host", "build": "Host.Api.slnx", "test": False}])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["selected"], state["hosts_selected"], state["train_ids"]), ([], ["Host"], []))
+        return state
+
+    def test_a_host_only_train_restores_under_package_source_mapping_and_promotes_the_host(self):
+        """Nothing is in the train, so the host's mapped nuget.config is left as it is (an empty train-local mapping
+        fails restore), its stale pin still moves forward to the newest release, nothing is pushed to the feed, and the
+        host is promoted and tagged."""
+        state = self.host_only_train()
+        mapped = (self.root / "train/src/Host/Host/nuget.config").read_text()
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        self.assertIn("$ dotnet build Host.Api.slnx", build.stdout)
+        self.assertEqual((self.root / "train/src/Host/Host/nuget.config").read_text(), mapped)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual([tuple(p[1:]) for p in state["repos"]["Host"]["pins"]], [("Up.Lib", "0.0.0.1", "0.0.1.1")])
+        self.assertEqual(state["packages"], [])
+        publish = self.train("publish")
+        self.assertEqual(publish.returncode, 0, publish.stdout)
+        self.assertNotIn("dotnet nuget push", publish.stdout)
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        version = state["version"]
+        self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
+        self.assertIn('Include="Up.Lib" Version="0.0.1.1"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
+        record = self.train("record")
+        self.assertEqual(record.returncode, 0, record.stdout)
+        self.assertIn("Packages: 1 considered, 0 in this train", record.stdout)
+        self.assertIn(f"Promoted (main fast-forwarded, tagged `train/{version}`): Host.", record.stdout)
+
+    def test_promote_only_finishes_a_stranded_host_only_train_with_the_pins_its_build_derived(self):
+        """A host-only train published nothing, so the feed has no package at its version; promote-only still finishes it
+        when every entry is a host, with the pins re-derived from the releases below the version. A package repository
+        named for such a version is still refused: only the feed can vouch for a train that should have published."""
+        state = self.host_only_train()
+        version, built = state["version"], state["repos"]["Host"]["sha"]
+        self.feed_env.update(TRAIN_VERSION=version, TRAIN_PROMOTE=f"Host={built}, Up={self.rev('Up', 'release')}")
+        refused = self.train("promote-only")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn(f"no package of any manifest repository is on the feed at {version}", refused.stdout)
+        self.assertFalse(self.is_ancestor("Host", built, "main"))
+        self.feed_env["TRAIN_PROMOTE"] = f"Host={built}"                             # what the stranded summary prints
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Host", "main^"), built)
+        self.assertIn('Include="Up.Lib" Version="0.0.1.1"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
         self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
 

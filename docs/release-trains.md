@@ -126,7 +126,8 @@ Phases, in the one job:
    references is in the train (a direct reference is enough: whatever depends on an in-train package is in the train
    itself). It is built **last**, after every package repository, so everything it can restore from this train is in
    the local feed. Its pins resolve exactly as a package's do (`pin_train_versions` with the train version for an
-   in-train package, else `newest(published, carry)`), the local feed is added to its `nuget.config`, then its `build`
+   in-train package, else `newest(published, carry)`), the local feed is added to its `nuget.config` (left untouched
+   when no package is in the train: a `packageSourceMapping` source with no pattern fails restore), then its `build`
    target is built and its `solution` (test target) tested, with the manifest's `test-env`/`test-args`, against
    packages only (no source-graph switch: what a host proves is that it builds and passes against what ships). A host
    failure fails the build step, so nothing is published. A host is never packed or pushed. On a live train its pins
@@ -178,7 +179,10 @@ promote step stopped there, leaving Commerce, Pay and the four External.* repos 
   - **The version must be published.** Some manifest package must be on the org feed at the version (read from the
     NuGet v3 flat container with the packages token, fail-closed; `TRAIN_FEED` may name another service index or a
     folder), so a typo or a dry run's stamp is refused before anything is tagged. A named repo none of whose packages
-    shipped in that train (a docs-only change) is still promoted and tagged.
+    shipped in that train (a docs-only change) is still promoted and tagged. The one exception is a **host-only
+    train** (no package changed, so nothing was published): when every entry is a host, an empty feed at the version
+    is accepted, and the hosts' pins re-derive from the releases below the version (and `main`'s carry), the map that
+    train built them against. The sha checks still apply; only the version is not vouched for by the feed.
   - **Which sha.** Use the sha the stranded summary prints (also in the Merryn release record as `strandedFrom`): it is
     the one the train built. The checks above refuse a sha off `release`, but cannot tell an older or newer sha on
     `release` from the built one.
