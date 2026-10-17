@@ -21,16 +21,24 @@
 #            Before packing, an exact pin on an in-train package moves to the train version and one on any other manifest
 #            package moves forward (never back) to its newest release already on the feed, so nothing packs against a
 #            pin that a dependency published ahead of it has outpaced.
+#            Then each selected HOST (the manifest's `hosts`), after every package repository: the same pin resolution
+#            (the train version for an in-train package, else its newest published release or main's carried pin), its
+#            build target built and its test target tested against the local feed. Hosts are never packed or published; a
+#            host failure fails the train here, before publish. A host is in the train when its ref has commits main lacks
+#            or a package it references is in the train.
 #   publish  only when every selected repository built and passed: pushes each package, in order, --skip-duplicate.
 #   promote  per repository: pushes the train's pin commit to `ref` when that still fast-forwards (when a lane merged
 #            into `ref` while the train ran, `ref` keeps the lane's work and the next plan reconciles), fast-forwards main
 #            to exactly what was built (a plain push, never forced) and tags train/<version>. A repository it cannot
 #            promote is recorded as stranded and the others are still promoted; the step then fails naming them.
+#            Selected hosts are promoted the same way, last; their main moving is their deploy (the host's own workflow on
+#            the main push), nothing is dispatched from here.
 #   record   writes the run summary and, when merryn-url is set, POSTs the release record.
 #
 # promote-only (recovery, with `version`) skips plan, build and publish: for a train whose packages are already on the
-# feed (every package of a named repo must be there at that version) it fast-forwards main and tags train/<version> at the
-# repo=sha entries it is given, re-deriving the pins that train packed,
+# feed (every package of a named repo must be there at that version), or a host-only train that published nothing (every
+# entry a host), it fast-forwards main and tags train/<version> at the repo=sha entries it is given, re-deriving the pins
+# that train packed,
 # and refuses any sha that is not on `ref` (or main). dry-run with promote-only checks and reports, pushing nothing.
 #
 # dry-run (the default until the first real train) stops after build and uploads the local feed as an artifact.
@@ -79,7 +87,7 @@ on:
         description: read:packages for restore; on a live train also write:packages for the push
         required: true
       dispatch-token:
-        description: Host deploys (Phase 2; accepted and unused until hosts join the manifest)
+        description: "Accepted and unused: a host deploys from its own main push, which promotion makes"
         required: false
       merryn-token:
         description: Bearer token for the release record
@@ -131,7 +139,8 @@ jobs:
 
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
                       package edges (a cycle fails, naming it), select the packages that changed since their last
-                      publication (select_packages) and the repos that carry one or are ahead of main, read the one
+                      publication (select_packages) and the repos that carry one or are ahead of main, the hosts that
+                      consume an in-train package or are ahead of main (select_host), read the one
                       version stamp from the clock, refuse a repo whose main is not an ancestor of TRAIN_REF
                       (a dry run warns instead: it promotes nothing). TRAIN_REF_OVERRIDES, dry runs only, takes the
                       repos it names at another branch, so a lane branch can ride a rehearsal before it merges
@@ -140,11 +149,13 @@ jobs:
                       (committed on a live train), point its nuget.config at the local feed, pack its in-train projects
                       (without the source-graph switch, from an untouched copy) into the local feed, check every package
                       carries the train version and every in-train dependency in its nuspec names that same version, then
-                      run its test gate from source
+                      run its test gate from source; then each selected host (hosts last): the same pins, its build
+                      and test targets against the local feed, nothing packed
             publish   push every package to the org feed in the same order (only reached when build passed everywhere)
-            promote   per selected repo: the pin commit onto TRAIN_REF when that still fast-forwards (else a warning; the
-                      next plan reconciles), main fast-forwarded to what was built, tag train/<version>; a repo that cannot
-                      be promoted is recorded as stranded, the rest still are, and the command fails naming them
+            promote   per selected repo, then per selected host: the pin commit onto TRAIN_REF when that still
+                      fast-forwards (else a warning; the next plan reconciles), main fast-forwarded to what was built, tag
+                      train/<version>; a repo that cannot be promoted is recorded as stranded, the rest still are, and the
+                      command fails naming them
             record    write the run summary and, when MERRYN_URL is set, POST the release record to it
 
             promote-only  (instead of plan..promote) finish a stranded promotion: TRAIN_VERSION names an already-published
@@ -259,7 +270,25 @@ jobs:
                   raise TrainError(f"{path}: a repo is listed twice")
               if not repos:
                   raise TrainError(f"{path}: no repos")
-              return {"org": org, "repos": repos, "hosts": data.get("hosts", [])}
+              hosts = []
+              for entry in data.get("hosts", []):
+                  host = {"repo": entry} if isinstance(entry, str) else dict(entry)
+                  if not host.get("repo"):
+                      raise TrainError(f"{path}: every hosts entry needs a name: {entry!r}")
+                  test_env = {**data.get("test-env", {}), **host.get("test-env", {})}
+                  if not all(isinstance(k, str) and isinstance(v, str) for k, v in test_env.items()):
+                      raise TrainError(f"{host['repo']}: test-env must map variable names to string values")
+                  # A host is built and tested, never packed: `build` names what to build (its deployable hosts), `solution`
+                  # what to test, as the host's own CI does. `deploy` and `pins` are kept for the record; promotion to main
+                  # is what deploys a host whose main push triggers its deploy.
+                  hosts.append({"repo": host["repo"], "host": True, "solution": host.get("solution", ""),
+                                "build": host.get("build", ""), "test": host.get("test", True),
+                                "test-args": host.get("test-args", ""), "test-env": test_env,
+                                "deploy": host.get("deploy", ""), "pins": host.get("pins", "")})
+              every = names + [h["repo"] for h in hosts]
+              if len(set(n.lower() for n in every)) != len(every):
+                  raise TrainError(f"{path}: a host is listed twice, or as both a repo and a host")
+              return {"org": org, "repos": repos, "hosts": hosts}
 
 
           # --- Reading a repository ----------------------------------------------------------------------------------------
@@ -469,7 +498,11 @@ jobs:
               """Add the local feed to the repo's nuget.config (in the runner's copy only) so a downstream restores the
               upstream packed minutes ago. Under packageSourceMapping, each train package id is mapped to the local feed
               AND to the GitHub source: an exact id pattern outranks `meshNet.*`, so without the second entry an exact pin
-              on an older version could no longer resolve. Floats take the highest version, which is the train's."""
+              on an older version could no longer resolve. Floats take the highest version, which is the train's. With no
+              package in the train (a host-only train) the nuget.config is left untouched: there is nothing to restore
+              locally, and under packageSourceMapping a source with no pattern fails restore."""
+              if not train_ids:
+                  return
               config = Path(dest) / "nuget.config"
               if not config.exists():
                   config.write_text('<?xml version="1.0" encoding="utf-8"?>\n<configuration><packageSources>'
@@ -813,6 +846,21 @@ jobs:
               return ship, decisions
 
 
+          def select_host(host, ship, ahead):
+              """(selected, reason) for a host: it is in the train when its ref has commits main lacks, or when a package it
+              references (host["consumes"], the manifest packages any of its projects names) is in the train. A host is never
+              packed, so "changed since its last publication" does not apply: what it has to prove is that it still builds and
+              passes against what this train packs."""
+              consumed = [p for p in host.get("consumes", []) if p in ship]
+              if consumed:
+                  more = f" and {len(consumed) - 3} more" if len(consumed) > 3 else ""
+                  return True, f"consumes {len(consumed)} package(s) in this train: {', '.join(consumed[:3])}{more}"
+              if ahead:
+                  return True, f"{host['ref']} is ahead of main; consumes nothing in this train"
+              return False, "unchanged" + (f" since {host['tag']['tag']}" if host.get("tag") else "") + \
+                  "; consumes nothing in this train"
+
+
           def pins_at(dest, commit, ids):
               """The exact pins on ids at a commit, across its .csproj and Directory.Packages.props files: {id: highest}."""
               found = {}
@@ -909,7 +957,7 @@ jobs:
               if overrides and not dry_run:
                   raise TrainError("ref overrides are for dry runs only: a live train assembles every repository from "
                                    f"'{ref}' and promotes that to main (overrides named {', '.join(sorted(overrides))})")
-              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"]})
+              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
               if unknown:
                   raise TrainError(f"ref overrides name repositories that are not in the manifest: {', '.join(unknown)}")
               if WORK.exists():
@@ -929,6 +977,21 @@ jobs:
                       f"latest train tag {tag['tag'] if tag else '(none)'}")
                   projects = [describe_project(dest, p) for p in find_projects(dest)]
                   repos[name] = {**repo, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag, "projects": projects}
+              # Hosts are read the same way, but produce nothing for the train: their projects never become package owners
+              # or edges, so they sort after every package repository and are built last, against what the train packed.
+              hosts = {}
+              for host in manifest["hosts"]:
+                  name = host["repo"]
+                  repo_ref = overrides.get(name, ref)
+                  dest = checkout_dir(SRC, name)
+                  sha = clone(manifest["org"], name, repo_ref, dest)
+                  tag = latest_train_tag(dest)
+                  main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
+                  log(f"{name} (host): {repo_ref} {sha[:12]}{' (override)' if name in overrides else ''}, main {main[:12]}, "
+                      f"latest train tag {tag['tag'] if tag else '(none)'}")
+                  projects = [describe_project(dest, p) for p in find_projects(dest)]
+                  hosts[name] = {**host, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag,
+                                 "projects": projects, "project_order": [], "ships": []}
 
               owner = {}
               for name, repo in repos.items():
@@ -968,8 +1031,14 @@ jobs:
                       repo["reason"] = "unchanged" + (f" since {repo['tag']['tag']}" if repo["tag"] else "")
 
               selected = [n for n in repo_order if repos[n]["selected"]]
+              for name, host in hosts.items():
+                  ahead = not is_ancestor(checkout_dir(SRC, name), host["sha"], host["main"])
+                  host["consumes"] = sorted({p for project in host["projects"] for p in project["packages"]} & set(owner))
+                  host["selected"], host["reason"] = select_host(host, ship, ahead)
+              hosts_selected = [n for n in hosts if hosts[n]["selected"]]
+              repos.update(hosts)
               warnings = []
-              for name in selected:
+              for name in selected + hosts_selected:
                   repo = repos[name]
                   dest = checkout_dir(SRC, name)
                   if not is_ancestor(dest, repo["main"], repo["sha"]):
@@ -992,6 +1061,9 @@ jobs:
                           warnings.append(message + " A live train refuses this repository.")
                           log(f"WARNING {message}")
                   repo["solution_file"] = find_solution(checkout_dir(SRC, name), repo) if repo["test"] else ""
+                  if repo.get("host"):
+                      # What the host's own CI builds; a host with no tests still has to compile against the train.
+                      repo["build_file"] = repo["build"] or ("" if repo["test"] else find_solution(dest, repo))
                   repo["source_graph"] = SWITCH in ((checkout_dir(SRC, name) / "Directory.Build.targets").read_text()
                                                     if (checkout_dir(SRC, name) / "Directory.Build.targets").exists() else "")
                   repo["items"] = sorted(set(ITEM_KEY.findall(git(
@@ -1009,22 +1081,24 @@ jobs:
                       "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
                       "decisions": decisions, "published": published,
-                      "repo_edges": repo_edges, "repos": repos, "hosts": manifest["hosts"], "packages": [], "promoted": [],
-                      "stranded": [], "release_behind": [], "release_refused": []}
+                      "repo_edges": repo_edges, "repos": repos, "hosts": list(hosts), "hosts_selected": hosts_selected,
+                      "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
 
               log(f"\nTrain {version} ({'dry run' if dry_run else 'live'}), ref {ref}" +
                   (" with overrides " + ", ".join(f"{n}={r}" for n, r in sorted(overrides.items())) if overrides else ""))
-              log(f"Repository order: {' -> '.join(repo_order)}")
+              log(f"Repository order: {' -> '.join(repo_order)}" + (f", then hosts {', '.join(hosts)}" if hosts else ""))
               for name in repo_order:
                   deps = ", ".join(repo_edges[name]) or "nothing in the manifest"
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name}: {repos[name]['reason']}; depends on {deps}")
+              for name in hosts:
+                  log(f"  {'*' if repos[name]['selected'] else ' '} {name} (host): {repos[name]['reason']}")
               log(f"Packages: {len(ship)} of {len(decisions)} in this train, across {len(repo_order)} repositories")
               for package_id, reason in ship.items():
                   log(f"  + {package_id}: {reason}")
               output("version", version)
-              output("selected", ",".join(selected))
-              if not selected:
+              output("selected", ",".join(selected + hosts_selected))
+              if not selected + hosts_selected:
                   log("Nothing changed since the last train; nothing to build.")
 
 
@@ -1034,7 +1108,11 @@ jobs:
               version, env = plan["version"], dotnet_env()
               PACK.mkdir(exist_ok=True)
               packages = []
-              for name in plan["selected"]:
+              # Hosts come last: they consume packages and produce none, so every package they could restore from this train
+              # is in the local feed by then. Their exact pins resolve exactly as a package's do (the train version for an
+              # in-train package, else newest(published, carry)), they are built and tested, never packed, and a failure here
+              # fails the train before anything is published.
+              for name in plan["selected"] + plan.get("hosts_selected", []):
                   repo = plan["repos"][name]
                   src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
                   log(f"::group::{name}")
@@ -1058,6 +1136,12 @@ jobs:
                       if not plan["dry_run"]:
                           repo["sha"] = commit_pins(src, pins, version)
                           repo["train_commits"] = True
+                  if repo.get("host"):
+                      point_at_local_feed(src, train_ids)
+                      build_host(repo, src, env)
+                      log("::endgroup::")
+                      log(f"{name} (host): built and tested at {version}, nothing packed")
+                      continue
                   # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
                   if pack.exists():
                       shutil.rmtree(pack)
@@ -1088,6 +1172,21 @@ jobs:
                        if len(repo["ships"]) < len(repo["project_order"]) else ""))
               plan["packages"] = packages
               PLAN.write_text(json.dumps(plan, indent=2))
+
+
+          def build_host(repo, src, env):
+              """A host's gate, as its own CI runs it: build its build target (the deployable hosts), then test its test
+              target, both against packages only. No source-graph switch: what a host has to prove is that it compiles and
+              passes against the versions this train packed and pinned."""
+              test_env = {**env, **repo.get("test-env", {})}
+              if repo.get("build_file"):
+                  run(["dotnet", "build", repo["build_file"], "-c", "Release"], cwd=src, env=test_env)
+              if repo["test"]:
+                  args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
+                  args += repo["test-args"].split() if repo["test-args"] else []
+                  run(args, cwd=src, env=test_env)
+              else:
+                  log(f"{repo['repo']}: tests skipped (\"test\": false in the manifest)")
 
 
           def cmd_publish():
@@ -1159,7 +1258,9 @@ jobs:
 
           def cmd_promote():
               plan = json.loads(PLAN.read_text())
-              promote_all(plan, [n for n in plan["selected"] if n not in plan["promoted"]])
+              # Hosts last, like the build: main moving is a host's deploy, so it moves only once every package repository
+              # it consumes has been promoted (or recorded as stranded).
+              promote_all(plan, [n for n in plan["selected"] + plan.get("hosts_selected", []) if n not in plan["promoted"]])
 
 
           def cmd_promote_only():
@@ -1167,7 +1268,7 @@ jobs:
               version, fast-forward main and tag train/<version> at the given shas. Builds and publishes nothing. Each sha must
               be on the ref (or already on main, which only the train moves) and main must be its ancestor; every entry is
               checked before anything is pushed, including that the version is a published train (some manifest package is on
-              the feed at it). The pins that train committed are re-derived on top of the sha: its packages are the ones on
+              the feed at it), unless every entry is a host (a host-only train publishes nothing). The pins that train committed are re-derived on top of the sha: its packages are the ones on
               the feed at the version (each repository read at its tag, at the given sha, or at the train tag before it), and
               an exact pin on any other package moves forward only to its newest release on the feed below the version, or
               to what main already carries, as the build did, so main carries what was packed."""
@@ -1182,9 +1283,10 @@ jobs:
               targets = repo_assignments(os.environ.get("TRAIN_PROMOTE", ""), "promote-only entry", "sha")
               if not targets:
                   raise TrainError("promote-only needs at least one repo=sha entry")
-              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"]})
+              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
               if unknown:
                   raise TrainError(f"promote-only names repositories that are not in the manifest: {', '.join(unknown)}")
+              host_names = {h["repo"] for h in manifest["hosts"]}
               # A dispatch input reaches git as an argument: only a commit id (hex) is accepted, never a ref name or an option.
               not_sha = sorted(f"{n}={v}" for n, v in targets.items() if not re.fullmatch(r"[0-9a-fA-F]{7,40}", v))
               if not_sha:
@@ -1195,14 +1297,15 @@ jobs:
               tag = f"train/{version}"
 
               repos, tagged_at, others, problems = {}, {}, {}, []
-              for entry in manifest["repos"]:
+              # A host is cloned only when it is named: it produces no package, so it never says what the train shipped.
+              for entry in manifest["repos"] + [h for h in manifest["hosts"] if h["repo"] in targets]:
                   name = entry["repo"]
                   dest = checkout_dir(SRC, name)
                   tip = clone(manifest["org"], name, ref, dest)
                   tagged = bool(git(["tag", "--list", tag], cwd=dest, capture=True).strip())
                   if tagged:
                       tagged_at[name] = git(["rev-list", "-n", "1", tag], cwd=dest, capture=True).strip()
-                  elif name not in targets:
+                  elif name not in targets and name not in host_names:
                       # Read at the train tag a plan for this train saw, or at the tip for a repository with none.
                       others[name] = (latest_train_tag(dest, before=version) or {"sha": tip})["sha"]
                   if name not in targets:
@@ -1223,7 +1326,8 @@ jobs:
                       problems.append(f"{name}: main ({main[:12]}) is not an ancestor of {sha[:12]} and is ahead of it by "
                                       f"commits the train did not make, so main cannot fast-forward to it")
                   repos[name] = {"repo": name, "ref": ref, "sha": sha, "base": sha, "tip": tip, "main": main,
-                                 "reason": f"promote-only at {sha[:12]}", "items": [], "selected": True}
+                                 "reason": f"promote-only at {sha[:12]}", "items": [], "selected": True,
+                                 **({"host": True} if name in host_names else {})}
                   if not is_ancestor(dest, main, sha) and only_train_commits(dest, sha, main):
                       repos[name]["carry_from"] = main
               if problems:
@@ -1249,16 +1353,24 @@ jobs:
                                       f"at {version} here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
               train_ids = {i for ids in member_ids.values() for i in ids}
-              if not train_ids:
+              if not train_ids and not set(targets) <= host_names:
                   raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
                                    f"feed at {version}; promote-only only finishes a train whose packages were published")
+              if not train_ids:
+                  # A host-only train (no package changed) publishes nothing, so the feed cannot vouch for the version. Its
+                  # hosts are still finished: the sha checks above hold, and every pin re-derives from the releases below the
+                  # version (and main's carry), the same map that train built them against.
+                  log(f"No package is on the feed at {version}: finishing it as a host-only train")
               # The same forward moves the build made: each other package's newest release published before this train.
               published = published_versions(manifest["org"], manifest_ids - train_ids, version)
               for name in targets:
-                  if not member_ids[name]:
+                  if name in host_names:
+                      log(f"{name} (host): main moves to what train {version} built and is tagged")
+                  elif not member_ids[name]:
                       log(f"{name}: none of its packages is in train {version}; main still moves and is tagged")
 
-              names = [r["repo"] for r in manifest["repos"] if r["repo"] in targets]
+              # Hosts last, as the train promotes them.
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] if r["repo"] in targets]
               for name in names:
                   repo, dest = repos[name], checkout_dir(SRC, name)
                   git(["checkout", "-q", "--detach", repo["sha"]], cwd=dest)
@@ -1303,11 +1415,18 @@ jobs:
                   repo = plan["repos"][name]
                   lines.append(f"| {name} | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
                                f"{', '.join(plan['repo_edges'][name]) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
+              for name in plan.get("hosts", []):
+                  # Hosts: built and tested against the train, never packed; promoted to main (their deploy) on a live train.
+                  repo = plan["repos"][name]
+                  lines.append(f"| {name} (host) | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
+                               f"{', '.join(repo.get('consumes', [])) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
               if plan.get("decisions") is not None:
                   ship = plan.get("ship", {})
                   lines += ["", f"Repositories: {len(plan['repo_order'])} considered, {len(plan['selected'])} in this train. "
                                 f"Packages: {len(plan['decisions'])} considered, {len(ship)} in this train; every other package "
-                                f"is unchanged since its last publication and is neither packed nor pushed."]
+                                f"is unchanged since its last publication and is neither packed nor pushed." +
+                                (f" Hosts: {len(plan['hosts'])} considered, {len(plan.get('hosts_selected', []))} built and "
+                                 f"tested against this train (never packed)." if plan.get("hosts") else "")]
               packed = {p["id"]: p for p in plan["packages"]}
               if plan.get("ship"):
                   lines += ["", "| package | why | version | in-train dependencies |", "|---|---|---|---|"]
@@ -1346,6 +1465,8 @@ jobs:
                   record = {"release": plan["version"], "org": plan["org"], "ref": plan["ref"],
                             "repos": [{"repo": n, "sha": plan["repos"][n]["sha"], "items": plan["repos"][n].get("items", [])}
                                       for n in plan["selected"]],
+                            "hosts": [{"repo": n, "sha": plan["repos"][n]["sha"], "items": plan["repos"][n].get("items", [])}
+                                      for n in plan.get("hosts_selected", [])],
                             "packages": [{"id": p["id"], "version": p["version"]} for p in plan["packages"]],
                             "promoted": plan["promoted"], "stranded": [s["repo"] for s in plan.get("stranded", [])],
                             # The sha each stranded repository was built from: exactly the promote-only input that finishes

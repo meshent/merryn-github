@@ -118,6 +118,24 @@ Phases, in the one job:
    `meshNet.Commerce.Types` resolved Types 0.0.2474.11566, whose nuspec names `meshNet.Common >= 0.0.2474.11566`
    (the pin commit of train 0.0.2474.11566 that moved it never reached Commerce's `release`). Under this rule Models
    packs against `meshNet.Common 0.0.2474.11566`.
+6b. **Hosts** (Phase 2, built; the meshNet #301 back-merge failure: meshNet.Api pinned meshNet.Networks
+   0.0.2474.11566 while its code needed the 0.0.2480.14757 train 0.0.2480.14757 had just published, and nothing built
+   the host). Every manifest `hosts` entry is cloned at `ref` (a dry run's `ref-overrides` may name it) and read like a
+   package repository, but its projects never become package owners or edges: a host produces nothing for the train.
+   A host is **in the train** when its ref has commits `main` lacks, or when any manifest package one of its projects
+   references is in the train (a direct reference is enough: whatever depends on an in-train package is in the train
+   itself). It is built **last**, after every package repository, so everything it can restore from this train is in
+   the local feed. Its pins resolve exactly as a package's do (`pin_train_versions` with the train version for an
+   in-train package, else `newest(published, carry)`), the local feed is added to its `nuget.config` (left untouched
+   when no package is in the train: a `packageSourceMapping` source with no pattern fails restore), then its `build`
+   target is built and its `solution` (test target) tested, with the manifest's `test-env`/`test-args`, against
+   packages only (no source-graph switch: what a host proves is that it builds and passes against what ships). A host
+   failure fails the build step, so nothing is published. A host is never packed or pushed. On a live train its pins
+   are its `[train <id>] pin …` commit on `release`, and promotion moves `main` to it after every package repository
+   (rule (a), stranding and promote-only apply unchanged); `main` moving is the host's deploy, through its own `main`
+   push workflow. The train dispatches nothing itself (`dispatch-token` stays unused). meshNet's entry mirrors its
+   `ci.yml`: `{"repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx"}` (both suites run
+   in-memory, no services).
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
    host in the manifest with `deploy: true`, fire the existing shared `dispatch-deploy` (meshNet.Hosting azd) or the
    `deploy-host.yml` here (Merryn tenant hosts). Static web apps (Web.Vocab, Web.Pay) deploy themselves on the push to
@@ -161,7 +179,10 @@ promote step stopped there, leaving Commerce, Pay and the four External.* repos 
   - **The version must be published.** Some manifest package must be on the org feed at the version (read from the
     NuGet v3 flat container with the packages token, fail-closed; `TRAIN_FEED` may name another service index or a
     folder), so a typo or a dry run's stamp is refused before anything is tagged. A named repo none of whose packages
-    shipped in that train (a docs-only change) is still promoted and tagged.
+    shipped in that train (a docs-only change) is still promoted and tagged. The one exception is a **host-only
+    train** (no package changed, so nothing was published): when every entry is a host, an empty feed at the version
+    is accepted, and the hosts' pins re-derive from the releases below the version (and `main`'s carry), the map that
+    train built them against. The sha checks still apply; only the version is not vouched for by the feed.
   - **Which sha.** Use the sha the stranded summary prints (also in the Merryn release record as `strandedFrom`): it is
     the one the train built. The checks above refuse a sha off `release`, but cannot tell an older or newer sha on
     `release` from the built one.
@@ -307,7 +328,8 @@ cache is per repository (10 GB, entries dropped after 7 days unused), so a train
   board as a release.
 
 **Phase 2: hosts, pins and the gate.**
-- Hosts join the manifest; the train bumps their pins and fires their deploys. Consumers move to exact pins (the owner's
+- Hosts join the manifest; the train bumps their pins and builds and tests them against the train, and promotion is
+  their deploy (built: step 6b). Consumers move to exact pins (the owner's
   standing request) now that something maintains them.
 - `actions-budget-gate.yml` with the variable, thresholds and the owner alert.
 - Mira adopts the same train (Mira packages, merryn-mira and Tower hosts).
