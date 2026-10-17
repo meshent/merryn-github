@@ -163,7 +163,7 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | `dotnet-version` | default `10.0.x` |
 | secret `repos-token` | reads every manifest repository; on a live train also pushes `main` and `train/*` tags |
 | secret `packages-token` | `read:packages` for restore; on a live train also `write:packages` |
-| secret `dispatch-token` | host deploys; accepted and unused until hosts join the manifest (Phase 2) |
+| secret `dispatch-token` | accepted and unused: a host deploys from its own `main` push, which promotion makes |
 | secrets `merryn-url`, `merryn-token` | when set, a live train that published and promoted POSTs its release record (version, repos with their commits and the item keys found in their commit messages since the last tag, packages, run URL) to `merryn-url` with the token as a bearer. A failed POST warns and never fails a published train |
 | output `version` | the train version, which is also the `train/<version>` tag |
 
@@ -178,7 +178,9 @@ then dispatch it with `dry-run: false` once the owner says yes.
     { "repo": "meshNet.Users", "solution": "meshNet.Users.slnx", "test-args": "--filter Category!=Integration" },
     { "repo": "meshNet.External.Carriers", "test": false }
   ],
-  "hosts": []
+  "hosts": [
+    { "repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx", "deploy": "dispatch-deploy" }
+  ]
 }
 ```
 
@@ -192,8 +194,17 @@ A repository entry is a name, or an object with `repo` plus any of three optiona
 - `test: false`: skip the tests. Use it only for a repository with none.
 
 A project is packable unless it evaluates `IsPackable` false or is a test project (`IsTestProject`, or it references
-`Microsoft.NET.Test.Sdk`). Its id is its `PackageId`. `hosts` is read but ignored until Phase 2, when hosts' pins and
-deploys join the train.
+`Microsoft.NET.Test.Sdk`). Its id is its `PackageId`.
+
+A `hosts` entry is a name, or an object with `repo` plus `build` (what to build, e.g. the deployable hosts' solution),
+`solution` (what to test; default as for a repository), `test`, `test-args` and `test-env` as above; `deploy` and
+`pins` are kept for the record. A host is in the train when its ref has commits `main` lacks or a package one of its
+projects references is in the train. It is built after every package repository, with its exact pins resolved as a
+package's are (the train version for an in-train package, else that package's newest published release), then its
+`build` target is built and its `solution` tested against packages only. It is never packed or published. A host
+failure fails the train before publish. On a live train its pin commit and `main` move like a repository's, after the
+repositories; `main` moving is its deploy (its own `main` push workflow). A host without the `ref` branch fails the
+plan, as a repository does.
 
 **Done** means the run is green. On a live train that also means the summary lists every package at one version and
 every selected repository promoted. The tag `train/<version>` exists in each one, and its `main` equals `ref`.

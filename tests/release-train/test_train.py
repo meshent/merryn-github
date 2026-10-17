@@ -112,6 +112,63 @@ class Unit(unittest.TestCase):
         with self.assertRaises(self.train.TrainError):
             self.train.load_manifest(path)
 
+    # --- Hosts (Phase 2): built and tested in the train's sequence, never packed --------------------------------------
+
+    def test_manifest_hosts_take_build_and_test_targets_and_the_top_level_test_env(self):
+        path = Path(self.tmp.name) / "m.json"
+        path.write_text(json.dumps({"org": "o", "test-env": {"COSMOS_EMULATOR_OPTIONAL": "1"}, "repos": ["A"], "hosts": [
+            {"repo": "meshNet", "deploy": "dispatch-deploy", "pins": "exact", "build": "meshNet.Api.slnx",
+             "solution": "meshNet.Tests.slnx", "test-args": "--filter X"},
+            "Plain"]}))
+        hosts = self.train.load_manifest(path)["hosts"]
+        self.assertEqual([h["repo"] for h in hosts], ["meshNet", "Plain"])
+        self.assertTrue(all(h["host"] for h in hosts))
+        self.assertEqual((hosts[0]["build"], hosts[0]["solution"], hosts[0]["test-args"], hosts[0]["deploy"]),
+                         ("meshNet.Api.slnx", "meshNet.Tests.slnx", "--filter X", "dispatch-deploy"))
+        self.assertEqual(hosts[1]["test-env"], {"COSMOS_EMULATOR_OPTIONAL": "1"})
+        self.assertTrue(hosts[1]["test"])
+        for bad in ({"org": "o", "repos": ["A"], "hosts": ["a"]},           # a repo and a host at once
+                    {"org": "o", "repos": ["A"], "hosts": ["H", "h"]},      # a host twice
+                    {"org": "o", "repos": ["A"], "hosts": [{"deploy": "x"}]}):
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(self.train.TrainError):
+                self.train.load_manifest(path)
+
+    def test_a_host_is_in_the_train_when_it_consumes_an_in_train_package_or_its_ref_is_ahead_of_main(self):
+        host = {"ref": "release", "tag": {"tag": "train/0.0.9.1"},
+                "consumes": ["meshNet.Commerce", "meshNet.Networks", "meshNet.Shares", "meshNet.Users", "meshNet.Common"]}
+        ship = {"meshNet.Networks": "changed", "meshNet.Shares": "changed", "meshNet.Users": "x", "meshNet.Common": "x"}
+        self.assertEqual(self.train.select_host(host, ship, False),
+                         (True, "consumes 4 package(s) in this train: meshNet.Networks, meshNet.Shares, meshNet.Users "
+                                "and 1 more"))
+        self.assertEqual(self.train.select_host(host, {"meshNet.Pay": "x"}, True),
+                         (True, "release is ahead of main; consumes nothing in this train"))
+        self.assertEqual(self.train.select_host(host, {"meshNet.Pay": "x"}, False),
+                         (False, "unchanged since train/0.0.9.1; consumes nothing in this train"))
+        self.assertFalse(self.train.select_host({**host, "tag": None}, {}, False)[0])
+
+    def test_the_summary_lists_hosts_after_the_repositories_with_what_they_consume(self):
+        import contextlib, io
+        self.train.WORK.mkdir(parents=True, exist_ok=True)
+        plan = {"org": "o", "ref": "release", "version": "0.0.9.1", "dry_run": True, "repo_order": ["A"],
+                "repo_edges": {"A": []}, "selected": ["A"], "promoted": [], "stranded": [], "packages": [],
+                "hosts": ["H", "Q"], "hosts_selected": ["H"],
+                "repos": {"A": {"selected": True, "reason": "1 of 1 package(s) changed", "sha": "a" * 40, "items": []},
+                          "H": {"selected": True, "reason": "consumes 1 package(s) in this train: A.Lib", "sha": "b" * 40,
+                                "items": ["test:T1"], "consumes": ["A.Lib"], "host": True},
+                          "Q": {"selected": False, "reason": "unchanged; consumes nothing in this train", "sha": "c" * 40,
+                                "items": [], "consumes": [], "host": True}},
+                "decisions": {"A.Lib": {}}, "ship": {"A.Lib": "never published"}}
+        self.train.PLAN.write_text(json.dumps(plan))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.train.cmd_record()
+        text = out.getvalue()
+        self.assertIn("| H (host) | yes | consumes 1 package(s) in this train: A.Lib | A.Lib | test:T1 |", text)
+        self.assertIn("| Q (host) | no | unchanged; consumes nothing in this train | — | — |", text)
+        self.assertIn("Hosts: 2 considered, 1 built and tested against this train (never packed).", text)
+        self.assertLess(text.index("| A | yes"), text.index("| H (host)"))
+
     def test_local_feed_is_mapped_for_train_ids_next_to_the_github_source(self):
         repo = Path(self.tmp.name) / "repo"
         repo.mkdir()
@@ -671,9 +728,9 @@ class EndToEnd(unittest.TestCase):
                            "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}",
                            "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
 
-    def manifest(self, repos):
+    def manifest(self, repos, hosts=()):
         path = self.root / "manifest.json"
-        path.write_text(json.dumps({"org": "o", "repos": repos}))
+        path.write_text(json.dumps({"org": "o", "repos": repos, "hosts": list(hosts)}))
         self.feed_env["TRAIN_MANIFEST"] = str(path)
 
     def train(self, command):
@@ -1215,6 +1272,158 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.rev("Down", "main^"), released)                                      # main took the pin commit
         record = self.train("record")
         self.assertIn("was **refused although `release` did not move**", record.stdout)
+
+    # --- Hosts (Phase 2): after the packages they consume, against the versions the train generated ---------------------
+
+    def released(self, package_id, version, commit, deps=()):
+        """A release on the 'org' feed folder: a restorable nuspec-only package naming the commit it was packed from."""
+        dependencies = "".join(f'<dependency id="{d}" version="{v}" />' for d, v in deps)
+        nuspec = (f'<?xml version="1.0"?><package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">'
+                  f'<metadata><id>{package_id}</id><version>{version}</version><authors>t</authors>'
+                  f'<description>t</description><repository type="git" commit="{commit}" />'
+                  f'<dependencies><group>{dependencies}</group></dependencies></metadata></package>')
+        (self.root / "orgfeed").mkdir(exist_ok=True)
+        with zipfile.ZipFile(self.root / "orgfeed" / f"{package_id}.{version}.nupkg", "w") as z:
+            z.writestr(f"{package_id}.nuspec", nuspec)
+
+    def host_repo(self, name, pins, test_body=None, code="namespace Host; public class B : Up.A {}"):
+        """A host like meshNet: a deployable project with exact pins, and (with test_body) a test project in its own
+        solution, the two targets its CI builds and tests."""
+        files = {"Host.App/Host.App.csproj": self.pinned_lib(*pins), "Host.App/Class.cs": code}
+        solution = '<Project Path="Host.App/Host.App.csproj" />'
+        if test_body is not None:
+            files["Host.Tests/Host.Tests.csproj"] = TEST_CSPROJ.format(
+                refs='<ProjectReference Include="../Host.App/Host.App.csproj" />')
+            files["Host.Tests/T.cs"] = f"namespace T; public class P {{ [Xunit.Fact] public void F() {{ {test_body} }} }}"
+            solution += '<Project Path="Host.Tests/Host.Tests.csproj" />'
+        files[f"{name}.Tests.slnx"] = f"<Solution>{solution}</Solution>"
+        files[f"{name}.Api.slnx"] = '<Solution><Project Path="Host.App/Host.App.csproj" /></Solution>'
+        self.repo(name, files, org_feed=True)
+
+    def test_a_host_builds_after_the_packages_it_consumes_against_the_train_versions_and_is_promoted_with_its_pins(self):
+        """meshNet #301: the host pinned meshNet.Networks 0.0.2474.11566 while its code needed the 0.0.2480.14757 the train
+        had just published, and nothing built the host in the train. Now the host is built and tested last, after the
+        package it consumes was packed: its exact pin on the in-train package moves to the train version and its pin on a
+        package outside the train moves forward to that package's newest release, exactly as a package's pins do. Nothing
+        of the host is packed; on a live train the pins are its train commit, and main and release move to it."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.repo("Side", {"Side.Lib/Side.Lib.csproj": csproj([]), "Side.Lib/Class.cs": "namespace Side; class S {}"})
+        self.host_repo("Host", [("Up.Lib", "0.0.1.1"), ("Side.Lib", "0.0.1.1")],
+                       test_body="Xunit.Assert.NotNull(new Host.B());")
+        self.release_branches("Up", "Side", "Host")
+        subprocess.run(["git", "tag", "train/0.0.2.1", "main"], cwd=self.bare("Side"), check=True)
+        for version in ("0.0.1.1", "0.0.2.1"):                       # Side is unchanged since its newest release
+            self.released("Side.Lib", version, self.rev("Side", "main"))
+        released = self.rev("Host", "release")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Side", "test": False}],
+                      [{"repo": "Host", "build": "Host.Api.slnx", "solution": "Host.Tests.slnx", "deploy": "dispatch-deploy"}])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("then hosts Host", plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["selected"], state["hosts_selected"], state["train_ids"]), (["Up"], ["Host"], ["Up.Lib"]))
+        self.assertEqual(state["repos"]["Host"]["reason"], "consumes 1 package(s) in this train: Up.Lib")
+        self.assertEqual(state["repos"]["Host"]["consumes"], ["Side.Lib", "Up.Lib"])
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        self.assertLess(build.stdout.index("$ dotnet pack Up.Lib"), build.stdout.index("$ dotnet build Host.Api.slnx"))
+        self.assertIn("$ dotnet test Host.Tests.slnx", build.stdout)
+        self.assertIn("Passed!", build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        version = state["version"]
+        pins = sorted(tuple(p[1:]) for p in state["repos"]["Host"]["pins"])
+        self.assertEqual(pins, [("Side.Lib", "0.0.1.1", "0.0.2.1"), ("Up.Lib", "0.0.1.1", version)])
+        self.assertEqual([p["id"] for p in state["packages"]], ["Up.Lib"])          # the host is never packed
+        self.assertEqual(sorted(p.name for p in (self.root / "train" / "feed").glob("*.nupkg")), [f"Up.Lib.{version}.nupkg"])
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual(state["promoted"], ["Up", "Host"])                          # the host last
+        main = self.rev("Host", "main")
+        self.assertEqual((main, self.rev("Host", "release")), (state["repos"]["Host"]["sha"],) * 2)
+        self.assertEqual(self.rev("Host", "main^"), released)
+        self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), main)
+        text = self.file_at("Host", "main", "Host.App/Host.App.csproj")
+        self.assertIn(f'Include="Up.Lib" Version="{version}"', text)
+        self.assertIn('Include="Side.Lib" Version="0.0.2.1"', text)
+        self.assertEqual(subprocess.run(["git", "log", "-1", "--format=%an %s", "main"], cwd=self.bare("Host"),
+                                        capture_output=True, text=True).stdout.strip(),
+                         f"release-train [train {version}] pin Up.Lib to {version}; Side.Lib to 0.0.2.1")
+        record = self.train("record")
+        self.assertIn("| Host (host) | yes | consumes 1 package(s) in this train: Up.Lib | Side.Lib, Up.Lib |", record.stdout)
+        self.assertIn("Promoted (main fast-forwarded, tagged `train/" + version + "`): Up, Host.", record.stdout)
+
+    def test_a_failing_host_fails_the_train_before_anything_is_published(self):
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.host_repo("Host", [("Up.Lib", "0.0.1.1")], test_body="Xunit.Assert.True(false);")
+        self.manifest([{"repo": "Up", "test": False}], [{"repo": "Host", "solution": "Host.Tests.slnx"}])
+        self.assertEqual(self.train("plan").returncode, 0)
+        build = self.train("build")
+        self.assertNotEqual(build.returncode, 0, build.stdout)
+        self.assertIn("Failed!", build.stdout)                                       # the host's test gate, not a restore
+        self.assertIn("$ dotnet pack Up.Lib", build.stdout)                          # the package was packed first ...
+        # ... but publish reads the package list build writes only once every repository AND host passed: still empty.
+        self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["packages"], [])
+
+    def test_a_host_that_consumes_nothing_in_the_train_rides_only_when_its_ref_is_ahead_of_main(self):
+        """No package changed: an unchanged host is left alone. Once its release has commits main lacks it rides (a dry run
+        builds it; nothing is packed), and its stale pin on a package outside the train moves forward to that package's
+        newest release, the same newest(published, carry) map a package's pins take. A dry-run ref override may name it."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.host_repo("Host", [("Up.Lib", "0.0.0.1")], code="namespace Host; public class B {}")
+        self.release_branches("Up", "Host")
+        for name in ("Up", "Host"):
+            subprocess.run(["git", "tag", "train/0.0.1.1", "main"], cwd=self.bare(name), check=True)
+        self.released("Up.Lib", "0.0.1.1", self.rev("Up", "main"))
+        self.manifest([{"repo": "Up", "test": False}], [{"repo": "Host", "build": "Host.Api.slnx", "test": False}])
+        self.feed_env["TRAIN_REF"] = "release"
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["selected"], state["hosts_selected"]), ([], []))
+        self.assertEqual(state["repos"]["Host"]["reason"], "unchanged since train/0.0.1.1; consumes nothing in this train")
+        self.assertIn("Nothing changed since the last train", plan.stdout)
+        self.commit_to("Host", "release", {"README.md": "a host-only change"})
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["selected"], state["hosts_selected"]), ([], ["Host"]))
+        self.assertEqual(state["repos"]["Host"]["reason"], "release is ahead of main; consumes nothing in this train")
+        self.assertEqual(state["published"], {"Up.Lib": "0.0.1.1"})
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual([tuple(p[1:]) for p in state["repos"]["Host"]["pins"]], [("Up.Lib", "0.0.0.1", "0.0.1.1")])
+        self.assertNotIn("train_commits", state["repos"]["Host"])                    # a dry run commits nothing
+        self.assertEqual(list((self.root / "train" / "feed").glob("*.nupkg")), [])
+        lane = self.commit_to("Host", "lane", {"Host.App/Lane.cs": "namespace Host; class L {}"}, new=True)
+        self.feed_env["TRAIN_REF_OVERRIDES"] = "Host=lane"
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["repos"]["Host"]["ref"], state["repos"]["Host"]["sha"]), ("lane", lane))
+
+    def test_promote_only_finishes_a_stranded_host_with_the_pins_that_train_built_it_against(self):
+        """A host stranded by a live train (its packages published, its main not moved) is finished like a package
+        repository: promote-only re-derives the train's pins on the built sha, fast-forwards main (its deploy) and tags."""
+        version = "0.0.2480.14757"
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.host_repo("Host", [("Up.Lib", "0.0.1.1")])
+        self.release_branches("Up", "Host")
+        subprocess.run(["git", "tag", f"train/{version}", "main"], cwd=self.bare("Up"), check=True)  # Up was promoted
+        self.released("Up.Lib", version, self.rev("Up", "main"))
+        built = self.rev("Host", "release")
+        self.manifest(["Up"], [{"repo": "Host", "solution": "Host.Tests.slnx"}])
+        self.live()
+        self.feed_env.update(TRAIN_VERSION=version, TRAIN_PROMOTE=f"Host={built}")
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Host", "main^"), built)
+        self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
+        self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
+        self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
 
 
 if __name__ == "__main__":
