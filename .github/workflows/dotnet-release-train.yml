@@ -31,8 +31,9 @@
 #            into `ref` while the train ran, `ref` keeps the lane's work and the next plan reconciles), fast-forwards main
 #            to exactly what was built (a plain push, never forced) and tags train/<version>. A repository it cannot
 #            promote is recorded as stranded and the others are still promoted; the step then fails naming them.
-#            Selected hosts are promoted the same way, last; their main moving is their deploy (the host's own workflow on
-#            the main push), nothing is dispatched from here.
+#            Selected hosts are promoted the same way, last. Nothing is dispatched from here: the `hosts-promoted` output
+#            names the hosts whose main moved, so the caller fires ONE deploy for the whole train once every host is on
+#            main (a deploy per host main push would start one full deploy per host).
 #   record   writes the run summary and, when merryn-url is set, POSTs the release record.
 #
 # promote-only (recovery, with `version`) skips plan, build and publish: for a train whose packages are already on the
@@ -87,7 +88,7 @@ on:
         description: read:packages for restore; on a live train also write:packages for the push
         required: true
       dispatch-token:
-        description: "Accepted and unused: a host deploys from its own main push, which promotion makes"
+        description: "Accepted and unused: the caller deploys once, from the hosts-promoted output"
         required: false
       merryn-token:
         description: Bearer token for the release record
@@ -99,6 +100,9 @@ on:
       version:
         description: The train version (also the train id and the train/<version> tag)
         value: ${{ jobs.train.outputs.version }}
+      hosts-promoted:
+        description: "The hosts whose main this run moved, comma-separated (empty when none, and on a dry run): the caller's cue to deploy once"
+        value: ${{ jobs.train.outputs.hosts-promoted }}
 
 permissions:
   contents: read
@@ -115,6 +119,7 @@ jobs:
       cancel-in-progress: false
     outputs:
       version: ${{ steps.plan.outputs.version || steps.promote-only.outputs.version }}
+      hosts-promoted: ${{ steps.promote.outputs.hosts-promoted || steps.promote-only.outputs.hosts-promoted }}
     env:
       TRAIN_WORK: ${{ github.workspace }}/_train
       TRAIN_REF: ${{ inputs.ref }}
@@ -1249,6 +1254,9 @@ jobs:
                                                "reason": redact(str(error))})
                       log(f"::error::{name}: not promoted: {redact(str(error))}")
                   PLAN.write_text(json.dumps(plan, indent=2))
+              # Written before a stranding fails the step: a host whose main moved is on main whether or not another
+              # repository stranded, and the caller's one deploy has to pick it up.
+              output("hosts-promoted", ",".join(n for n in plan["promoted"] if plan["repos"][n].get("host")))
               if plan["stranded"]:
                   entries = ", ".join(f"{s['repo']}={s['base']}" for s in plan["stranded"])
                   raise TrainError(f"{len(plan['stranded'])} repository(ies) published at {plan['version']} but not promoted: "
@@ -1541,6 +1549,7 @@ jobs:
         run: python3 "$RUNNER_TEMP/train.py" publish
 
       - name: Promote (fast-forward main, tag train/<version>)
+        id: promote
         if: ${{ !inputs.dry-run && steps.plan.outputs.selected != '' }}
         env:
           REPOS_TOKEN: ${{ secrets.repos-token }}

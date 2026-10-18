@@ -132,8 +132,10 @@ Phases, in the one job:
    packages only (no source-graph switch: what a host proves is that it builds and passes against what ships). A host
    failure fails the build step, so nothing is published. A host is never packed or pushed. On a live train its pins
    are its `[train <id>] pin …` commit on `release`, and promotion moves `main` to it after every package repository
-   (rule (a), stranding and promote-only apply unchanged); `main` moving is the host's deploy, through its own `main`
-   push workflow. The train dispatches nothing itself (`dispatch-token` stays unused). meshNet's entry mirrors its
+   (rule (a), stranding and promote-only apply unchanged). The train dispatches nothing itself (`dispatch-token` stays
+   unused): its `hosts-promoted` output names the hosts whose `main` moved, and the caller's wrapper fires one deploy for
+   the whole train from it, after the last host moved (owner, 2026-10-18, "Cut all three": one deploy per train, not one
+   per host `main` push). meshNet's entry mirrors its
    `ci.yml`: `{"repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx"}` (both suites run
    in-memory, no services).
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each

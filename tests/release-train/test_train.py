@@ -90,6 +90,31 @@ class Unit(unittest.TestCase):
         self.assertEqual(self.train.normalized_version(2472, 15628), "0.0.2472.15628")
         self.assertEqual(self.train.normalized_version(2472, 0), "0.0.2472")
 
+    def test_promotion_names_the_hosts_whose_main_moved_even_when_another_repository_strands(self):
+        # The caller fires one deploy for the whole train from hosts-promoted, so a host that moved is named even when the
+        # step then fails on a stranded repository, and a stranded host or a package repository is never named.
+        from unittest.mock import patch
+        out = Path(self.tmp.name) / "github_output"
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+        plan = {"version": "0.0.1", "promoted": [], "stranded": [], "release_behind": [], "repos": {
+            "Lib": {"repo": "Lib", "sha": "a" * 40}, "Api": {"repo": "Api", "sha": "b" * 40, "host": True},
+            "Auth": {"repo": "Auth", "sha": "c" * 40, "host": True}, "Web": {"repo": "Web", "sha": "d" * 40, "host": True}}}
+
+        def promote(plan, name, repo, dest):
+            if name == "Web":
+                raise self.train.TrainError("refused")
+            plan["promoted"].append(name)
+
+        with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "promote_repo", promote):
+            with self.assertRaises(self.train.TrainError):
+                self.train.promote_all(plan, ["Lib", "Api", "Auth", "Web"])
+        self.assertEqual(out.read_text(), "hosts-promoted=Api,Auth\n")
+        out.unlink()
+        plan = {**plan, "promoted": [], "stranded": [], "repos": {"Lib": plan["repos"]["Lib"]}}
+        with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "promote_repo", promote):
+            self.train.promote_all(plan, ["Lib"])
+        self.assertEqual(out.read_text(), "hosts-promoted=\n")
+
     def test_manifest_accepts_names_and_objects_and_refuses_duplicates(self):
         path = Path(self.tmp.name) / "m.json"
         path.write_text(json.dumps({"org": "o", "repos": ["A", {"repo": "B", "solution": "B.Tests.slnx", "test": False}]}))
