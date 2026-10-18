@@ -132,8 +132,10 @@ Phases, in the one job:
    packages only (no source-graph switch: what a host proves is that it builds and passes against what ships). A host
    failure fails the build step, so nothing is published. A host is never packed or pushed. On a live train its pins
    are its `[train <id>] pin …` commit on `release`, and promotion moves `main` to it after every package repository
-   (rule (a), stranding and promote-only apply unchanged); `main` moving is the host's deploy, through its own `main`
-   push workflow. The train dispatches nothing itself (`dispatch-token` stays unused). meshNet's entry mirrors its
+   (rule (a), stranding and promote-only apply unchanged). The train dispatches nothing itself (`dispatch-token` stays
+   unused): its `hosts-promoted` output names the hosts whose `main` moved, and the caller's wrapper fires one deploy for
+   the whole train from it, after the last host moved (owner, 2026-10-18, "Cut all three": one deploy per train, not one
+   per host `main` push). meshNet's entry mirrors its
    `ci.yml`: `{"repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx"}` (both suites run
    in-memory, no services).
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
@@ -164,6 +166,14 @@ promote step stopped there, leaving Commerce, Pay and the four External.* repos 
     `[train <id>] pin …` on `release` and `main`; (b) would leave source pins one train behind the nuspecs.
   - Rejected (c), rebase the pin commit onto the moved `release` and push both: the lane's merge would reach `main`
     without having been built or tested by this train.
+- **Deploy: one per train, and by hand outside it.** A host's `main` push no longer deploys (meshNet `ci.yml` and
+  meshNet.Api.Auth `deploy-on-merge.yml`, owner 2026-10-18, "Cut all three"). The caller's `deploy` job fires one
+  deploy from `hosts-promoted`, including for a host whose `main` moved and was then stranded on its tag push.
+  - **Hotfix outside the train:** a push to a host's `main` that the train did not make deploys nothing. Run
+    meshNet.Hosting "Deploy to production" (`workflow_dispatch`) by hand afterwards.
+  - **The first train after this change** must be dispatched from `release`, not `main`. A dispatch runs the wrapper
+    on the branch it names, and `main`'s wrapper has no `deploy` job until a train promotes meshNet. A train dispatched
+    from `main` would deploy nothing; if one was, run "Deploy to production" by hand.
 - **Recovery: promote-only.** Dispatch with `promote-only: <repo>=<sha>, …` and `version: <train id>` (packages already on
   the feed). It clones the manifest, checks every entry before pushing anything (the sha is on `release` or already on
   `main`; `main` is its ancestor or ahead by train commits only; the repo is not already tagged with that train),

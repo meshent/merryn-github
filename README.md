@@ -163,9 +163,10 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | `dotnet-version` | default `10.0.x` |
 | secret `repos-token` | reads every manifest repository; on a live train also pushes `main` and `train/*` tags |
 | secret `packages-token` | `read:packages` for restore; on a live train also `write:packages` |
-| secret `dispatch-token` | accepted and unused: a host deploys from its own `main` push, which promotion makes |
+| secret `dispatch-token` | accepted and unused: the caller deploys, once, from `hosts-promoted` |
 | secrets `merryn-url`, `merryn-token` | when set, a live train that published and promoted POSTs its release record (version, repos with their commits and the item keys found in their commit messages since the last tag, packages, run URL) to `merryn-url` with the token as a bearer. A failed POST warns and never fails a published train |
 | output `version` | the train version, which is also the `train/<version>` tag |
+| output `hosts-promoted` | the hosts whose `main` this run moved, comma-separated; empty when none moved and on a dry run. Set even when the promote step fails on a stranded repository, for the hosts that did move. The caller's cue to start one deploy for the whole train: a job with `needs: train` and `if: ${{ !cancelled() && needs.train.outputs.hosts-promoted != '' }}` |
 
 **The manifest.** Repositories only. The order is computed, so list them in any order:
 
@@ -203,7 +204,9 @@ projects references is in the train. It is built after every package repository,
 package's are (the train version for an in-train package, else that package's newest published release), then its
 `build` target is built and its `solution` tested against packages only. It is never packed or published. A host
 failure fails the train before publish. On a live train its pin commit and `main` move like a repository's, after the
-repositories; `main` moving is its deploy (its own `main` push workflow). A host without the `ref` branch fails the
+repositories. The train deploys nothing: it names the hosts whose `main` moved in `hosts-promoted`, and the caller
+starts one deploy for the whole train after the last host moved. A host's own `main` push workflow should not deploy
+as well (with two hosts that was two full deploys per train, the first racing the second host's push). A host without the `ref` branch fails the
 plan, as a repository does.
 
 **Done** means the run is green. On a live train that also means the summary lists every package at one version and
