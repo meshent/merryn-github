@@ -1233,6 +1233,9 @@ jobs:
               if repo["main"] != repo["sha"]:
                   # A plain push: the remote refuses anything but a fast-forward. Never forced.
                   git(["push", "origin", f"{repo['sha']}:refs/heads/main"], cwd=dest)
+              # main is at what was built from here on, even if the tag push below fails and the repository is recorded as
+              # stranded: a host listed here is on main and so needs the caller's deploy (hosts-promoted).
+              plan.setdefault("main_moved", []).append(name)
               run(["git", "-c", f"user.name={TRAIN_NAME}", "-c", f"user.email={TRAIN_EMAIL}",
                    "tag", "-a", tag, repo["sha"], "-m", f"Release train {plan['version']}"], cwd=dest)
               git(["push", "origin", f"refs/tags/{tag}"], cwd=dest)
@@ -1254,9 +1257,10 @@ jobs:
                                                "reason": redact(str(error))})
                       log(f"::error::{name}: not promoted: {redact(str(error))}")
                   PLAN.write_text(json.dumps(plan, indent=2))
-              # Written before a stranding fails the step: a host whose main moved is on main whether or not another
-              # repository stranded, and the caller's one deploy has to pick it up.
-              output("hosts-promoted", ",".join(n for n in plan["promoted"] if plan["repos"][n].get("host")))
+              # Written before a stranding fails the step, and from main_moved rather than promoted: a host whose main
+              # moved is on main whether or not its own tag push or another repository then failed, and the caller's one
+              # deploy has to pick it up.
+              output("hosts-promoted", ",".join(n for n in plan.get("main_moved", []) if plan["repos"][n].get("host")))
               if plan["stranded"]:
                   entries = ", ".join(f"{s['repo']}={s['base']}" for s in plan["stranded"])
                   raise TrainError(f"{len(plan['stranded'])} repository(ies) published at {plan['version']} but not promoted: "

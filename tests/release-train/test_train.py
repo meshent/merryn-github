@@ -103,6 +103,7 @@ class Unit(unittest.TestCase):
         def promote(plan, name, repo, dest):
             if name == "Web":
                 raise self.train.TrainError("refused")
+            plan.setdefault("main_moved", []).append(name)
             plan["promoted"].append(name)
 
         with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "promote_repo", promote):
@@ -110,10 +111,38 @@ class Unit(unittest.TestCase):
                 self.train.promote_all(plan, ["Lib", "Api", "Auth", "Web"])
         self.assertEqual(out.read_text(), "hosts-promoted=Api,Auth\n")
         out.unlink()
-        plan = {**plan, "promoted": [], "stranded": [], "repos": {"Lib": plan["repos"]["Lib"]}}
+        plan = {**plan, "promoted": [], "main_moved": [], "stranded": [], "repos": {"Lib": plan["repos"]["Lib"]}}
         with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "promote_repo", promote):
             self.train.promote_all(plan, ["Lib"])
         self.assertEqual(out.read_text(), "hosts-promoted=\n")
+
+    def test_a_host_whose_main_moved_but_whose_tag_push_failed_is_still_named_for_the_deploy(self):
+        # The real promote_repo against a stubbed git: main's push succeeds, the tag push fails. The host is stranded
+        # (not tagged), but prod would lag main without a deploy, so hosts-promoted still names it.
+        from unittest.mock import patch
+        out = Path(self.tmp.name) / "github_output"
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+        pushes = []
+
+        def git(args, cwd=None, capture=False):
+            if args[:1] == ["push"]:
+                pushes.append(args[-1])
+                if args[-1].startswith("refs/tags/"):
+                    raise self.train.TrainError("tag push refused")
+            return ""
+
+        plan = {"version": "0.0.1", "ref": "release", "promoted": [], "stranded": [], "release_behind": [], "repos": {
+            "Api": {"repo": "Api", "sha": "b" * 40, "main": "a" * 40, "host": True},
+            "Auth": {"repo": "Auth", "sha": "c" * 40, "main": "c" * 40, "host": True}}}
+        with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "git", git), \
+                patch.object(self.train, "run", lambda *a, **k: None):
+            with self.assertRaises(self.train.TrainError):
+                self.train.promote_all(plan, ["Api", "Auth"])
+        self.assertIn("b" * 40 + ":refs/heads/main", pushes)
+        self.assertEqual([s["repo"] for s in plan["stranded"]], ["Api", "Auth"])
+        self.assertEqual(plan["promoted"], [])
+        # Api's main moved here; Auth's main already was the sha. Both are on main, so both are named.
+        self.assertEqual(out.read_text(), "hosts-promoted=Api,Auth\n")
 
     def test_manifest_accepts_names_and_objects_and_refuses_duplicates(self):
         path = Path(self.tmp.name) / "m.json"
