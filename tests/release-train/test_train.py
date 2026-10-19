@@ -176,6 +176,57 @@ class Unit(unittest.TestCase):
         self.assertEqual([s["repo"] for s in plan["stranded"]], ["Bad"])
         self.assertIn("does not contain the release head it planned", plan["stranded"][0]["reason"])
 
+    def test_the_deploy_alias_is_never_overwritten_and_a_second_promotion_the_same_day_gets_the_next_suffix(self):
+        from unittest.mock import patch
+        remote = {}                          # tag -> sha, standing in for the remote
+        pushes = []
+        refuse_next = []
+
+        def git(args, cwd=None, capture=False):
+            if args[:2] == ["ls-remote", "--tags"]:
+                return "".join(f"{sha}\trefs/tags/{tag}\n" for tag, sha in remote.items())
+            if args[:1] == ["push"]:
+                sha, _, ref = args[-1].partition(":")
+                tag = ref[len("refs/tags/"):]
+                pushes.append(tag)
+                if refuse_next:              # another run took the name between the read and the push
+                    remote[tag] = refuse_next.pop()
+                    raise self.train.TrainError("rejected (already exists)")
+                if tag in remote:
+                    raise self.train.TrainError("rejected (already exists)")
+                remote[tag] = sha
+            return ""
+
+        plan = {"version": "0.0.1", "deploy_date": "2026-10-19"}
+        with patch.object(self.train, "git", git):
+            self.assertEqual(self.train.deploy_tag(plan, "A", None, "a" * 40), "deploy/2026-10-19")
+            self.assertEqual(self.train.deploy_tag(plan, "A", None, "b" * 40), "deploy/2026-10-19.2")
+            self.assertEqual(self.train.deploy_tag(plan, "A", None, "b" * 40), "deploy/2026-10-19.2")   # kept, no push
+            remote["deploy/2026-10-18"] = "f" * 40                                                    # other dates ignored
+            remote["deploy/2026-10-19-x"] = "f" * 40
+            refuse_next.append("9" * 40)
+            self.assertEqual(self.train.deploy_tag(plan, "A", None, "c" * 40), "deploy/2026-10-19.4")
+        self.assertEqual(remote["deploy/2026-10-19"], "a" * 40)                                        # never moved
+        self.assertEqual(remote["deploy/2026-10-19.2"], "b" * 40)
+        self.assertEqual(remote["deploy/2026-10-19.3"], "9" * 40)
+        self.assertEqual(pushes, ["deploy/2026-10-19", "deploy/2026-10-19.2", "deploy/2026-10-19.3", "deploy/2026-10-19.4"])
+        self.assertEqual(plan["deploy_tags"], {"A": "deploy/2026-10-19.4"})
+
+    def test_a_deploy_alias_that_cannot_be_pushed_warns_and_strands_nothing(self):
+        from unittest.mock import patch
+
+        def git(args, cwd=None, capture=False):
+            if args[:1] == ["push"]:
+                raise self.train.TrainError("refused")
+            return ""
+
+        plan = {"version": "0.0.1", "deploy_date": "2026-10-19"}
+        with patch.object(self.train, "git", git):
+            self.assertIsNone(self.train.deploy_tag(plan, "A", None, "a" * 40))
+        self.assertEqual(plan["deploy_untagged"], ["A"])
+        with self.assertRaises(self.train.TrainError):
+            self.train.deploy_tag({"version": "0.0.1", "deploy_date": "19/10/2026"}, "A", None, "a" * 40)
+
     def test_manifest_accepts_names_and_objects_and_refuses_duplicates(self):
         path = Path(self.tmp.name) / "m.json"
         path.write_text(json.dumps({"org": "o", "repos": ["A", {"repo": "B", "solution": "B.Tests.slnx", "test": False}]}))
@@ -1207,6 +1258,11 @@ class EndToEnd(unittest.TestCase):
         # Down: main is the pin commit that was built, tagged; release still carries the lane's merge.
         self.assertEqual(self.rev("Down", "main"), built["Down"]["sha"])
         self.assertEqual(self.rev("Down", f"train/{version}^{{commit}}"), built["Down"]["sha"])
+        # The deploy alias sits on the same commit as the train tag, in every promoted repository, and on none stranded.
+        alias = f"deploy/{state['deploy_date']}"
+        for name in ("Up", "Down", "Mid"):
+            self.assertEqual(self.rev(name, alias), self.rev(name, f"train/{version}^{{commit}}"))
+        self.assertNotIn("Side", state.get("deploy_tags", {}))
         self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
         self.assertEqual(self.rev("Down", "release"), lane)
         # Side: untouched, untagged.

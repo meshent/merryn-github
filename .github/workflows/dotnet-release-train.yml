@@ -1257,6 +1257,51 @@ jobs:
                        "--api-key", os.environ["PACKAGES_TOKEN"], "--skip-duplicate", "--no-symbols"], env=dotnet_env())
 
 
+          DEPLOY_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+          def deploy_tag(plan, name, dest, sha):
+              """The deploy/YYYY-MM-DD alias: a lightweight tag on the same commit as train/<version>, so "what deployed on
+              the 19th" reads off a tag. The date is the UTC date the run's promotion started, one reading for every
+              repository. An alias is never overwritten: a second promotion of the repository on the same date gets
+              deploy/YYYY-MM-DD.2, then .3; a sha that already carries one of that date's aliases keeps it. The push is a
+              plain tag push, which the remote refuses for a name that exists, so a race with another run moves on to the
+              next suffix. A failure warns and never strands: main and train/<version> already moved."""
+              date = plan.setdefault("deploy_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+              if not DEPLOY_DATE.fullmatch(date):
+                  raise TrainError(f"deploy date '{date}' is not YYYY-MM-DD")
+              alias = re.compile(rf"deploy/{re.escape(date)}(?:\.([2-9]|[1-9]\d+))?")
+              for _ in range(3):
+                  try:
+                      listing = git(["ls-remote", "--tags", "origin", f"refs/tags/deploy/{date}*"], cwd=dest, capture=True)
+                  except TrainError:
+                      break
+                  existing = {}
+                  for line in listing.splitlines():
+                      commit, _, ref = line.partition("\t")
+                      tag = ref[len("refs/tags/"):]
+                      peeled = tag.endswith("^{}")
+                      tag = tag[:-3] if peeled else tag
+                      match = alias.fullmatch(tag)
+                      if match and (peeled or tag not in existing):
+                          existing[tag] = (commit, int(match.group(1) or 1))
+                  same = sorted(tag for tag, (commit, _) in existing.items() if commit == sha)
+                  if same:
+                      plan.setdefault("deploy_tags", {})[name] = same[0]
+                      return same[0]
+                  number = max([n for _, n in existing.values()], default=0) + 1
+                  tag = f"deploy/{date}" + (f".{number}" if number > 1 else "")
+                  try:
+                      git(["push", "origin", f"{sha}:refs/tags/{tag}"], cwd=dest)
+                  except TrainError:
+                      continue                         # taken meanwhile, or refused: re-read and try the next suffix
+                  plan.setdefault("deploy_tags", {})[name] = tag
+                  return tag
+              plan.setdefault("deploy_untagged", []).append(name)
+              log(f"::warning::{name}: could not push a deploy/{date} alias tag; main and train/{plan['version']} moved")
+              return None
+
+
           def promote_repo(plan, name, repo, dest):
               """Move one repository to what the train built: its train commits onto the ref when that still fast-forwards,
               main to the train's sha, and the train/<version> tag on it. Raises TrainError when main or the tag cannot move."""
@@ -1311,6 +1356,7 @@ jobs:
                    "tag", "-a", tag, repo["sha"], "-m", f"Release train {plan['version']}"], cwd=dest)
               git(["push", "origin", f"refs/tags/{tag}"], cwd=dest)
               plan["promoted"].append(name)
+              deploy_tag(plan, name, dest, repo["sha"])
 
 
           def promote_all(plan, names):
@@ -1319,6 +1365,9 @@ jobs:
               train carries on. Fails at the end, naming every stranded repository."""
               plan.setdefault("stranded", [])
               plan.setdefault("release_behind", [])
+              # One date for every repository this run promotes, read before the first push (TRAIN_DEPLOY_DATE: tests).
+              plan.setdefault("deploy_date", os.environ.get("TRAIN_DEPLOY_DATE") or
+                              datetime.now(timezone.utc).strftime("%Y-%m-%d"))
               for name in names:
                   repo, dest = plan["repos"][name], checkout_dir(SRC, name)
                   try:
@@ -1521,6 +1570,12 @@ jobs:
                   lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
               if plan["promoted"]:
                   lines += ["", f"Promoted (main fast-forwarded, tagged `train/{plan['version']}`): {', '.join(plan['promoted'])}."]
+              if plan.get("deploy_tags"):
+                  lines += ["", "Deploy alias tags (same commit as `train/" + plan["version"] + "`): " +
+                            ", ".join(f"{n} `{tag}`" for n, tag in plan["deploy_tags"].items()) + "."]
+              if plan.get("deploy_untagged"):
+                  lines += ["", f"⚠️ Promoted and tagged `train/{plan['version']}` but no `deploy/{plan.get('deploy_date')}` "
+                                f"alias could be pushed: {', '.join(plan['deploy_untagged'])}."]
               if plan.get("release_moved"):
                   lines += ["", f"`{plan['ref']}` moved while the train ran; main took the planned sha, and the merges that "
                                 f"landed since wait on `{plan['ref']}` for the next train: {', '.join(plan['release_moved'])}."]
@@ -1558,6 +1613,7 @@ jobs:
                             # The sha each stranded repository was built from: exactly the promote-only input that finishes
                             # it, so recovery copies it from the record rather than guessing a sha on the ref.
                             "strandedFrom": {s["repo"]: s["base"] for s in plan.get("stranded", [])},
+                            "deployTags": plan.get("deploy_tags", {}),
                             "run": os.environ.get("TRAIN_RUN_URL", "")}
                   request = urllib.request.Request(url, data=json.dumps(record).encode(), method="POST", headers={
                       "Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('MERRYN_TOKEN', '')}"})
