@@ -39,6 +39,9 @@
 #            Selected hosts are promoted the same way, last. Nothing is dispatched from here: the `hosts-promoted` output
 #            names the hosts whose main moved, so the caller fires ONE deploy for the whole train once every host is on
 #            main (a deploy per host main push would start one full deploy per host).
+#            Then each selected PROMOTE repository (the manifest's `promote`: static apps, design, mobile, the AppHost),
+#            last: nothing built, tested, pinned or published; main fast-forwards to exactly the `ref` head the plan read
+#            and is tagged. Its own CI gates its PRs into `ref`; its main push is its deploy.
 #   record   writes the run summary and, when merryn-url is set, POSTs the release record.
 #
 # promote-only (recovery, with `version`) skips plan, build and publish: for a train whose packages are already on the
@@ -298,10 +301,18 @@ jobs:
                                 "build": host.get("build", ""), "test": host.get("test", True),
                                 "test-args": host.get("test-args", ""), "test-env": test_env,
                                 "deploy": host.get("deploy", ""), "pins": host.get("pins", "")})
-              every = names + [h["repo"] for h in hosts]
+              # promote: repositories the train only promotes (ref -> main, tagged), with nothing built, pinned or published:
+              # static web apps, design and mobile sources, an AppHost that only builds next to its sibling checkouts.
+              promote = []
+              for entry in data.get("promote", []):
+                  item = {"repo": entry} if isinstance(entry, str) else dict(entry)
+                  if not item.get("repo"):
+                      raise TrainError(f"{path}: every promote entry needs a name: {entry!r}")
+                  promote.append({"repo": item["repo"], "promote": True, "test": False})
+              every = names + [h["repo"] for h in hosts] + [p["repo"] for p in promote]
               if len(set(n.lower() for n in every)) != len(every):
-                  raise TrainError(f"{path}: a host is listed twice, or as both a repo and a host")
-              return {"org": org, "repos": repos, "hosts": hosts}
+                  raise TrainError(f"{path}: a repository is listed twice, or in more than one of repos, hosts and promote")
+              return {"org": org, "repos": repos, "hosts": hosts, "promote": promote}
 
 
           # --- Reading a repository ----------------------------------------------------------------------------------------
@@ -976,7 +987,7 @@ jobs:
               if root.exists():
                   shutil.rmtree(root)
               root.mkdir(parents=True)
-              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest.get("promote", [])]
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["promote"]]
               ahead, lines = [], []
               for name in names:
                   dest = root / name
@@ -1017,7 +1028,7 @@ jobs:
               if overrides and not dry_run:
                   raise TrainError("ref overrides are for dry runs only: a live train assembles every repository from "
                                    f"'{ref}' and promotes that to main (overrides named {', '.join(sorted(overrides))})")
-              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
+              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["promote"]})
               if unknown:
                   raise TrainError(f"ref overrides name repositories that are not in the manifest: {', '.join(unknown)}")
               if WORK.exists():
@@ -1052,6 +1063,24 @@ jobs:
                   projects = [describe_project(dest, p) for p in find_projects(dest)]
                   hosts[name] = {**host, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag,
                                  "projects": projects, "project_order": [], "ships": []}
+
+              # Promote repositories: read for their heads only. No project is described: nothing of theirs is built,
+              # pinned or packed, and none of them is a package owner or an edge.
+              promote = {}
+              for item in manifest["promote"]:
+                  name = item["repo"]
+                  repo_ref = overrides.get(name, ref)
+                  dest = checkout_dir(SRC, name)
+                  sha = clone(manifest["org"], name, repo_ref, dest)
+                  tag = latest_train_tag(dest)
+                  main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
+                  ahead = not is_ancestor(dest, sha, main)
+                  log(f"{name} (promote): {repo_ref} {sha[:12]}{' (override)' if name in overrides else ''}, main {main[:12]}, "
+                      f"latest train tag {tag['tag'] if tag else '(none)'}")
+                  promote[name] = {**item, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag,
+                                   "projects": [], "project_order": [], "ships": [], "selected": ahead,
+                                   "reason": (f"{repo_ref} is ahead of main; promoted, nothing built or published" if ahead
+                                              else "unchanged" + (f" since {tag['tag']}" if tag else ""))}
 
               owner = {}
               for name, repo in repos.items():
@@ -1096,7 +1125,9 @@ jobs:
                   host["consumes"] = sorted({p for project in host["projects"] for p in project["packages"]} & set(owner))
                   host["selected"], host["reason"] = select_host(host, ship, ahead)
               hosts_selected = [n for n in hosts if hosts[n]["selected"]]
+              promote_selected = [n for n in promote if promote[n]["selected"]]
               repos.update(hosts)
+              repos.update(promote)
               warnings = []
               for name in selected + hosts_selected:
                   repo = repos[name]
@@ -1130,6 +1161,20 @@ jobs:
                       ["log", "--format=%B", f"{repo['tag']['sha']}..{repo['sha']}" if repo["tag"] else repo["sha"],
                        *([] if repo["tag"] else ["-n", "200"])], cwd=checkout_dir(SRC, name), capture=True))))
 
+              for name in promote_selected:
+                  repo, dest = repos[name], checkout_dir(SRC, name)
+                  # main moves only by the train: a promote repository whose main has commits its ref lacks cannot fast-forward.
+                  if not is_ancestor(dest, repo["main"], repo["sha"]):
+                      message = (f"{name}: main ({repo['main'][:12]}) is not an ancestor of {repo['ref']} ({repo['sha'][:12]}), "
+                                 f"so the train cannot fast-forward main. Merge main into {repo['ref']} first.")
+                      if not dry_run:
+                          raise TrainError(message)
+                      warnings.append(message + " A live train refuses this repository.")
+                      log(f"WARNING {message}")
+                  repo["items"] = sorted(set(ITEM_KEY.findall(git(
+                      ["log", "--format=%B", f"{repo['tag']['sha']}..{repo['sha']}" if repo["tag"] else f"{repo['main']}..{repo['sha']}"],
+                      cwd=dest, capture=True))))
+
               build, revision = stamp()
               version = normalized_version(build, revision)
               # Only the packages that changed are in the train. An exact pin on any other manifest package moves forward to
@@ -1142,6 +1187,7 @@ jobs:
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
                       "decisions": decisions, "published": published,
                       "repo_edges": repo_edges, "repos": repos, "hosts": list(hosts), "hosts_selected": hosts_selected,
+                      "promote": list(promote), "promote_selected": promote_selected,
                       "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
 
@@ -1153,12 +1199,14 @@ jobs:
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name}: {repos[name]['reason']}; depends on {deps}")
               for name in hosts:
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name} (host): {repos[name]['reason']}")
+              for name in promote:
+                  log(f"  {'*' if repos[name]['selected'] else ' '} {name} (promote): {repos[name]['reason']}")
               log(f"Packages: {len(ship)} of {len(decisions)} in this train, across {len(repo_order)} repositories")
               for package_id, reason in ship.items():
                   log(f"  + {package_id}: {reason}")
               output("version", version)
-              output("selected", ",".join(selected + hosts_selected))
-              if not selected + hosts_selected:
+              output("selected", ",".join(selected + hosts_selected + promote_selected))
+              if not selected + hosts_selected + promote_selected:
                   log("Nothing changed since the last train; nothing to build.")
 
 
@@ -1392,7 +1440,10 @@ jobs:
               plan = json.loads(PLAN.read_text())
               # Hosts last, like the build: main moving is a host's deploy, so it moves only once every package repository
               # it consumes has been promoted (or recorded as stranded).
-              promote_all(plan, [n for n in plan["selected"] + plan.get("hosts_selected", []) if n not in plan["promoted"]])
+              # Promote repositories after the hosts: nothing of theirs was built, so they move only once everything that was
+              # built has been promoted (or recorded as stranded).
+              promote_all(plan, [n for n in plan["selected"] + plan.get("hosts_selected", []) + plan.get("promote_selected", [])
+                                 if n not in plan["promoted"]])
 
 
           def cmd_promote_only():
@@ -1415,10 +1466,11 @@ jobs:
               targets = repo_assignments(os.environ.get("TRAIN_PROMOTE", ""), "promote-only entry", "sha")
               if not targets:
                   raise TrainError("promote-only needs at least one repo=sha entry")
-              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
+              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["promote"]})
               if unknown:
                   raise TrainError(f"promote-only names repositories that are not in the manifest: {', '.join(unknown)}")
               host_names = {h["repo"] for h in manifest["hosts"]}
+              promote_names = {p["repo"] for p in manifest["promote"]}
               # A dispatch input reaches git as an argument: only a commit id (hex) is accepted, never a ref name or an option.
               not_sha = sorted(f"{n}={v}" for n, v in targets.items() if not re.fullmatch(r"[0-9a-fA-F]{7,40}", v))
               if not_sha:
@@ -1430,7 +1482,7 @@ jobs:
 
               repos, tagged_at, others, problems = {}, {}, {}, []
               # A host is cloned only when it is named: it produces no package, so it never says what the train shipped.
-              for entry in manifest["repos"] + [h for h in manifest["hosts"] if h["repo"] in targets]:
+              for entry in manifest["repos"] + [h for h in manifest["hosts"] + manifest["promote"] if h["repo"] in targets]:
                   name = entry["repo"]
                   dest = checkout_dir(SRC, name)
                   tip = clone(manifest["org"], name, ref, dest)
@@ -1459,7 +1511,8 @@ jobs:
                                       f"commits the train did not make, so main cannot fast-forward to it")
                   repos[name] = {"repo": name, "ref": ref, "sha": sha, "base": sha, "tip": tip, "main": main,
                                  "reason": f"promote-only at {sha[:12]}", "items": [], "selected": True,
-                                 **({"host": True} if name in host_names else {})}
+                                 **({"host": True} if name in host_names else {}),
+                                 **({"promote": True} if name in promote_names else {})}
                   if not is_ancestor(dest, main, sha) and only_train_commits(dest, sha, main):
                       repos[name]["carry_from"] = main
               if problems:
@@ -1485,7 +1538,7 @@ jobs:
                                       f"at {version} here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
               train_ids = {i for ids in member_ids.values() for i in ids}
-              if not train_ids and not set(targets) <= host_names:
+              if not train_ids and not set(targets) <= host_names | promote_names:
                   raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
                                    f"feed at {version}; promote-only only finishes a train whose packages were published")
               if not train_ids:
@@ -1498,11 +1551,13 @@ jobs:
               for name in targets:
                   if name in host_names:
                       log(f"{name} (host): main moves to what train {version} built and is tagged")
+                  elif name in promote_names:
+                      log(f"{name} (promote): main moves to the given sha and is tagged; nothing of it was built")
                   elif not member_ids[name]:
                       log(f"{name}: none of its packages is in train {version}; main still moves and is tagged")
 
               # Hosts last, as the train promotes them.
-              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] if r["repo"] in targets]
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["promote"] if r["repo"] in targets]
               for name in names:
                   repo, dest = repos[name], checkout_dir(SRC, name)
                   git(["checkout", "-q", "--detach", repo["sha"]], cwd=dest)
@@ -1512,7 +1567,8 @@ jobs:
                                                         f"[train {version}] reconcile main's train commits", repo["main"]])
                       repo["train_commits"] = True
                   carry = pins_at(dest, repo["carry_from"], manifest_ids) if repo.get("carry_from") else {}
-                  pins = pin_train_versions(dest, train_ids, version, newest(published, carry))
+                  # A promote repository is never pinned: the train promotes it exactly as its ref has it.
+                  pins = [] if repo.get("promote") else pin_train_versions(dest, train_ids, version, newest(published, carry))
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
                       repo["sha"] = commit_pins(dest, pins, version)
@@ -1552,6 +1608,11 @@ jobs:
                   repo = plan["repos"][name]
                   lines.append(f"| {name} (host) | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
                                f"{', '.join(repo.get('consumes', [])) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
+              for name in plan.get("promote", []):
+                  # Promote repositories: nothing built or published; promoted to main (their deploy) on a live train.
+                  repo = plan["repos"][name]
+                  lines.append(f"| {name} (promote) | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | — | "
+                               f"{', '.join(repo.get('items', [])) or '—'} |")
               if plan.get("decisions") is not None:
                   ship = plan.get("ship", {})
                   lines += ["", f"Repositories: {len(plan['repo_order'])} considered, {len(plan['selected'])} in this train. "
@@ -1608,6 +1669,8 @@ jobs:
                                       for n in plan["selected"]],
                             "hosts": [{"repo": n, "sha": plan["repos"][n]["sha"], "items": plan["repos"][n].get("items", [])}
                                       for n in plan.get("hosts_selected", [])],
+                            "promoteRepos": [{"repo": n, "sha": plan["repos"][n]["sha"], "items": plan["repos"][n].get("items", [])}
+                                             for n in plan.get("promote_selected", [])],
                             "packages": [{"id": p["id"], "version": p["version"]} for p in plan["packages"]],
                             "promoted": plan["promoted"], "stranded": [s["repo"] for s in plan.get("stranded", [])],
                             # The sha each stranded repository was built from: exactly the promote-only input that finishes

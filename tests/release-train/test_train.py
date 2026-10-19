@@ -882,9 +882,10 @@ class EndToEnd(unittest.TestCase):
                            "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}",
                            "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
 
-    def manifest(self, repos, hosts=()):
+    def manifest(self, repos, hosts=(), promote=()):
         path = self.root / "manifest.json"
-        path.write_text(json.dumps({"org": "o", "repos": repos, "hosts": list(hosts)}))
+        path.write_text(json.dumps({"org": "o", "repos": repos, "hosts": list(hosts),
+                                    **({"promote": list(promote)} if promote else {})}))
         self.feed_env["TRAIN_MANIFEST"] = str(path)
 
     def train(self, command):
@@ -1704,6 +1705,101 @@ class GitOnly(unittest.TestCase):
         self.assertIn("Up: release", check.stdout)
         self.assertIn("1 commit(s) ahead", check.stdout)
         self.assertIn("Pre-check: 2 of 3 repositories have `release` ahead of main: Up, Host.", check.stdout)
+
+    def promote_fixture(self):
+        self.repo("Lib", {"README.md": "a package repository with nothing to pack"})
+        self.repo("Web", {"index.html": "v1"})
+        self.repo("Design", {"README.md": "tokens"})
+        self.release_branches("Lib", "Web", "Design")
+        self.manifest([{"repo": "Lib", "test": False}], promote=["Web", {"repo": "Design"}])
+        self.feed_env["TRAIN_DEPLOY_DATE"] = "2026-10-19"
+        self.live()
+
+    def test_a_promote_repository_moves_main_to_the_planned_sha_tags_it_and_a_second_run_the_same_day_gets_dot_2(self):
+        """The 2026-10-10 race on a promote repository, with no dotnet: a lane merges into Web's release between plan and
+        promote. main takes the head the plan read, never the lane's merge; train/<version> and deploy/<date> sit on
+        it. The next run the same day promotes the lane's merge under deploy/<date>.2 and leaves deploy/<date> alone."""
+        import time
+        self.promote_fixture()
+        planned = self.commit_to("Web", "release", {"index.html": "v2"})
+        check = self.train("precheck")
+        self.assertEqual(check.returncode, 0, check.stdout)
+        self.assertEqual(self.output(), {"ahead": "Web", "go": "true"})
+        self.assertIn("Design: release", check.stdout)
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual(self.output()["selected"], "Web")
+        self.assertIn("Web (promote): release is ahead of main; promoted, nothing built or published", plan.stdout)
+        self.assertIn("Design (promote): unchanged", plan.stdout)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        lane = self.commit_to("Web", "release", {"index.html": "v3"})            # merged while the train runs
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        first = state["version"]
+        self.assertEqual(state["promoted"], ["Web"])
+        self.assertEqual(state["release_moved"], ["Web"])
+        self.assertEqual(self.rev("Web", "main"), planned)
+        self.assertEqual(self.rev("Web", f"train/{first}^{{commit}}"), planned)
+        self.assertEqual(self.rev("Web", "deploy/2026-10-19"), planned)
+        self.assertEqual(self.rev("Web", "release"), lane)
+        self.assertEqual(self.file_at("Web", "main", "index.html"), "v2")
+        self.assertEqual(state["deploy_tags"], {"Web": "deploy/2026-10-19"})
+        record = self.train("record")
+        self.assertIn("| Web (promote) | yes |", record.stdout)
+        self.assertIn("Deploy alias tags (same commit as `train/" + first + "`): Web `deploy/2026-10-19`.", record.stdout)
+        # Same day, second run: the lane's merge is ahead now.
+        time.sleep(2.1)                                                          # a new clock stamp
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.output()
+        self.assertEqual(self.train("build").returncode, 0)
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        second = json.loads((self.root / "train/plan.json").read_text())["version"]
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.rev("Web", "main"), lane)
+        self.assertEqual(self.rev("Web", "deploy/2026-10-19.2"), lane)
+        self.assertEqual(self.rev("Web", f"train/{second}^{{commit}}"), lane)
+        self.assertEqual(self.rev("Web", "deploy/2026-10-19"), planned)           # never overwritten
+        self.assertNotEqual(subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/tags/deploy/2026-10-19"],
+                                           cwd=self.bare("Design"), capture_output=True).returncode, 0)
+        # A third run with nothing ahead promotes nothing and tags nothing.
+        time.sleep(2.1)
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual(self.output()["selected"], "")
+        self.assertIn("Nothing changed since the last train", plan.stdout)
+
+    def test_a_live_train_refuses_a_promote_repository_whose_main_has_commits_its_release_lacks(self):
+        self.promote_fixture()
+        self.commit_to("Web", "release", {"index.html": "v2"})
+        self.commit_to("Web", "main", {"hotfix.html": "x"})
+        plan = self.train("plan")
+        self.assertNotEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("Web: main", plan.stdout)
+        self.assertIn("is not an ancestor of release", plan.stdout)
+
+    def test_promote_only_finishes_a_promote_repository_with_nothing_on_the_feed(self):
+        self.promote_fixture()
+        planned = self.commit_to("Web", "release", {"index.html": "v2"})
+        self.feed_env.update(TRAIN_VERSION="0.0.2480.7", TRAIN_PROMOTE=f"Web={planned}")
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Web", "main"), planned)
+        self.assertEqual(self.rev("Web", "train/0.0.2480.7^{commit}"), planned)
+        self.assertEqual(self.rev("Web", "deploy/2026-10-19"), planned)
+        self.assertEqual(self.file_at("Web", "main", "index.html"), "v2")       # no pin commit on a promote repository
+
+    def test_the_manifest_takes_promote_entries_and_refuses_one_listed_twice(self):
+        self.manifest(["Lib"], hosts=[{"repo": "Api"}], promote=["Web", {"repo": "Design"}])
+        manifest = self.module.load_manifest(self.feed_env["TRAIN_MANIFEST"])
+        self.assertEqual([p["repo"] for p in manifest["promote"]], ["Web", "Design"])
+        self.manifest(["Lib"], hosts=[{"repo": "Api"}], promote=["Api"])
+        with self.assertRaises(self.module.TrainError) as raised:
+            self.module.load_manifest(self.feed_env["TRAIN_MANIFEST"])
+        self.assertIn("more than one of repos, hosts and promote", str(raised.exception))
 
     def test_the_pre_check_fails_loudly_for_a_repository_without_the_ref(self):
         self.repo("Up", {"README.md": "Up"})
