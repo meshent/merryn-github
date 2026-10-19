@@ -64,9 +64,10 @@ Matthew's rule as stated: merging to `release` does not trigger workflows, only 
 ### 3. The train: one run, every repo, dependency order
 
 A reusable workflow here, `dotnet-release-train.yml`, called by one wrapper in the tenant's aggregator repo
-(meshNet for meshNet; Mira for Mira). **Dispatched, never scheduled** (owner, 2026-10-11, "Keep proposals"): each
-release is proposed, with its repositories and what ships, when its planned group of work is done or after four or more
-days of accumulated work, and it runs live only on the owner's yes. A hotfix train is the same dispatch. **One job**, so one runner, one `setup-dotnet`, one warm NuGet cache, no per-job rounding.
+(meshNet for meshNet; Mira for Mira). The wrapper decides when it runs. **meshNet runs it nightly** (owner,
+2026-10-18, "I'm fine with cron-based, whatever is easiest", coordinator:C-nightly-train; this replaces the 2026-10-11
+"Keep proposals" rule): a live scheduled run at 07:13 UTC that is a logged no-op when nothing is ahead (see "Nightly"
+below). A rehearsal, a recovery and a hotfix train are dispatches. **One job**, so one runner, one `setup-dotnet`, one warm NuGet cache, no per-job rounding.
 
 Inputs: a manifest of repositories and hosts (below), a token that can read every repo and write packages
 (`MESHENT_CI_PAT` already exists for this), and the dispatch-deploy secret for hosts.
@@ -207,6 +208,35 @@ the hosts' deploy wrappers.
 Rough cost: one train is one job of maybe 30 to 60 minutes (every suite in the org, once). Twice a week is about
 400 to 500 minutes a month. Today a single Common PR plus its main publish is on the order of 60 to 70 billed minutes.
 
+#### Nightly (coordinator:C-nightly-train, 2026-10-18)
+
+- **Schedule and switch.** The meshNet wrapper's `schedule:` is `13 7 * * *` (07:13 UTC, 00:13 Pacific daylight
+  time, off the hour). A scheduled run is live on purpose: its `dry-run` expression names the schedule case. The
+  repository variable `RELEASE_TRAIN_NIGHTLY` steers only the scheduled run: unset or `live` is live, `dry` rehearses,
+  `off` skips the night. Any event other than the schedule and a dispatch is dry.
+- **Nothing ahead is a logged no-op.** With `skip-when-nothing-ahead` (the wrapper sets it for the schedule) the job's
+  first step, before `setup-dotnet`, clones every manifest repository's commit graph (blobless, no checkout) and counts
+  the commits `ref` has that `main` lacks. Every repository checked is logged and summarised; with none ahead the run
+  stops green. `main` ahead of `ref` by train commits only is not "ahead".
+- **Green** is the train's own gate: every selected repository and host is built and tested before anything is
+  published, and a failure publishes and promotes nothing that night (the next night retries). A promote repository
+  (below) is gated by its own CI on its PRs into `release`.
+- **A merge into `release` during the run cannot strand a promotion.** `main` and `train/<version>` take the `release`
+  head the plan cloned plus only the train's own pin commit; the promote step re-reads `release` only to report a moved
+  head (`release_moved`, its own summary line) and refuses a built sha that does not contain the planned head. What
+  moved waits on `release` for the next night. The C44 handling covers the rest: the pin commit reaches `release` only
+  as a fast-forward and the next plan reconciles; a repository that cannot be promoted is stranded with its built sha
+  and finished by promote-only. The org-wide concurrency group keeps one train at a time. No `train-running` required
+  status is used: it would block lane merges for the whole run and is not needed once the planned sha is what moves.
+- **Deploy alias.** Every repository the train (or promote-only) moves gets a lightweight `deploy/YYYY-MM-DD` tag (the
+  UTC date the run's promotion started) on the same commit as `train/<version>`. An alias is never overwritten: a second
+  promotion of that repository the same date gets `deploy/YYYY-MM-DD.2`, then `.3`. A failed alias push warns and
+  strands nothing.
+- **Promote repositories.** The manifest's `promote` list names repositories that have nothing to build or publish
+  but whose `main` push is their deploy (static web apps, design and mobile sources, an AppHost that builds only beside
+  sibling checkouts). They are promoted last, by the same rule: `main` fast-forwards to the `release` head the plan read
+  and is tagged; nothing is pinned or committed.
+
 #### The manifest
 
 Lives in the tenant's aggregator repo (`meshNet/release-train.json`). Repos only; the dependency order is computed, not
@@ -228,7 +258,8 @@ maintained.
     { "repo": "meshNet.Api.Auth", "deploy": "dispatch-deploy", "pins": "exact" },
     { "repo": "meshNet.Api.Pay",  "deploy": "dispatch-deploy", "pins": "exact" },
     { "repo": "meshNet.Tower",    "deploy": "deploy-host",     "pins": "exact" }
-  ]
+  ],
+  "promote": ["meshNet.Web.Vocab", "meshNet.Web.Pay"]
 }
 ```
 

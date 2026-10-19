@@ -123,15 +123,15 @@ Only when every selected repository has passed does the train push the packages,
 publishes something it cannot promote; a dry run promotes nothing, so there it is a warning in the summary instead
 and the branch is still built and tested. A failure anywhere publishes nothing.
 
-Put the wrapper in the tenant's aggregator repository (meshNet for meshNet). It has **no schedule**: a release is
-proposed (when its planned group of work is done, or after a few days of accumulated work) and is dispatched live
-only on the owner's yes. A hotfix train is the same dispatch.
+Put the wrapper in the tenant's aggregator repository (meshNet for meshNet). The wrapper decides when it runs: a
+dispatch (rehearsal, recovery, hotfix) or its own nightly `schedule:` with `skip-when-nothing-ahead: true`, so a night
+with nothing ahead is a logged no-op (meshNet's wrapper, coordinator:C-nightly-train). The minimal dispatch-only form:
 
 ```yaml
 # .github/workflows/release-train.yml
 name: Release train
 on:
-  workflow_dispatch:                # never a schedule: each release runs on the owner's yes
+  workflow_dispatch:                # add a schedule: with skip-when-nothing-ahead for a nightly train
     inputs:
       dry-run: { type: boolean, default: true }
       override: { type: boolean, default: false, description: "Run even at ACTIONS_BUDGET_STATE=hard (hotfix)" }
@@ -159,6 +159,7 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | `ref` | the branch the train assembles from in every manifest repository; default `release`. A repository without it fails the run |
 | `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). Conflicting refs for the same repository fail before checkout or deletion of existing work; identical repeated assignments are accepted. A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
 | `dry-run` | build, test and pack only, then upload the local feed; default `true` |
+| `skip-when-nothing-ahead` | the nightly run: before `setup-dotnet`, count every manifest repository's `ref` commits that `main` lacks (commit graph only) and stop as a logged no-op when there are none; default `false` |
 | `override` | run even when the org variable `ACTIONS_BUDGET_STATE` is `hard`. The train runs at `soft`; at `hard` only an override runs |
 | `dotnet-version` | default `10.0.x` |
 | secret `repos-token` | reads every manifest repository; on a live train also pushes `main` and `train/*` tags |
@@ -208,6 +209,14 @@ repositories. The train deploys nothing: it names the hosts whose `main` moved i
 starts one deploy for the whole train after the last host moved. A host's own `main` push workflow should not deploy
 as well (with two hosts that was two full deploys per train, the first racing the second host's push). A host without the `ref` branch fails the
 plan, as a repository does.
+
+A `promote` entry (a name or `{ "repo": ... }`) is a repository the train only promotes: nothing is built, pinned or
+published, and when its `ref` is ahead of `main` its `main` fast-forwards to the head the plan read, last, tagged
+`train/<version>`. For static web apps and other repositories whose `main` push is their deploy. A live train refuses
+one whose `main` has commits `ref` lacks.
+
+Every repository a live train or promote-only moves also gets a lightweight `deploy/YYYY-MM-DD` alias (UTC) on the
+`train/<version>` commit; never overwritten, a second promotion the same date gets `.2`, then `.3`.
 
 **Done** means the run is green. On a live train that also means the summary lists every package at one version and
 every selected repository promoted. The tag `train/<version>` exists in each one, and its `main` equals `ref`.
