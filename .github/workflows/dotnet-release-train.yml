@@ -1,9 +1,14 @@
 # Reusable: the release train. One run, one job, every repository in a manifest, in dependency order, one version stamp
 # for the packages that changed.
 #
-# Call it from a thin wrapper in the tenant's aggregator repository (see README.md), dispatched only: each release is
-# proposed and runs on the owner's yes, never on a schedule. The job:
+# Call it from a thin wrapper in the tenant's aggregator repository (see README.md). The wrapper decides when it runs:
+# dispatched (a proposal the owner said yes to, a rehearsal, a recovery) or on the caller's own nightly schedule (meshNet,
+# owner 2026-10-18, coordinator:C-nightly-train). The job:
 #
+#   precheck (with skip-when-nothing-ahead, the nightly run) fetches every manifest repository's commit graph, no blobs and
+#            no checkout, before setup-dotnet, and counts the commits `ref` has that main lacks. When no repository is
+#            ahead the run is a logged no-op: it names every repository it checked and stops; nothing is built, published
+#            or promoted, and the run is green.
 #   plan     clones every manifest repository at `ref` (default `release`), reads every .csproj, and sorts the
 #            repositories (then the projects inside each) by their package edges: a PackageReference to a package
 #            another manifest repository produces is an edge. A cycle fails the run and names it. A PACKAGE is in the
@@ -77,6 +82,10 @@ on:
         description: Run even when vars.ACTIONS_BUDGET_STATE is 'hard' (the hotfix reserve)
         type: boolean
         default: false
+      skip-when-nothing-ahead:
+        description: "The nightly run: stop as a logged no-op, before setup-dotnet, when no manifest repository's ref has commits its main lacks"
+        type: boolean
+        default: false
       dotnet-version:
         type: string
         default: "10.0.x"
@@ -130,10 +139,6 @@ jobs:
         with:
           path: caller
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ inputs.dotnet-version }}
-
       - name: Write the train script
         run: |
           cat > "$RUNNER_TEMP/train.py" <<'TRAIN_PY'
@@ -142,6 +147,9 @@ jobs:
           Subcommands, run in this order by dotnet-release-train.yml (each reads what the previous one wrote under
           TRAIN_WORK):
 
+            precheck  (the nightly run, before setup-dotnet) fetch every manifest repo's commit graph without blobs or a
+                      checkout and count TRAIN_REF's commits that main lacks; log every repo checked; `go` is false when
+                      none is ahead, and the run is then a logged no-op
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
                       package edges (a cycle fails, naming it), select the packages that changed since their last
                       publication (select_packages) and the repos that carry one or are ahead of main, the hosts that
@@ -954,6 +962,53 @@ jobs:
               return train_commit(src, ["commit", "-q", "-m", message])
 
 
+          def cmd_precheck():
+              """The nightly run's cheap first look: is any manifest repository's ref ahead of its main? Each repository is
+              cloned blobless with no checkout (the commit graph only, seconds per repository, no dotnet) and main..ref is
+              counted. Every repository checked is logged. `ahead` names the ones with commits main lacks and `go` is false
+              when there are none: the scheduled run is then a logged no-op that builds, publishes and promotes nothing. A
+              repository whose main is ahead of the ref by train commits only (rule (a), C44) is not ahead: nothing new is
+              waiting, and the next train that runs reconciles it."""
+              manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
+              ref = os.environ.get("TRAIN_REF", "release")
+              server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+              root = WORK / "precheck"
+              if root.exists():
+                  shutil.rmtree(root)
+              root.mkdir(parents=True)
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest.get("promote", [])]
+              ahead, lines = [], []
+              for name in names:
+                  dest = root / name
+                  try:
+                      git(["clone", "--quiet", "--filter=blob:none", "--no-checkout", "--branch", ref,
+                           f"{server}/{manifest['org']}/{name}.git", dest])
+                  except TrainError:
+                      raise TrainError(f"{name}: could not fetch branch '{ref}'. Every manifest repo needs that branch.")
+                  tip = git(["rev-parse", f"refs/remotes/origin/{ref}"], cwd=dest, capture=True).strip()
+                  main = git(["rev-parse", "refs/remotes/origin/main"], cwd=dest, capture=True).strip()
+                  count = int(git(["rev-list", "--count", f"{main}..{tip}"], cwd=dest, capture=True).strip())
+                  if count:
+                      ahead.append(name)
+                  lines.append(f"{name}: {ref} {tip[:12]}, main {main[:12]}, " +
+                               (f"{count} commit(s) ahead" if count else "nothing ahead"))
+                  shutil.rmtree(dest)
+              log(f"Pre-check, ref {ref}: {len(names)} repositories checked")
+              for line in lines:
+                  log(f"  {line}")
+              if ahead:
+                  text = f"Pre-check: {len(ahead)} of {len(names)} repositories have `{ref}` ahead of main: {', '.join(ahead)}."
+              else:
+                  text = (f"Pre-check: no-op. None of the {len(names)} repositories has `{ref}` ahead of main, so nothing is "
+                          f"built, published or promoted. Checked: {', '.join(names)}.")
+              log(text)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write(text + "\n")
+              output("ahead", ",".join(ahead))
+              output("go", "true" if ahead else "false")
+
+
           def cmd_plan():
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
               ref = os.environ.get("TRAIN_REF", "release")
@@ -1500,7 +1555,7 @@ jobs:
                       f.write(f"{key}={value}\n")
 
 
-          COMMANDS = {"plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote,
+          COMMANDS = {"precheck": cmd_precheck, "plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote,
                       "promote-only": cmd_promote_only, "record": cmd_record}
 
           if __name__ == "__main__":
@@ -1513,9 +1568,23 @@ jobs:
                   sys.exit(1)
           TRAIN_PY
 
+      # The nightly run's no-op: before setup-dotnet, so a night with nothing ahead costs about a minute.
+      - name: Pre-check (is any release ahead of main?)
+        id: precheck
+        if: ${{ inputs.skip-when-nothing-ahead && inputs.promote-only == '' }}
+        env:
+          TRAIN_MANIFEST: caller/${{ inputs.manifest }}
+          REPOS_TOKEN: ${{ secrets.repos-token }}
+        run: python3 "$RUNNER_TEMP/train.py" precheck
+
+      - uses: actions/setup-dotnet@v4
+        if: ${{ steps.precheck.outputs.go != 'false' }}
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
       - name: Plan (clone, sort, select, stamp)
         id: plan
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && steps.precheck.outputs.go != 'false' }}
         env:
           TRAIN_MANIFEST: caller/${{ inputs.manifest }}
           REPOS_TOKEN: ${{ secrets.repos-token }}
@@ -1525,7 +1594,7 @@ jobs:
       # Keyed on the cloned repositories' project files (no packages.lock.json: a lock file would pin every
       # Version="*" float to its last resolution).
       - name: Cache NuGet packages
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && steps.precheck.outputs.go != 'false' }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages

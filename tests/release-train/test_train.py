@@ -1566,5 +1566,65 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
 
 
+class GitOnly(unittest.TestCase):
+    """The paths that need git but no dotnet (the nightly pre-check, promotion of promote-only repositories, the deploy
+    alias tag): the same throwaway file:// repositories as EndToEnd, always run."""
+
+    def setUp(self):
+        EndToEnd.setUp(self)
+        self.outputs = self.root / "github_output"
+        self.feed_env["GITHUB_OUTPUT"] = str(self.outputs)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def output(self):
+        lines = self.outputs.read_text().splitlines() if self.outputs.exists() else []
+        self.outputs.unlink(missing_ok=True)
+        return dict(line.split("=", 1) for line in lines)
+
+    def test_the_nightly_pre_check_is_a_logged_no_op_when_no_release_is_ahead_and_names_the_ones_that_are(self):
+        for name in ("Up", "Down", "Host"):
+            self.repo(name, {"README.md": name})
+        self.release_branches("Up", "Down", "Host")
+        self.manifest(["Up", "Down"], hosts=[{"repo": "Host"}])
+        self.feed_env["TRAIN_REF"] = "release"
+        check = self.train("precheck")
+        self.assertEqual(check.returncode, 0, check.stdout)
+        self.assertEqual(self.output(), {"ahead": "", "go": "false"})
+        self.assertIn("Pre-check, ref release: 3 repositories checked", check.stdout)
+        for name in ("Up", "Down", "Host"):
+            self.assertRegex(check.stdout, rf"{name}: release [0-9a-f]{{12}}, main [0-9a-f]{{12}}, nothing ahead")
+        self.assertIn("Pre-check: no-op. None of the 3 repositories has `release` ahead of main", check.stdout)
+        self.assertIn("Checked: Up, Down, Host.", check.stdout)
+        # main ahead of release (the train's own pin commit, rule (a)) is not "ahead": nothing new is waiting.
+        self.commit_to("Down", "main", {"README.md": "pinned"})
+        check = self.train("precheck")
+        self.assertEqual(check.returncode, 0, check.stdout)
+        self.assertEqual(self.output()["go"], "false")
+        # A lane's merge into one release, and into a host's: those two are named and the train goes.
+        self.commit_to("Up", "release", {"Feature.md": "x"})
+        self.commit_to("Host", "release", {"Feature.md": "y"})
+        check = self.train("precheck")
+        self.assertEqual(check.returncode, 0, check.stdout)
+        self.assertEqual(self.output(), {"ahead": "Up,Host", "go": "true"})
+        self.assertIn("Up: release", check.stdout)
+        self.assertIn("1 commit(s) ahead", check.stdout)
+        self.assertIn("Pre-check: 2 of 3 repositories have `release` ahead of main: Up, Host.", check.stdout)
+
+    def test_the_pre_check_fails_loudly_for_a_repository_without_the_ref(self):
+        self.repo("Up", {"README.md": "Up"})
+        self.manifest(["Up"])
+        self.feed_env["TRAIN_REF"] = "release"
+        check = self.train("precheck")
+        self.assertNotEqual(check.returncode, 0, check.stdout)
+        self.assertIn("Up: could not fetch branch 'release'", check.stdout)
+
+
+for _helper in ("repo", "commit_to", "bare", "rev", "file_at", "is_ancestor", "release_branches", "manifest", "train",
+                "live"):
+    setattr(GitOnly, _helper, getattr(EndToEnd, _helper))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
