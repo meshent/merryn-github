@@ -1261,6 +1261,22 @@ jobs:
               """Move one repository to what the train built: its train commits onto the ref when that still fast-forwards,
               main to the train's sha, and the train/<version> tag on it. Raises TrainError when main or the tag cannot move."""
               tag = f"train/{plan['version']}"
+              # The planned sha, never a moved head. What main takes is repo["sha"]: the ref's head the plan cloned
+              # (repo["base"]) plus only the train's own commits on top. The ref is re-read here only to say whether a lane
+              # merged while the train ran; its new head is never pushed to main or tagged, since this train did not build
+              # or test it. It waits on the ref for the next train (the 2026-10-10 race, coordinator:C44).
+              base = repo.get("base", repo["sha"])
+              if base != repo["sha"] and not is_ancestor(dest, base, repo["sha"]):
+                  raise TrainError(f"{name}: what the train would promote ({repo['sha'][:12]}) does not contain the {plan['ref']} "
+                                   f"head it planned ({base[:12]}); refusing to move main")
+              try:
+                  now = (git(["ls-remote", "origin", f"refs/heads/{plan['ref']}"], cwd=dest, capture=True).split() or [""])[0]
+              except TrainError:
+                  now = ""
+              if now and now != base and now != repo["sha"] and plan.get("mode") != "promote-only":
+                  plan.setdefault("release_moved", []).append(name)
+                  log(f"{name}: {plan['ref']} moved while the train ran ({base[:12]} -> {now[:12]}); main takes the planned "
+                      f"{repo['sha'][:12]}, and what moved waits on {plan['ref']} for the next train")
               if repo.get("train_commits"):
                   # The train's commits (pins, a reconcile merge) sit on top of the ref in the runner's clone. The ref takes
                   # them when that is a fast-forward. When a lane merged into the ref while the train ran, the push is refused
@@ -1505,6 +1521,9 @@ jobs:
                   lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
               if plan["promoted"]:
                   lines += ["", f"Promoted (main fast-forwarded, tagged `train/{plan['version']}`): {', '.join(plan['promoted'])}."]
+              if plan.get("release_moved"):
+                  lines += ["", f"`{plan['ref']}` moved while the train ran; main took the planned sha, and the merges that "
+                                f"landed since wait on `{plan['ref']}` for the next train: {', '.join(plan['release_moved'])}."]
               if plan.get("release_behind"):
                   lines += ["", f"⚠️ `{plan['ref']}` moved while the train ran, so it does not carry the train's pin commit yet "
                                 f"(main does; the next train reconciles it): {', '.join(plan['release_behind'])}."]

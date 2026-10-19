@@ -144,6 +144,38 @@ class Unit(unittest.TestCase):
         # Api's main moved here; Auth's main already was the sha. Both are on main, so both are named.
         self.assertEqual(out.read_text(), "hosts-promoted=Api,Auth\n")
 
+    def test_promotion_pushes_the_planned_sha_to_main_never_the_moved_head_of_the_ref(self):
+        # The 2026-10-10 race, at the unit level: the ref moved to a lane's merge after the plan. main and the tag take the
+        # sha the train built from its planned base; the moved head is only reported. A built sha that does not contain
+        # the planned base is refused (stranded), never pushed.
+        from unittest.mock import patch
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+        base, built, lane, main = "b" * 40, "c" * 40, "d" * 40, "a" * 40
+        pushes = []
+
+        def git(args, cwd=None, capture=False):
+            if args[:1] == ["ls-remote"]:
+                return f"{lane}\trefs/heads/release\n"
+            if args[:1] == ["push"]:
+                pushes.append(args[-1])
+            return ""
+
+        plan = {"version": "0.0.1", "ref": "release", "promoted": [], "stranded": [], "release_behind": [], "repos": {
+            "Lib": {"repo": "Lib", "base": base, "sha": built, "main": main},
+            "Bad": {"repo": "Bad", "base": base, "sha": "e" * 40, "main": main}}}
+        with patch.object(self.train, "git", git), patch.object(self.train, "run", lambda *a, **k: None), \
+                patch.object(self.train, "deploy_tag", lambda *a, **k: None, create=True), \
+                patch.object(self.train, "is_ancestor", lambda dest, a, b: (a, b) != (base, "e" * 40)):
+            with self.assertRaises(self.train.TrainError):
+                self.train.promote_all(plan, ["Lib", "Bad"])
+        self.assertIn(f"{built}:refs/heads/main", pushes)
+        self.assertNotIn(f"{lane}:refs/heads/main", pushes)
+        self.assertFalse(any(p.startswith("e" * 40) for p in pushes))
+        self.assertEqual(plan["promoted"], ["Lib"])
+        self.assertEqual(plan["release_moved"], ["Lib"])
+        self.assertEqual([s["repo"] for s in plan["stranded"]], ["Bad"])
+        self.assertIn("does not contain the release head it planned", plan["stranded"][0]["reason"])
+
     def test_manifest_accepts_names_and_objects_and_refuses_duplicates(self):
         path = Path(self.tmp.name) / "m.json"
         path.write_text(json.dumps({"org": "o", "repos": ["A", {"repo": "B", "solution": "B.Tests.slnx", "test": False}]}))
@@ -1169,6 +1201,9 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([s["repo"] for s in state["stranded"]], ["Side"])
         self.assertEqual(state["stranded"][0]["base"], built["Side"]["base"])
         self.assertEqual(state["release_behind"], ["Down"])
+        self.assertEqual(state["release_moved"], ["Down"])               # re-read, reported, never promoted
+        self.assertNotEqual(self.rev("Down", "main"), lane)
+        self.assertFalse(self.is_ancestor("Down", lane, "main"))
         # Down: main is the pin commit that was built, tagged; release still carries the lane's merge.
         self.assertEqual(self.rev("Down", "main"), built["Down"]["sha"])
         self.assertEqual(self.rev("Down", f"train/{version}^{{commit}}"), built["Down"]["sha"])
@@ -1180,6 +1215,8 @@ class EndToEnd(unittest.TestCase):
         record = self.train("record")
         self.assertIn("**Stranded** (published at " + version + ", main not moved, not tagged): Side.", record.stdout)
         self.assertIn("(main does; the next train reconciles it): Down.", record.stdout)
+        self.assertIn("main took the planned sha, and the merges that landed since wait on `release` for the next train: "
+                      "Down.", record.stdout)
 
     def test_the_next_train_reconciles_main_s_pin_commit_and_carries_its_pins(self):
         """Rule (a)'s second half: after a train left main ahead of release by its pin commit, the next live plan accepts
