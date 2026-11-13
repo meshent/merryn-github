@@ -134,6 +134,7 @@ on:
   workflow_dispatch:                # never a schedule: each release runs on the owner's yes
     inputs:
       dry-run: { type: boolean, default: true }
+      split: { type: string, default: "", description: "Branch to split this release off the ref, e.g. release-2026-01-31" }
       override: { type: boolean, default: false, description: "Run even at ACTIONS_BUDGET_STATE=hard (hotfix)" }
 permissions:
   contents: read
@@ -143,6 +144,7 @@ jobs:
     with:
       manifest: release-train.json
       dry-run: ${{ inputs.dry-run }}
+      split: ${{ inputs.split }}
       override: ${{ inputs.override }}
     secrets:
       repos-token: ${{ secrets.MESHENT_CI_PAT }}
@@ -158,6 +160,7 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | `manifest` | path to the manifest in the calling repository; default `release-train.json` |
 | `ref` | the branch the train assembles from in every manifest repository; default `release`. A repository without it fails the run |
 | `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). Conflicting refs for the same repository fail before checkout or deletion of existing work; identical repeated assignments are accepted. A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
+| `split` | a branch name that cuts this release off `ref`. Before the plan, every manifest repository (hosts too) that has no branch of that name gets one at `ref`'s tip; a repository that already has it is left exactly as it is. The train then assembles from the split branch and a live train promotes it, so lanes keep merging into `ref` while the release is settled: a fix for the release merges into the split branch (and into `ref`), and a second dispatch with the same `split` continues the same release without picking up anything merged into `ref` since. A dry run splits too (a branch is created; nothing is published and neither `ref` nor main moves). Refused: `main`, `ref` itself, a name git cannot keep beside `ref` (`release/1` beside `release`; use `release-2026-01-31`), and a repository that has neither branch (nothing is created). After a live split train, main is ahead of `ref` by the train's own commits, which the next train from `ref` reconciles; a fix that was merged only into the split branch must be merged into `ref` first, and that train says so |
 | `dry-run` | build, test and pack only, then upload the local feed; default `true` |
 | `override` | run even when the org variable `ACTIONS_BUDGET_STATE` is `hard`. The train runs at `soft`; at `hard` only an override runs |
 | `dotnet-version` | default `10.0.x` |
