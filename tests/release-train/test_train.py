@@ -697,8 +697,7 @@ TEST_CSPROJ = """<Project Sdk="Microsoft.NET.Sdk">
 """
 
 
-@unittest.skipUnless(os.environ.get("TRAIN_DOTNET"), "set TRAIN_DOTNET=1 to run the dotnet end-to-end tests")
-class EndToEnd(unittest.TestCase):
+class Fixture(unittest.TestCase):
     """Throwaway git repositories served from file://, so the real plan/build path runs with no network for git."""
 
     def setUp(self):
@@ -814,6 +813,112 @@ class EndToEnd(unittest.TestCase):
         return subprocess.run([sys.executable, self.script, command], env=self.feed_env, text=True,
                               encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
+
+class Split(Fixture):
+    """The split command needs git only, so these run without dotnet."""
+
+    def split(self, name, ref="release"):
+        self.feed_env.update(TRAIN_REF=ref, TRAIN_SPLIT=name)
+        return self.train("split")
+
+    def branches(self, name):
+        out = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=self.bare(name),
+                             capture_output=True, text=True, check=True).stdout
+        return sorted(out.split())
+
+    def test_a_split_creates_the_branch_at_the_ref_s_tip_in_every_repository_and_host(self):
+        self.two_repos()
+        self.repo("Host", {"Host.App/Host.App.csproj": csproj(["Up.Lib"])})
+        self.release_branches("Up", "Down", "Host")
+        on_release = self.commit_to("Up", "release", {"Up.Lib/More.cs": "namespace Up; public class C {}"})
+        self.manifest(["Down", "Up"], hosts=[{"repo": "Host"}])
+        summary = self.root / "summary.md"
+        self.feed_env["GITHUB_STEP_SUMMARY"] = str(summary)
+        done = self.split("release-1")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Up", "release-1"), on_release)            # the ref's tip, not main's
+        for name in ("Down", "Host"):
+            self.assertEqual(self.rev(name, "release-1"), self.rev(name, "release"))
+        for name in ("Up", "Down", "Host"):
+            self.assertEqual(self.branches(name), ["main", "release", "release-1"])
+        self.assertEqual(self.rev("Up", "release"), on_release)                # the ref itself did not move
+        self.assertIn("3 created, 0 already there", done.stdout)
+        self.assertIn("## Split `release-1` off `release`", summary.read_text())
+
+    def test_a_second_split_of_the_same_name_keeps_the_release_and_never_takes_what_lanes_merged_since(self):
+        self.two_repos()
+        self.release_branches("Up", "Down")
+        self.manifest(["Down", "Up"])
+        self.assertEqual(self.split("release-1").returncode, 0)
+        cut = self.rev("Up", "release-1")
+        lane = self.commit_to("Up", "release", {"Up.Lib/Lane.cs": "namespace Up; public class Lane {}"})
+        self.assertNotEqual(lane, cut)
+        again = self.split("release-1")
+        self.assertEqual(again.returncode, 0, again.stdout)
+        self.assertEqual(self.rev("Up", "release-1"), cut)                    # the lane's merge stays on release
+        self.assertEqual(self.rev("Up", "release"), lane)
+        self.assertIn("0 created, 2 already there", again.stdout)
+        # A fix merged into the split branch is kept too: the split is left exactly as it is.
+        subprocess.run(["git", "checkout", "-q", "-b", "release-1", cut], cwd=self.root / "make" / "Up", check=True)
+        fix = self.commit_to("Up", "release-1", {"Up.Lib/Fix.cs": "namespace Up; public class Fix {}"})
+        self.assertEqual(self.split("release-1").returncode, 0)
+        self.assertEqual(self.rev("Up", "release-1"), fix)
+
+    def test_a_split_that_stopped_half_way_is_finished_by_the_next_run(self):
+        self.two_repos()
+        self.release_branches("Up", "Down")
+        self.manifest(["Down", "Up"])
+        subprocess.run(["git", "branch", "release-1", "release"], cwd=self.bare("Down"), check=True)
+        done = self.split("release-1")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("1 created, 1 already there", done.stdout)
+        self.assertEqual(self.rev("Up", "release-1"), self.rev("Up", "release"))
+
+    def test_a_repository_with_neither_branch_fails_the_split_before_anything_is_created(self):
+        self.two_repos()
+        self.release_branches("Down")                                         # Up has no release branch
+        self.manifest(["Down", "Up"])
+        refused = self.split("release-1")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("Up has neither branch. Nothing was created.", refused.stdout)
+        self.assertEqual(self.branches("Down"), ["main", "release"])
+        self.assertEqual(self.branches("Up"), ["main"])
+
+    def test_a_split_name_that_is_main_the_ref_or_cannot_exist_beside_the_ref_is_refused_before_any_read(self):
+        self.two_repos()
+        self.release_branches("Up", "Down")
+        self.manifest(["Down", "Up"])
+        for name, why in (("main", "must be a branch of its own, not main"),
+                          ("release", "must be a branch of its own, not the ref it splits off"),
+                          ("release/1", "cannot exist beside 'release'"),
+                          ("has space", "is not a branch name"), ("-x", "is not a branch name"),
+                          ("a..b", "is not a branch name")):
+            with self.subTest(name=name):
+                refused = self.split(name)
+                self.assertNotEqual(refused.returncode, 0, refused.stdout)
+                self.assertIn(why, refused.stdout)
+                self.assertNotIn("ls-remote", refused.stdout)
+        for name in ("Up", "Down"):
+            self.assertEqual(self.branches(name), ["main", "release"])
+
+    def test_without_a_split_the_command_does_nothing_and_every_command_keeps_the_ref(self):
+        self.two_repos()
+        self.release_branches("Up", "Down")
+        self.manifest(["Down", "Up"])
+        self.feed_env.update(TRAIN_REF="release", TRAIN_SPLIT="  ")
+        done = self.train("split")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("No split was asked for.", done.stdout)
+        self.assertEqual(self.branches("Up"), ["main", "release"])
+        from unittest.mock import patch
+        with patch.dict(os.environ, TRAIN_REF="release", TRAIN_SPLIT=""):
+            self.assertEqual(self.module.train_ref(), "release")
+        with patch.dict(os.environ, TRAIN_REF="release", TRAIN_SPLIT="release-1"):
+            self.assertEqual(self.module.train_ref(), "release-1")
+
+
+@unittest.skipUnless(os.environ.get("TRAIN_DOTNET"), "set TRAIN_DOTNET=1 to run the dotnet end-to-end tests")
+class EndToEnd(Fixture):
     def test_two_repos_pack_in_order_with_one_version_and_downstream_depends_on_the_train_version(self):
         self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}",
                          "Up.slnx": '<Solution><Project Path="Up.Lib/Up.Lib.csproj" /></Solution>'})
@@ -1221,6 +1326,43 @@ class EndToEnd(unittest.TestCase):
         self.assertIn(f'Include="Up.Lib" Version="{first}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
         self.assertIn("class Lane", self.file_at("Down", "main", "Down.Lib/Lane.cs"))
         self.assertEqual(self.rev("Down", f"train/{second['version']}^{{commit}}"), self.rev("Down", "main"))
+
+    def test_a_split_release_ships_from_the_split_branch_while_the_ref_keeps_its_lane_and_the_next_train_reconciles(self):
+        """split cuts a release off the ref: the train assembles from and promotes the split branch, a lane's merge into
+        the ref after the cut is neither built nor lost, and the next train from the ref reconciles main's pin commit."""
+        self.repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.pinned_repo("Down", "Up")
+        self.release_branches("Up", "Down")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        self.feed_env["TRAIN_SPLIT"] = "release-1"
+        split = self.train("split")
+        self.assertEqual(split.returncode, 0, split.stdout)
+        lane = self.commit_to("Down", "release", {"Down.Lib/Lane.cs": "namespace Down; public class Lane {}"})
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["ref"], state["split_from"]), ("release-1", "release"))
+        self.assertEqual(state["repos"]["Down"]["ref"], "release-1")
+        built, version = state["repos"]["Down"]["sha"], state["version"]
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        self.assertEqual(self.rev("Down", "main"), built)                  # main is what the split branch built ...
+        self.assertEqual(self.rev("Down", "release-1"), built)             # ... the split branch carries the pin commit ...
+        self.assertEqual(self.rev("Down", "release"), lane)                # ... and the ref was not touched
+        self.assertFalse(self.is_ancestor("Down", lane, "main"))           # the lane's work did not ship
+        self.assertIn(f'Include="Up.Lib" Version="{version}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        record = self.train("record")
+        self.assertIn("Ref `release-1` (split off `release`)", record.stdout)
+        # The next train, from the ref with no split: main is ahead by the split train's pin commit only.
+        self.feed_env["TRAIN_SPLIT"] = ""
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertIn("is ahead of release by train commits only; this train reconciles it", plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["ref"], state["split_from"]), ("release", None))
 
     def test_promote_only_finishes_a_stranded_promotion_and_refuses_a_sha_that_is_not_on_release(self):
         """Recovery for the first train's stranded repositories: packages already on the feed at the version; main moves

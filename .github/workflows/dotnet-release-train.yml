@@ -42,6 +42,12 @@
 # that train packed,
 # and refuses any sha that is not on `ref` (or main). dry-run with promote-only checks and reports, pushing nothing.
 #
+# split (a branch name) cuts this release off from the work that keeps arriving on `ref`: before the plan, every manifest
+# repository that has no branch of that name gets one at `ref`'s tip, and one that already has it is left as it is. The
+# train then assembles from the split branch and, live, promotes it, so lanes keep merging into `ref` while this release
+# is settled on the split branch, and a second dispatch with the same name continues the same release. A dry run splits
+# too (a branch is created, nothing is published or promoted).
+#
 # dry-run (the default until the first real train) stops after build and uploads the local feed as an artifact.
 # The job skips while the org's ACTIONS_BUDGET_STATE is `hard`, unless `override` is set (the hotfix reserve).
 name: dotnet release train (reusable)
@@ -59,6 +65,10 @@ on:
         default: release
       ref-overrides:
         description: "Dry runs only: repo=ref entries (one per line or comma-separated); conflicting refs for one repo fail before checkout, identical repeats are accepted; a live train refuses overrides"
+        type: string
+        default: ""
+      split:
+        description: "A branch name to split this release off `ref`: created at `ref`'s tip in every manifest repository that lacks it (also on a dry run), left alone where it exists; the train assembles from it and a live train promotes it, while `ref` keeps taking new work"
         type: string
         default: ""
       promote-only:
@@ -82,7 +92,7 @@ on:
         default: "10.0.x"
     secrets:
       repos-token:
-        description: Reads every manifest repository; on a live train also pushes main and train/* tags
+        description: Reads every manifest repository; on a live train also pushes main and train/* tags, and with `split` it creates that branch
         required: true
       packages-token:
         description: read:packages for restore; on a live train also write:packages for the push
@@ -124,6 +134,7 @@ jobs:
       TRAIN_WORK: ${{ github.workspace }}/_train
       TRAIN_REF: ${{ inputs.ref }}
       TRAIN_REF_OVERRIDES: ${{ inputs.ref-overrides }}
+      TRAIN_SPLIT: ${{ inputs.split }}
       TRAIN_DRY_RUN: ${{ inputs.dry-run }}
     steps:
       - uses: actions/checkout@v4
@@ -142,6 +153,8 @@ jobs:
           Subcommands, run in this order by dotnet-release-train.yml (each reads what the previous one wrote under
           TRAIN_WORK):
 
+            split     (only with TRAIN_SPLIT) create that branch at TRAIN_REF's tip in every manifest repo that lacks
+                      it, leave it alone where it exists; every later command then takes TRAIN_SPLIT as the ref
             plan      clone every manifest repo at TRAIN_REF, read every .csproj, sort repos and projects by their
                       package edges (a cycle fails, naming it), select the packages that changed since their last
                       publication (select_packages) and the repos that carry one or are ahead of main, the hosts that
@@ -167,7 +180,7 @@ jobs:
                       train, TRAIN_PROMOTE lists repo=sha; every sha must be on TRAIN_REF (or main) with main its ancestor
                       (or ahead by train commits only), checked before anything is pushed
 
-          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_REF_OVERRIDES, TRAIN_DRY_RUN, TRAIN_VERSION, TRAIN_PROMOTE, TRAIN_FEED,
+          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_REF_OVERRIDES, TRAIN_SPLIT, TRAIN_DRY_RUN, TRAIN_VERSION, TRAIN_PROMOTE, TRAIN_FEED,
           REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL, MERRYN_TOKEN; GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and GITHUB_SERVER_URL as
           Actions sets them.
           """
@@ -178,6 +191,7 @@ jobs:
           import shutil
           import subprocess
           import sys
+          import tempfile
           import urllib.request
           import xml.etree.ElementTree as ET
           import zipfile
@@ -928,6 +942,89 @@ jobs:
               return repo_assignments(os.environ.get("TRAIN_REF_OVERRIDES", ""), "ref override", "ref")
 
 
+          def split_name(ref):
+              """TRAIN_SPLIT, the branch this release is split off `ref` onto, or None when no split was asked for. Refused
+              before anything is read or pushed: a name git does not take as a branch, `main` (written only by a promotion),
+              `ref` itself, and a name that cannot exist beside `ref` (git keeps `release` and `release/x` in one place)."""
+              name = os.environ.get("TRAIN_SPLIT", "").strip()
+              if not name:
+                  return None
+              valid = subprocess.run(["git", "check-ref-format", "--branch", name], stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL).returncode == 0
+              if not valid or name.startswith("-"):
+                  raise TrainError(f"split '{name}' is not a branch name")
+              if name in ("main", ref):
+                  raise TrainError(f"split '{name}' must be a branch of its own, not {'main' if name == 'main' else 'the ref it splits off'}")
+              if name.startswith(ref + "/") or ref.startswith(name + "/"):
+                  raise TrainError(f"split '{name}' cannot exist beside '{ref}': git keeps both names in one place. "
+                                   f"Name it like '{ref}-2026-01-31'.")
+              return name
+
+
+          def train_ref():
+              """The branch every command assembles from, checks against and promotes: the split branch when one was asked
+              for, else TRAIN_REF."""
+              ref = os.environ.get("TRAIN_REF", "release")
+              return split_name(ref) or ref
+
+
+          def cmd_split():
+              """Split this release off TRAIN_REF: in every manifest repository (hosts too) that has no TRAIN_SPLIT branch,
+              create it at TRAIN_REF's tip; where it exists, leave it exactly as it is, so a second run of the same split
+              continues the same release (with whatever was merged into the split branch since) and never picks up what
+              lanes merged into TRAIN_REF meanwhile. Every repository is read before any branch is created, so a repository
+              that has neither branch fails the split with nothing pushed. The pushes are plain, never forced. Runs on a dry
+              run as well: a branch is created, nothing is published and neither TRAIN_REF nor main moves."""
+              ref = os.environ.get("TRAIN_REF", "release")
+              split = split_name(ref)
+              if not split:
+                  log("No split was asked for.")
+                  return
+              manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
+              server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"]]
+              heads = {}
+              for name in names:
+                  url = f"{server}/{manifest['org']}/{name}.git"
+                  listed = git(["ls-remote", url, f"refs/heads/{ref}", f"refs/heads/{split}"], capture=True)
+                  found = dict(reversed(line.split()) for line in listed.splitlines() if len(line.split()) == 2)
+                  heads[name] = (url, found.get(f"refs/heads/{ref}"), found.get(f"refs/heads/{split}"))
+              neither = [name for name, (_, at_ref, at_split) in heads.items() if not at_ref and not at_split]
+              if neither:
+                  raise TrainError(f"cannot split '{split}' off '{ref}': {', '.join(neither)} "
+                                   f"{'has' if len(neither) == 1 else 'have'} neither branch. Nothing was created.")
+              created, kept = [], []
+              for name in names:
+                  url, at_ref, at_split = heads[name]
+                  if at_split:
+                      kept.append((name, at_split))
+                      log(f"{name}: {split} exists at {at_split[:12]}; left as it is")
+                      continue
+                  # One commit, no blobs: the remote already holds everything the new branch names.
+                  # The branch as it is now (a lane may have merged since the read above), fetched and pushed by name.
+                  with tempfile.TemporaryDirectory() as scratch:
+                      run(["git", "init", "-q", scratch])
+                      git(["fetch", "-q", "--depth=1", "--filter=blob:none", url, f"refs/heads/{ref}"], cwd=scratch)
+                      at_ref = git(["rev-parse", "FETCH_HEAD"], cwd=scratch, capture=True).strip()
+                      git(["push", "-q", url, f"{at_ref}:refs/heads/{split}"], cwd=scratch)
+                  created.append((name, at_ref))
+                  log(f"{name}: {split} created at {at_ref[:12]} ({ref})")
+              log(f"\nSplit {split} off {ref}: {len(created)} created, {len(kept)} already there.")
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  lines = [f"## Split `{split}` off `{ref}`", "",
+                           f"This release assembles from `{split}`. `{ref}` keeps taking new work and is not read by this run. "
+                           f"A fix for this release merges into `{split}` (and into `{ref}`); dispatch again with the same "
+                           f"split to continue it.", ""]
+                  if created:
+                      lines += ["Created at the tip of `" + ref + "`: " +
+                                ", ".join(f"{name} `{sha[:12]}`" for name, sha in created) + ".", ""]
+                  if kept:
+                      lines += ["Already split, left as it is: " +
+                                ", ".join(f"{name} `{sha[:12]}`" for name, sha in kept) + ".", ""]
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write("\n".join(lines) + "\n")
+
+
           # The train's own commits (pin bumps, reconciling main into the ref) carry this author and a "[train <version>]"
           # subject. That pair is how a plan recognises main being ahead of the ref by nothing but train commits.
           TRAIN_NAME, TRAIN_EMAIL = "release-train", "release-train@users.noreply.github.com"
@@ -956,7 +1053,7 @@ jobs:
 
           def cmd_plan():
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
-              ref = os.environ.get("TRAIN_REF", "release")
+              ref = train_ref()
               dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
               overrides = ref_overrides()
               if overrides and not dry_run:
@@ -1082,7 +1179,9 @@ jobs:
               # float resolves to its newest version, which may already name a newer one than a stale csproj pin.
               train_ids = sorted(ship)
               published = published_versions(manifest["org"], set(owner) - set(ship), version)
-              plan = {"org": manifest["org"], "ref": ref, "version": version, "build": build, "revision": revision,
+              split_from = os.environ.get("TRAIN_REF", "release")
+              plan = {"org": manifest["org"], "ref": ref, "split_from": split_from if split_from != ref else None,
+                      "version": version, "build": build, "revision": revision,
                       "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
                       "decisions": decisions, "published": published,
@@ -1285,7 +1384,7 @@ jobs:
               an exact pin on any other package moves forward only to its newest release on the feed below the version, or
               to what main already carries, as the build did, so main carries what was packed."""
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
-              ref = os.environ.get("TRAIN_REF", "release")
+              ref = train_ref()
               dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
               version = os.environ.get("TRAIN_VERSION", "").strip()
               if not VERSION.fullmatch(version):
@@ -1417,7 +1516,8 @@ jobs:
                   return
               plan = json.loads(PLAN.read_text())
               mode = ("dry run" if plan["dry_run"] else "live") + (", promote-only" if plan.get("mode") == "promote-only" else "")
-              ref_line = f"Ref `{plan['ref']}`. Order: {' → '.join(plan['repo_order'])}."
+              ref_line = (f"Ref `{plan['ref']}`" + (f" (split off `{plan['split_from']}`)" if plan.get("split_from") else "") +
+                          f". Order: {' → '.join(plan['repo_order'])}.")
               if plan.get("overrides"):
                   ref_line += " Overrides (dry run only): " + ", ".join(f"`{n}={r}`" for n, r in sorted(plan["overrides"].items())) + "."
               lines = [f"## Release train {plan['version']} ({mode})", "", ref_line, "",
@@ -1500,7 +1600,7 @@ jobs:
                       f.write(f"{key}={value}\n")
 
 
-          COMMANDS = {"plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote,
+          COMMANDS = {"split": cmd_split, "plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote,
                       "promote-only": cmd_promote_only, "record": cmd_record}
 
           if __name__ == "__main__":
@@ -1512,6 +1612,13 @@ jobs:
                   print(f"::error::{redact(str(error))}", flush=True)
                   sys.exit(1)
           TRAIN_PY
+
+      - name: Split (cut this release off the ref)
+        if: ${{ inputs.split != '' && inputs.promote-only == '' }}
+        env:
+          TRAIN_MANIFEST: caller/${{ inputs.manifest }}
+          REPOS_TOKEN: ${{ secrets.repos-token }}
+        run: python3 "$RUNNER_TEMP/train.py" split
 
       - name: Plan (clone, sort, select, stamp)
         id: plan

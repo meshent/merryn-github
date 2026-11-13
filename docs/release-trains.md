@@ -138,6 +138,18 @@ Phases, in the one job:
    per host `main` push). meshNet's entry mirrors its
    `ci.yml`: `{"repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx"}` (both suites run
    in-memory, no services).
+6c. **Split** (built; the 2026-11-13 release: five live dispatches in a row each met a change a lane had merged into
+   `release` since the dispatch before it, a new interface member one time, a new rule another, so no train saw the
+   commits the last one had tested). Lanes never stop merging into `release`, so a release needs a branch of its own.
+   The `split` input names one. Before the plan, every manifest repository and host that has no branch of that name
+   gets one at `release`'s tip; one that already has it is left exactly as it is. The train then assembles from the
+   split branch and, live, promotes it. `release` is not read and keeps taking lane work. A fix for the release merges
+   into the split branch (and into `release`), and a dispatch with the same `split` continues the same release: it sees
+   the commits the last run tested plus that fix, and nothing else. A dry run splits too, so a rehearsal and the live
+   run that follows it build the same commits. After the live train, `main` is ahead of `release` by the train's own
+   commits, which the next train from `release` reconciles (rule (a)); a fix merged only into the split branch has to
+   be merged into `release` first, and that train's plan refuses the repository until it is. Nothing deletes a split
+   branch: it is the record of what the release was cut from.
 7. **Promote and deploy.** Merge `release` into `main` in every selected repo (fast-forward), tag `train/<id>`. For each
    host in the manifest with `deploy: true`, fire the existing shared `dispatch-deploy` (meshNet.Hosting azd) or the
    `deploy-host.yml` here (Merryn tenant hosts). Static web apps (Web.Vocab, Web.Pay) deploy themselves on the push to
