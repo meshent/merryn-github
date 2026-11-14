@@ -85,6 +85,10 @@ on:
         description: Build, test and pack into a local feed, upload it as an artifact, publish and promote nothing
         type: boolean
         default: true
+      skip-tests:
+        description: "Build and pack only: no repository's or host's tests run. For a hotfix the owner has decided to ship on a successful build alone; the summary says so"
+        type: boolean
+        default: false
       override:
         description: Run even when vars.ACTIONS_BUDGET_STATE is 'hard' (the hotfix reserve)
         type: boolean
@@ -142,6 +146,7 @@ jobs:
       TRAIN_REF_OVERRIDES: ${{ inputs.ref-overrides }}
       TRAIN_SPLIT: ${{ inputs.split }}
       TRAIN_DRY_RUN: ${{ inputs.dry-run }}
+      TRAIN_SKIP_TESTS: ${{ inputs.skip-tests }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1247,6 +1252,7 @@ jobs:
               # publish reads this list, so it stays empty unless every repository and host passed.
               plan["packages"] = [] if failed else packages
               plan["failed"], plan["blocked"] = failed, blocked
+              plan["tests_skipped"] = skip_tests()
               PLAN.write_text(json.dumps(plan, indent=2))
               if failed:
                   raise TrainError(f"{len(failed)} failed: {', '.join(failed)}" +
@@ -1300,7 +1306,7 @@ jobs:
               for path in repo["ships"]:
                   project = next(p for p in repo["projects"] if p["path"] == path)
                   packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
-              if repo["test"]:
+              if repo["test"] and not skip_tests():
                   args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
                   if repo["source_graph"]:
                       args.append(f"-p:{SWITCH}=true")
@@ -1308,12 +1314,18 @@ jobs:
                   # test-env: the manifest's acknowledgements for the runner, e.g. a suite's "no emulator here" variable.
                   run(args, cwd=src, env={**env, **repo.get("test-env", {})})
               else:
-                  log(f"{name}: tests skipped (\"test\": false in the manifest)")
+                  log(f"{name}: tests skipped (" + ("the skip-tests input" if repo["test"] else '"test": false in the manifest') + ")")
               log("::endgroup::")
               log(f"{name}: {len(repo['ships'])} package(s) at {version}" +
                   (f"; {len(repo['project_order']) - len(repo['ships'])} unchanged, not packed"
                    if len(repo["ships"]) < len(repo["project_order"]) else ""))
               return packages
+
+
+          def skip_tests():
+              """TRAIN_SKIP_TESTS: the owner's per-run decision to ship on a successful build alone (a hotfix). Everything
+              is still restored, built and packed, and every package is still checked; only the test commands are left out."""
+              return os.environ.get("TRAIN_SKIP_TESTS", "").lower() == "true"
 
 
           def build_host(repo, src, env):
@@ -1323,12 +1335,12 @@ jobs:
               test_env = {**env, **repo.get("test-env", {})}
               if repo.get("build_file"):
                   run(["dotnet", "build", repo["build_file"], "-c", "Release"], cwd=src, env=test_env)
-              if repo["test"]:
+              if repo["test"] and not skip_tests():
                   args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
                   args += repo["test-args"].split() if repo["test-args"] else []
                   run(args, cwd=src, env=test_env)
               else:
-                  log(f"{repo['repo']}: tests skipped (\"test\": false in the manifest)")
+                  log(f"{repo['repo']}: tests skipped (" + ("the skip-tests input" if repo["test"] else '"test": false in the manifest') + ")")
 
 
           def cmd_publish():
@@ -1586,6 +1598,9 @@ jobs:
               elif plan["packages"]:
                   lines += ["", "| package | version | in-train dependencies |", "|---|---|---|"]
                   lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
+              if plan.get("tests_skipped"):
+                  lines += ["", "⚠️ **Tests were skipped** (the skip-tests input): this run proved only that every repository "
+                                "and host restores, builds and packs."]
               if plan.get("failed"):
                   lines += ["", f"❌ **Failed** ({len(plan['failed'])}; nothing is published):", ""]
                   lines += [f"- {name}: {redact(reason)}" for name, reason in plan["failed"].items()]

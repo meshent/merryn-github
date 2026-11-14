@@ -174,6 +174,30 @@ class Unit(unittest.TestCase):
         self.assertEqual([p["id"] for p in state["packages"]], ["Low.Lib", "Mid.Lib", "Side.Lib"])
         self.assertEqual((state["failed"], state["blocked"]), ({}, {}))
 
+    def test_skip_tests_builds_a_host_but_runs_no_test_and_the_summary_says_so(self):
+        from unittest.mock import patch
+        host = {"repo": "Api", "build_file": "Api.slnx", "solution_file": "Tests.slnx", "test": True, "test-args": ""}
+        calls = []
+        with patch.object(self.train, "run", lambda args, **kwargs: calls.append(list(args)) or ""):
+            self.train.build_host(host, "src", {})
+            self.assertEqual([c[:2] for c in calls], [["dotnet", "build"], ["dotnet", "test"]])
+            calls.clear()
+            with patch.dict(os.environ, TRAIN_SKIP_TESTS="true"):
+                self.train.build_host(host, "src", {})
+            self.assertEqual([c[:2] for c in calls], [["dotnet", "build"]])
+        self.assertFalse(self.train.skip_tests())
+        with patch.dict(os.environ, TRAIN_SKIP_TESTS="false"):
+            self.assertFalse(self.train.skip_tests())
+        # The summary carries it, so a release that shipped on a build alone is never mistaken for a tested one.
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+        self.train.PLAN.write_text(json.dumps({
+            "version": "0.0.1", "dry_run": False, "ref": "release", "repo_order": [], "repos": {}, "repo_edges": {},
+            "packages": [], "promoted": [], "tests_skipped": True}))
+        summary = Path(self.tmp.name) / "summary.md"
+        with patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(summary)):
+            self.train.cmd_record()
+        self.assertIn("**Tests were skipped** (the skip-tests input)", summary.read_text())
+
     def test_a_host_whose_main_moved_but_whose_tag_push_failed_is_still_named_for_the_deploy(self):
         # The real promote_repo against a stubbed git: main's push succeeds, the tag push fails. The host is stranded
         # (not tagged), but prod would lag main without a deploy, so hosts-promoted still names it.
