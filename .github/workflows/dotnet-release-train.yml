@@ -24,7 +24,9 @@
 #            Then each selected HOST (the manifest's `hosts`), after every package repository: the same pin resolution
 #            (the train version for an in-train package, else its newest published release or main's carried pin), its
 #            build target built and its test target tested against the local feed. Hosts are never packed or published; a
-#            host failure fails the train here, before publish. A host is in the train when its ref has commits main lacks
+#            host failure fails the train here, before publish. A failure does not stop the step: every repository and
+#            host that does not depend on the one that failed is still built and tested, and the step then fails naming
+#            every failure, so one run reports all of them. A host is in the train when its ref has commits main lacks
 #            or a package it references is in the train.
 #   publish  only when every selected repository built and passed: pushes each package, in order, --skip-duplicate.
 #   promote  per repository: pushes the train's pin commit to `ref` when that still fast-forwards (when a lane merged
@@ -90,6 +92,10 @@ on:
       dotnet-version:
         type: string
         default: "10.0.x"
+      runner:
+        description: The runner label the train job runs on. The host test suites are CPU-bound, so a larger runner shortens the train roughly in proportion to its cores
+        type: string
+        default: ubuntu-latest
     secrets:
       repos-token:
         description: Reads every manifest repository; on a live train also pushes main and train/* tags, and with `split` it creates that branch
@@ -120,7 +126,7 @@ permissions:
 jobs:
   train:
     if: ${{ vars.ACTIONS_BUDGET_STATE != 'hard' || inputs.override }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
     # One train at a time per organization, and a train is never cancelled half-way: a killed publish strands a
     # half-train on the feed.
@@ -1189,6 +1195,7 @@ jobs:
                       "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
 
+              log(f"\nRunner: {os.cpu_count()} CPU(s).")
               log(f"\nTrain {version} ({'dry run' if dry_run else 'live'}), ref {ref}" +
                   (" with overrides " + ", ".join(f"{n}={r}" for n, r in sorted(overrides.items())) if overrides else ""))
               log(f"Repository order: {' -> '.join(repo_order)}" + (f", then hosts {', '.join(hosts)}" if hosts else ""))
@@ -1212,70 +1219,101 @@ jobs:
               version, env = plan["version"], dotnet_env()
               PACK.mkdir(exist_ok=True)
               packages = []
+              # One run reports every failure: a repository or host that fails does not stop the ones that do not depend on
+              # it. `failed` maps a name to what failed; `blocked` maps a name to the failed or blocked repositories it needs.
+              # The step still fails when either is non-empty, so nothing is published.
+              owner = {project["id"]: name for name in plan["repo_order"] for project in plan["repos"][name]["projects"]}
+              failed, blocked = {}, {}
               # Hosts come last: they consume packages and produce none, so every package they could restore from this train
               # is in the local feed by then. Their exact pins resolve exactly as a package's do (the train version for an
               # in-train package, else newest(published, carry)), they are built and tested, never packed, and a failure here
               # fails the train before anything is published.
               for name in plan["selected"] + plan.get("hosts_selected", []):
                   repo = plan["repos"][name]
-                  src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
-                  log(f"::group::{name}")
-                  # Exact pins on in-train packages move to the train version first, in the source tree, before any copy: the
-                  # train is the one place that knows the version it is about to publish. On a live train that edit is
-                  # committed on top of the ref (only the project files, never the nuget.config edit below), so main and the
-                  # ref receive exactly what was packed. A dry run keeps the edit in the runner's copy only.
-                  if repo.get("reconcile") and not plan["dry_run"]:
-                      # main is ahead of the ref by an earlier train's commits only (see plan). Record main as merged, keeping
-                      # the ref's tree exactly: the pins below re-derive what those commits set, so main fast-forwards to
-                      # this train's sha and the build still tests exactly the ref plus this train's pins.
-                      repo["sha"] = train_commit(src, ["merge", "-q", "-s", "ours", "--no-ff", "-m",
-                                                       f"[train {version}] reconcile main's train commits into {plan['ref']}",
-                                                       repo["reconcile"]])
-                      repo["train_commits"] = True
-                  pins = pin_train_versions(src, train_ids, version, newest(plan.get("published"), repo.get("carry")))
-                  repo["pins"] = [list(p) for p in pins]
-                  if pins:
-                      log(f"{name}: pinned {len(pins)} reference(s): " +
-                          ", ".join(sorted({f'{pid} ({old} -> {new})' for _, pid, old, new in pins})))
-                      if not plan["dry_run"]:
-                          repo["sha"] = commit_pins(src, pins, version)
-                          repo["train_commits"] = True
-                  if repo.get("host"):
-                      point_at_local_feed(src, train_ids)
-                      build_host(repo, src, env)
-                      log("::endgroup::")
-                      log(f"{name} (host): built and tested at {version}, nothing packed")
+                  needs = ({owner[p] for p in repo.get("consumes", []) if p in owner} if repo.get("host")
+                           else set(plan["repo_edges"].get(name, [])))
+                  broken = sorted(n for n in needs if n in failed or n in blocked)
+                  if broken:
+                      blocked[name] = broken
+                      log(f"{name}: not built, it needs {', '.join(broken)}")
                       continue
-                  # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
-                  if pack.exists():
-                      shutil.rmtree(pack)
-                  shutil.copytree(src, pack, symlinks=True)
-                  for tree in (src, pack):
-                      point_at_local_feed(tree, train_ids)
-                  # Pack before testing: a pin bumped to the train version can only restore once the upstream package is in
-                  # the local feed, and the project order puts it there first. Publishing is still gated on the tests below.
-                  for path in repo["ships"]:
-                      run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
-                           f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
-                           "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
-                  for path in repo["ships"]:
-                      project = next(p for p in repo["projects"] if p["path"] == path)
-                      packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
-                  if repo["test"]:
-                      args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
-                      if repo["source_graph"]:
-                          args.append(f"-p:{SWITCH}=true")
-                      args += repo["test-args"].split() if repo["test-args"] else []
-                      # test-env: the manifest's acknowledgements for the runner, e.g. a suite's "no emulator here" variable.
-                      run(args, cwd=src, env={**env, **repo.get("test-env", {})})
-                  else:
-                      log(f"{name}: tests skipped (\"test\": false in the manifest)")
-                  log("::endgroup::")
-                  log(f"{name}: {len(repo['ships'])} package(s) at {version}" +
-                      (f"; {len(repo['project_order']) - len(repo['ships'])} unchanged, not packed"
-                       if len(repo["ships"]) < len(repo["project_order"]) else ""))
-              plan["packages"] = packages
+                  log(f"::group::{name}")
+                  try:
+                      packages += build_repo(plan, name, repo, train_ids, version, env)
+                  except TrainError as error:
+                      log("::endgroup::")
+                      failed[name] = str(error)
+                      log(f"::error::{name}: {redact(str(error))}")
+              # publish reads this list, so it stays empty unless every repository and host passed.
+              plan["packages"] = [] if failed else packages
+              plan["failed"], plan["blocked"] = failed, blocked
               PLAN.write_text(json.dumps(plan, indent=2))
+              if failed:
+                  raise TrainError(f"{len(failed)} failed: {', '.join(failed)}" +
+                                   (f"; not built because of them: {', '.join(blocked)}" if blocked else "") +
+                                   ". Nothing is published.")
+
+
+          def build_repo(plan, name, repo, train_ids, version, env):
+              """Build, pack and test one selected repository (or build and test one host); returns the packages it packed.
+              Raises TrainError where it fails; cmd_build decides what still runs after that."""
+              packages = []
+              src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
+              # Exact pins on in-train packages move to the train version first, in the source tree, before any copy: the
+              # train is the one place that knows the version it is about to publish. On a live train that edit is
+              # committed on top of the ref (only the project files, never the nuget.config edit below), so main and the
+              # ref receive exactly what was packed. A dry run keeps the edit in the runner's copy only.
+              if repo.get("reconcile") and not plan["dry_run"]:
+                  # main is ahead of the ref by an earlier train's commits only (see plan). Record main as merged, keeping
+                  # the ref's tree exactly: the pins below re-derive what those commits set, so main fast-forwards to
+                  # this train's sha and the build still tests exactly the ref plus this train's pins.
+                  repo["sha"] = train_commit(src, ["merge", "-q", "-s", "ours", "--no-ff", "-m",
+                                                   f"[train {version}] reconcile main's train commits into {plan['ref']}",
+                                                   repo["reconcile"]])
+                  repo["train_commits"] = True
+              pins = pin_train_versions(src, train_ids, version, newest(plan.get("published"), repo.get("carry")))
+              repo["pins"] = [list(p) for p in pins]
+              if pins:
+                  log(f"{name}: pinned {len(pins)} reference(s): " +
+                      ", ".join(sorted({f'{pid} ({old} -> {new})' for _, pid, old, new in pins})))
+                  if not plan["dry_run"]:
+                      repo["sha"] = commit_pins(src, pins, version)
+                      repo["train_commits"] = True
+              if repo.get("host"):
+                  point_at_local_feed(src, train_ids)
+                  build_host(repo, src, env)
+                  log("::endgroup::")
+                  log(f"{name} (host): built and tested at {version}, nothing packed")
+                  return packages
+              # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
+              if pack.exists():
+                  shutil.rmtree(pack)
+              shutil.copytree(src, pack, symlinks=True)
+              for tree in (src, pack):
+                  point_at_local_feed(tree, train_ids)
+              # Pack before testing: a pin bumped to the train version can only restore once the upstream package is in
+              # the local feed, and the project order puts it there first. Publishing is still gated on the tests below.
+              for path in repo["ships"]:
+                  run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
+                       f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
+                       "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
+              for path in repo["ships"]:
+                  project = next(p for p in repo["projects"] if p["path"] == path)
+                  packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
+              if repo["test"]:
+                  args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
+                  if repo["source_graph"]:
+                      args.append(f"-p:{SWITCH}=true")
+                  args += repo["test-args"].split() if repo["test-args"] else []
+                  # test-env: the manifest's acknowledgements for the runner, e.g. a suite's "no emulator here" variable.
+                  run(args, cwd=src, env={**env, **repo.get("test-env", {})})
+              else:
+                  log(f"{name}: tests skipped (\"test\": false in the manifest)")
+              log("::endgroup::")
+              log(f"{name}: {len(repo['ships'])} package(s) at {version}" +
+                  (f"; {len(repo['project_order']) - len(repo['ships'])} unchanged, not packed"
+                   if len(repo["ships"]) < len(repo["project_order"]) else ""))
+              return packages
 
 
           def build_host(repo, src, env):
@@ -1548,6 +1586,12 @@ jobs:
               elif plan["packages"]:
                   lines += ["", "| package | version | in-train dependencies |", "|---|---|---|"]
                   lines += [f"| {p['id']} | {p['version']} | {', '.join(p['dependencies']) or '—'} |" for p in plan["packages"]]
+              if plan.get("failed"):
+                  lines += ["", f"❌ **Failed** ({len(plan['failed'])}; nothing is published):", ""]
+                  lines += [f"- {name}: {redact(reason)}" for name, reason in plan["failed"].items()]
+                  if plan.get("blocked"):
+                      lines += ["", "Not built, because something they need failed: " +
+                                ", ".join(f"{name} (needs {', '.join(needs)})" for name, needs in plan["blocked"].items()) + "."]
               if plan["promoted"]:
                   lines += ["", f"Promoted (main fast-forwarded, tagged `train/{plan['version']}`): {', '.join(plan['promoted'])}."]
               if plan.get("release_behind"):
@@ -1650,7 +1694,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-train-${{ steps.plan.outputs.version }}
-          path: _train/feed/*.nupkg
+          path: |
+            _train/feed/*.nupkg
+            _train/plan.json
           retention-days: 7
 
       - name: Publish

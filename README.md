@@ -121,7 +121,9 @@ Only when every selected repository has passed does the train push the packages,
 `--skip-duplicate`. It then fast-forwards `main` to `ref` in each repository (a plain push, never forced) and tags
 `train/<version>`. The plan step refuses a repository whose `main` is not an ancestor of `ref`, so a train never
 publishes something it cannot promote; a dry run promotes nothing, so there it is a warning in the summary instead
-and the branch is still built and tested. A failure anywhere publishes nothing.
+and the branch is still built and tested. A failure anywhere publishes nothing. A failure
+does not stop the build step: every repository and host that does not depend on the one that failed is still built and
+tested, and the step then fails naming every failure and what was not built because of it, so one run reports them all.
 
 Put the wrapper in the tenant's aggregator repository (meshNet for meshNet). It has **no schedule**: a release is
 proposed (when its planned group of work is done, or after a few days of accumulated work) and is dispatched live
@@ -161,6 +163,7 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | `ref` | the branch the train assembles from in every manifest repository; default `release`. A repository without it fails the run |
 | `ref-overrides` | dry runs only: `repo=ref` entries, one per line or comma-separated, taken at that branch instead of `ref`, so a lane branch can ride a rehearsal before it merges (`meshNet.Pay=wip/pay`). Conflicting refs for the same repository fail before checkout or deletion of existing work; identical repeated assignments are accepted. A live train with any override refuses to start, and a name that is not in the manifest fails the plan |
 | `split` | a branch name that cuts this release off `ref`. Before the plan, every manifest repository (hosts too) that has no branch of that name gets one at `ref`'s tip; a repository that already has it is left exactly as it is. The train then assembles from the split branch and a live train promotes it, so lanes keep merging into `ref` while the release is settled: a fix for the release merges into the split branch (and into `ref`), and a second dispatch with the same `split` continues the same release without picking up anything merged into `ref` since. A dry run splits too (a branch is created; nothing is published and neither `ref` nor main moves). Refused: `main`, `ref` itself, a name git cannot keep beside `ref` (`release/1` beside `release`; use `release-2026-01-31`), and a repository that has neither branch (nothing is created). After a live split train, main is ahead of `ref` by the train's own commits, which the next train from `ref` reconciles; a fix that was merged only into the split branch must be merged into `ref` first, and that train says so |
+| `runner` | the runner label the train job runs on; default `ubuntu-latest`. The host test suites are CPU-bound (the plan logs the runner's CPU count), so a larger runner shortens the train roughly in proportion to its cores |
 | `dry-run` | build, test and pack only, then upload the local feed; default `true` |
 | `override` | run even when the org variable `ACTIONS_BUDGET_STATE` is `hard`. The train runs at `soft`; at `hard` only an override runs |
 | `dotnet-version` | default `10.0.x` |

@@ -116,6 +116,64 @@ class Unit(unittest.TestCase):
             self.train.promote_all(plan, ["Lib"])
         self.assertEqual(out.read_text(), "hosts-promoted=\n")
 
+    def test_a_failure_stops_only_what_depends_on_it_and_the_build_names_every_failure(self):
+        # One run reports everything: Low fails, so Mid (which needs Low) and the host that consumes Mid are not built,
+        # while Side and the host that consumes only Side still are. A second, independent failure is named too. The
+        # package list publish reads stays empty.
+        from unittest.mock import patch
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+
+        def repo(name, deps=(), **extra):
+            return {"repo": name, "projects": [{"id": f"{name}.Lib"}], **extra}
+
+        plan = {"version": "0.0.1", "train_ids": ["Low.Lib", "Mid.Lib", "Side.Lib"], "dry_run": True,
+                "repo_order": ["Low", "Mid", "Side"], "selected": ["Low", "Mid", "Side"],
+                "repo_edges": {"Low": [], "Mid": ["Low"], "Side": []},
+                "hosts": ["Api", "Auth", "Pay"], "hosts_selected": ["Api", "Auth", "Pay"], "packages": [],
+                "repos": {"Low": repo("Low"), "Mid": repo("Mid"), "Side": repo("Side"),
+                          "Api": {"repo": "Api", "host": True, "projects": [], "consumes": ["Mid.Lib", "Side.Lib"]},
+                          "Auth": {"repo": "Auth", "host": True, "projects": [], "consumes": ["Side.Lib"]},
+                          "Pay": {"repo": "Pay", "host": True, "projects": [], "consumes": ["Side.Lib"]}}}
+        self.train.PLAN.write_text(json.dumps(plan))
+        built = []
+
+        def build_repo(plan, name, repo, train_ids, version, env):
+            built.append(name)
+            if name in ("Low", "Pay"):
+                raise self.train.TrainError(f"command failed (1): dotnet test {name}")
+            return [] if repo.get("host") else [{"repo": name, "id": f"{name}.Lib", "version": version}]
+
+        with patch.object(self.train, "build_repo", build_repo):
+            with self.assertRaises(self.train.TrainError) as raised:
+                self.train.cmd_build()
+        self.assertEqual(built, ["Low", "Side", "Auth", "Pay"])
+        self.assertIn("2 failed: Low, Pay; not built because of them: Mid, Api. Nothing is published.", str(raised.exception))
+        state = json.loads(self.train.PLAN.read_text())
+        self.assertEqual(sorted(state["failed"]), ["Low", "Pay"])
+        self.assertEqual(state["blocked"], {"Mid": ["Low"], "Api": ["Mid"]})
+        self.assertEqual(state["packages"], [])
+        summary = Path(self.tmp.name) / "summary.md"
+        state.update(ref="release", promoted=[], repo_order=["Low", "Mid", "Side"],
+                     repos={n: {**r, "selected": True, "reason": "changed"} for n, r in state["repos"].items()})
+        self.train.PLAN.write_text(json.dumps(state))
+        with patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(summary)):
+            self.train.cmd_record()
+        text = summary.read_text()
+        self.assertIn("**Failed** (2; nothing is published)", text)
+        self.assertIn("- Low: command failed (1): dotnet test Low", text)
+        self.assertIn("Not built, because something they need failed: Mid (needs Low), Api (needs Mid).", text)
+
+        # Every repository and host passing: the packages are listed for publish, nothing is recorded as failed.
+        built.clear()
+        self.train.PLAN.write_text(json.dumps(plan))
+        with patch.object(self.train, "build_repo", lambda plan, name, repo, *a: built.append(name) or (
+                [] if repo.get("host") else [{"repo": name, "id": f"{name}.Lib"}])):
+            self.train.cmd_build()
+        self.assertEqual(built, ["Low", "Mid", "Side", "Api", "Auth", "Pay"])
+        state = json.loads(self.train.PLAN.read_text())
+        self.assertEqual([p["id"] for p in state["packages"]], ["Low.Lib", "Mid.Lib", "Side.Lib"])
+        self.assertEqual((state["failed"], state["blocked"]), ({}, {}))
+
     def test_a_host_whose_main_moved_but_whose_tag_push_failed_is_still_named_for_the_deploy(self):
         # The real promote_repo against a stubbed git: main's push succeeds, the tag push fails. The host is stranded
         # (not tagged), but prod would lag main without a deploy, so hosts-promoted still names it.
