@@ -50,6 +50,13 @@
 # is settled on the split branch, and a second dispatch with the same name continues the same release. A dry run splits
 # too (a branch is created, nothing is published or promoted).
 #
+# release-build (a run id, or `latest`) releases a build that was ALREADY tested instead of building it again: it takes
+# the artifact a successful test build (dry run) uploaded, checks that every commit that build tested is still on the
+# ref and that main has not moved under it, commits exactly the pins the build tested, publishes exactly the packages it
+# packed and promotes. No plan, no build, no tests: minutes instead of the full suite. It refuses a build assembled with
+# ref overrides, from another ref, with a failure, or already released, and a release whose pins would differ from the
+# tested ones. With dry-run it checks and reports, publishing and pushing nothing.
+#
 # dry-run (the default until the first real train) stops after build and uploads the local feed as an artifact.
 # The job skips while the org's ACTIONS_BUDGET_STATE is `hard`, unless `override` is set (the hotfix reserve).
 name: dotnet release train (reusable)
@@ -71,6 +78,10 @@ on:
         default: ""
       split:
         description: "A branch name to split this release off `ref`: created at `ref`'s tip in every manifest repository that lacks it (also on a dry run), left alone where it exists; the train assembles from it and a live train promotes it, while `ref` keeps taking new work"
+        type: string
+        default: ""
+      release-build:
+        description: "Release an already-tested build without rebuilding: the run id of a successful test build (dry run) of this workflow, or `latest`. Publishes the packages that run packed and promotes the commits it tested; refused when the ref, main or the pins no longer match what was tested"
         type: string
         default: ""
       promote-only:
@@ -98,7 +109,7 @@ on:
         default: ubuntu-latest
     secrets:
       repos-token:
-        description: Reads every manifest repository; on a live train also pushes main and train/* tags, and with `split` it creates that branch
+        description: Reads every manifest repository; on a live train also pushes main and train/* tags, and with `split` it creates that branch; with `release-build` it also reads the calling repository's workflow runs and artifacts
         required: true
       packages-token:
         description: read:packages for restore; on a live train also write:packages for the push
@@ -134,7 +145,7 @@ jobs:
       group: release-train-${{ github.repository_owner }}
       cancel-in-progress: false
     outputs:
-      version: ${{ steps.plan.outputs.version || steps.promote-only.outputs.version }}
+      version: ${{ steps.plan.outputs.version || steps.release-build.outputs.version || steps.promote-only.outputs.version }}
       hosts-promoted: ${{ steps.promote.outputs.hosts-promoted || steps.promote-only.outputs.hosts-promoted }}
     env:
       TRAIN_WORK: ${{ github.workspace }}/_train
@@ -182,11 +193,14 @@ jobs:
                       command fails naming them
             record    write the run summary and, when MERRYN_URL is set, POST the release record to it
 
+            release-build (instead of plan and build) release the test build under TRAIN_BUILD: check it, clone its repos,
+                      commit the pins it tested, hand its packages to publish and its commits to promote
+
             promote-only  (instead of plan..promote) finish a stranded promotion: TRAIN_VERSION names an already-published
                       train, TRAIN_PROMOTE lists repo=sha; every sha must be on TRAIN_REF (or main) with main its ancestor
                       (or ahead by train commits only), checked before anything is pushed
 
-          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_REF_OVERRIDES, TRAIN_SPLIT, TRAIN_DRY_RUN, TRAIN_VERSION, TRAIN_PROMOTE, TRAIN_FEED,
+          Environment: TRAIN_WORK, TRAIN_MANIFEST, TRAIN_REF, TRAIN_REF_OVERRIDES, TRAIN_SPLIT, TRAIN_BUILD, TRAIN_BUILD_RUN, TRAIN_DRY_RUN, TRAIN_VERSION, TRAIN_PROMOTE, TRAIN_FEED,
           REPOS_TOKEN, PACKAGES_TOKEN, MERRYN_URL, MERRYN_TOKEN; GITHUB_STEP_SUMMARY, GITHUB_OUTPUT and GITHUB_SERVER_URL as
           Actions sets them.
           """
@@ -1412,6 +1426,129 @@ jobs:
               promote_all(plan, [n for n in plan["selected"] + plan.get("hosts_selected", []) if n not in plan["promoted"]])
 
 
+          def find_build(root):
+              """The folder of a downloaded test-build artifact under root: the one holding plan.json (root itself, or the one
+              artifact folder inside it)."""
+              root = Path(root)
+              candidates = [root, *sorted(p for p in root.iterdir() if p.is_dir())] if root.is_dir() else []
+              found = [c for c in candidates if (c / "plan.json").is_file()]
+              if len(found) != 1:
+                  raise TrainError(f"expected one test build with a plan.json under {root}, found {len(found)}. A test build is a "
+                                   f"successful dry run of this workflow; its artifact is release-train-<version>.")
+              return found[0]
+
+
+          def cmd_release_build():
+              """Release a build that was already tested, without building it again. TRAIN_BUILD holds the artifact of a successful
+              test build (a dry run): its plan.json and the packages it packed. This command is the plan and build steps of a live
+              train with the building left out: it clones every repository and host that build selected, checks each is still
+              what was tested, commits the pins the build applied (a dry run keeps them in the runner's copy only), and leaves
+              plan.json and the feed exactly as a live build would, so the ordinary publish and promote steps finish the release.
+
+              What makes it the tested build, checked before anything is written:
+                - the artifact is a test build's: a dry run, with no failure, no ref override, assembled from this release's ref,
+                  every package it lists present;
+                - in each repository the tested commit is still on the ref (the ref may have moved on; what a lane merged since
+                  waits for the next build), the train tag does not exist yet, and main is an ancestor of the tested commit or
+                  ahead of it by train commits only;
+                - the pins this release commits are exactly the pins the build recorded. They are derived the same way (the
+                  train version, the feed releases the build saw, the pins main carries), so a difference means main moved
+                  since the build and the tree that would be promoted is not the tree that was tested.
+              On a dry run nothing is committed, published or pushed: the checks run and the summary says what would happen."""
+              manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
+              ref = train_ref()
+              dry_run = os.environ.get("TRAIN_DRY_RUN", "true").lower() != "false"
+              build = find_build(os.environ.get("TRAIN_BUILD", ""))
+              saved = json.loads((build / "plan.json").read_text())
+              built_by = os.environ.get("TRAIN_BUILD_RUN", "").strip()
+              names = list(saved.get("selected", [])) + list(saved.get("hosts_selected", []))
+              packages = saved.get("packages", [])
+              version = str(saved.get("version", ""))
+              known = {r["repo"] for r in manifest["repos"] + manifest["hosts"]}
+              problems = []
+              if saved.get("dry_run") is not True or saved.get("mode"):
+                  problems.append("it is not a test build (a dry run)")
+              if saved.get("failed") or saved.get("blocked"):
+                  problems.append("it failed: " + ", ".join(list(saved.get("failed") or {}) + list(saved.get("blocked") or {})))
+              if saved.get("overrides"):
+                  problems.append("it was assembled with ref overrides (" + ", ".join(sorted(saved["overrides"])) +
+                                  "), so it is not what the ref holds")
+              if saved.get("ref") != ref:
+                  problems.append(f"it was assembled from '{saved.get('ref')}', and this release is from '{ref}'")
+              if saved.get("org") != manifest["org"]:
+                  problems.append(f"it belongs to '{saved.get('org')}', not '{manifest['org']}'")
+              if not VERSION.fullmatch(version):
+                  problems.append(f"its version '{version}' is not a train version")
+              if not names:
+                  problems.append("it selected nothing, so there is nothing to release")
+              if sorted(set(names) - known):
+                  problems.append("it names repositories that are not in the manifest: " + ", ".join(sorted(set(names) - known)))
+              if {p.get("id") for p in packages} != set(saved.get("train_ids", [])):
+                  problems.append("its package list does not match the packages it selected (the build did not finish)")
+              absent = [p.get("file", "?") for p in packages if not (build / "feed" / str(p.get("file", ""))).is_file()]
+              if absent:
+                  problems.append("its artifact lacks " + ", ".join(absent))
+              if problems:
+                  raise TrainError(f"cannot release test build {built_by or build.name}: " + "; ".join(problems) + ".")
+
+              if WORK.exists():
+                  shutil.rmtree(WORK)
+              SRC.mkdir(parents=True)
+              FEED.mkdir(parents=True)
+              for package in packages:
+                  shutil.copy2(build / "feed" / package["file"], FEED / package["file"])
+              tag = f"train/{version}"
+              train_ids = set(saved["train_ids"])
+              manifest_ids = set(saved.get("decisions") or {}) | train_ids
+              plan = {**saved, "dry_run": dry_run, "mode": "release-build", "built_by": built_by, "promoted": [], "stranded": [],
+                      "release_behind": [], "release_refused": [], "main_moved": [], "failed": {}, "blocked": {}}
+              for name in names:
+                  repo, dest = plan["repos"][name], checkout_dir(SRC, name)
+                  tip = clone(manifest["org"], name, ref, dest)
+                  main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
+                  base = repo.get("base", "")
+                  if not has_commit(dest, base) or not is_ancestor(dest, base, tip):
+                      problems.append(f"{name}: {base[:12]}, the commit the build tested, is not on {ref} ({tip[:12]})")
+                      continue
+                  if git(["tag", "--list", tag], cwd=dest, capture=True).strip():
+                      problems.append(f"{name}: {tag} already exists; this build was released")
+                      continue
+                  reconcile = not is_ancestor(dest, main, base)
+                  if reconcile and not only_train_commits(dest, base, main):
+                      problems.append(f"{name}: main ({main[:12]}) has commits the tested commit {base[:12]} lacks that no train made, "
+                                      f"so main cannot fast-forward to it")
+                      continue
+                  git(["checkout", "-q", "--detach", base], cwd=dest)
+                  repo.update(ref=ref, sha=base, main=main)
+                  repo.pop("train_commits", None)
+                  tested = sorted(tuple(p) for p in repo.get("pins", []))
+                  if reconcile and not dry_run:
+                      # main is ahead by an earlier train's commits only: record it as merged, keeping the tested tree (as build does).
+                      repo["sha"] = train_commit(dest, ["merge", "-q", "-s", "ours", "--no-ff", "-m",
+                                                        f"[train {version}] reconcile main's train commits into {ref}", main])
+                      repo["train_commits"] = True
+                  carry = pins_at(dest, main, manifest_ids) if reconcile else {}
+                  pins = pin_train_versions(dest, train_ids, version, newest(saved.get("published"), carry))
+                  if sorted(tuple(p) for p in pins) != tested:
+                      problems.append(f"{name}: the pins this release would commit are not the pins the build tested "
+                                      f"({len(pins)} now, {len(tested)} tested), so main moved since the build. Run a new test build")
+                      continue
+                  repo["pins"] = [list(p) for p in pins]
+                  if pins and not dry_run:
+                      repo["sha"] = commit_pins(dest, pins, version)
+                      repo["train_commits"] = True
+                  log(f"{name}{' (host)' if repo.get('host') else ''}: tested at {base[:12]}, {ref} {tip[:12]}, main {main[:12]} -> "
+                      f"{repo['sha'][:12]}{', with ' + str(len(pins)) + ' pin(s)' if pins else ''}")
+              if problems:
+                  raise TrainError(f"cannot release test build {built_by or build.name}: " + "; ".join(problems) + ".")
+              PLAN.write_text(json.dumps(plan, indent=2))
+              log(f"\nTest build {built_by or build.name} ({version}) is what {ref} was tested as: "
+                  f"{len(packages)} package(s), {len(names)} repository(ies) and host(s)" +
+                  (". Dry run: nothing is published or pushed." if dry_run else "; publishing and promoting it without a rebuild."))
+              output("version", version)
+              output("selected", ",".join(names))
+
+
           def cmd_promote_only():
               """Finish a stranded promotion with the train's identity instead of by hand: for an already-published train
               version, fast-forward main and tag train/<version> at the given shas. Builds and publishes nothing. Each sha must
@@ -1553,7 +1690,8 @@ jobs:
                   log("No plan was written; nothing to record.")
                   return
               plan = json.loads(PLAN.read_text())
-              mode = ("dry run" if plan["dry_run"] else "live") + (", promote-only" if plan.get("mode") == "promote-only" else "")
+              mode = ("dry run" if plan["dry_run"] else "live") + (", promote-only" if plan.get("mode") == "promote-only" else "") + (
+                  f", test build {plan.get('built_by') or '?'} released without a rebuild" if plan.get("mode") == "release-build" else "")
               ref_line = (f"Ref `{plan['ref']}`" + (f" (split off `{plan['split_from']}`)" if plan.get("split_from") else "") +
                           f". Order: {' → '.join(plan['repo_order'])}.")
               if plan.get("overrides"):
@@ -1645,7 +1783,7 @@ jobs:
 
 
           COMMANDS = {"split": cmd_split, "plan": cmd_plan, "build": cmd_build, "publish": cmd_publish, "promote": cmd_promote,
-                      "promote-only": cmd_promote_only, "record": cmd_record}
+                      "release-build": cmd_release_build, "promote-only": cmd_promote_only, "record": cmd_record}
 
           if __name__ == "__main__":
               if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
@@ -1658,7 +1796,7 @@ jobs:
           TRAIN_PY
 
       - name: Split (cut this release off the ref)
-        if: ${{ inputs.split != '' && inputs.promote-only == '' }}
+        if: ${{ inputs.split != '' && inputs.promote-only == '' && inputs.release-build == '' }}
         env:
           TRAIN_MANIFEST: caller/${{ inputs.manifest }}
           REPOS_TOKEN: ${{ secrets.repos-token }}
@@ -1666,7 +1804,7 @@ jobs:
 
       - name: Plan (clone, sort, select, stamp)
         id: plan
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && inputs.release-build == '' }}
         env:
           TRAIN_MANIFEST: caller/${{ inputs.manifest }}
           REPOS_TOKEN: ${{ secrets.repos-token }}
@@ -1676,7 +1814,7 @@ jobs:
       # Keyed on the cloned repositories' project files (no packages.lock.json: a lock file would pin every
       # Version="*" float to its last resolution).
       - name: Cache NuGet packages
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && inputs.release-build == '' }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
@@ -1699,15 +1837,54 @@ jobs:
             _train/plan.json
           retention-days: 7
 
+      # release-build: the artifact of a test build that already passed, found here (`latest`: the newest successful
+      # run of the calling workflow that still has one). The script decides whether it may be released.
+      - name: Download the tested build
+        id: tested
+        if: ${{ inputs.release-build != '' && inputs.promote-only == '' }}
+        env:
+          GH_TOKEN: ${{ secrets.repos-token }}
+          BUILD_RUN: ${{ inputs.release-build }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          run="$BUILD_RUN"
+          if [ "$run" = "latest" ]; then
+            run=""
+            for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW" --status success --limit 40 --json databaseId --jq '.[].databaseId'); do
+              count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" --jq '[.artifacts[] | select((.name | startswith("release-train-")) and (.expired | not))] | length')
+              if [ "$count" -ge 1 ]; then run="$id"; break; fi
+            done
+            if [ -z "$run" ]; then
+              echo "::error::No successful test build of '$WORKFLOW' with an unexpired release-train artifact was found."
+              exit 1
+            fi
+          fi
+          case "$run" in
+            ''|*[!0-9]*) echo "::error::release-build takes a run id or 'latest', got '$run'"; exit 1 ;;
+          esac
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --pattern 'release-train-*' --dir "$RUNNER_TEMP/train-build"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Release the tested build (check, pin, no rebuild)
+        id: release-build
+        if: ${{ inputs.release-build != '' && inputs.promote-only == '' }}
+        env:
+          TRAIN_MANIFEST: caller/${{ inputs.manifest }}
+          TRAIN_BUILD: ${{ runner.temp }}/train-build
+          TRAIN_BUILD_RUN: ${{ steps.tested.outputs.run }}
+          REPOS_TOKEN: ${{ secrets.repos-token }}
+        run: python3 "$RUNNER_TEMP/train.py" release-build
+
       - name: Publish
-        if: ${{ !inputs.dry-run && steps.plan.outputs.selected != '' }}
+        if: ${{ !inputs.dry-run && (steps.plan.outputs.selected != '' || steps.release-build.outputs.selected != '') }}
         env:
           PACKAGES_TOKEN: ${{ secrets.packages-token }}
         run: python3 "$RUNNER_TEMP/train.py" publish
 
       - name: Promote (fast-forward main, tag train/<version>)
         id: promote
-        if: ${{ !inputs.dry-run && steps.plan.outputs.selected != '' }}
+        if: ${{ !inputs.dry-run && (steps.plan.outputs.selected != '' || steps.release-build.outputs.selected != '') }}
         env:
           REPOS_TOKEN: ${{ secrets.repos-token }}
         run: python3 "$RUNNER_TEMP/train.py" promote
