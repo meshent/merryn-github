@@ -172,6 +172,8 @@ then dispatch it with `dry-run: false` once the owner says yes.
 | secret `dispatch-token` | accepted and unused: the caller deploys, once, from `hosts-promoted` |
 | secrets `merryn-url`, `merryn-token` | when set, a live train that published and promoted POSTs its release record (version, repos with their commits and the item keys found in their commit messages since the last tag, packages, run URL) to `merryn-url` with the token as a bearer. A failed POST warns and never fails a published train |
 | output `version` | the train version, which is also the `train/<version>` tag |
+| input `node-version` | the Node.js version the manifest's frontends' gates run on (default `22`) |
+| output `frontends-ready` | `repo=sha` entries, comma-separated: the manifest's `frontends` this live train selected, at the sha the plan archived for their gate. Set only when every gate passed in the `frontend-gates` job and the promote step promoted every repository and host it selected (empty on a dry run, when no frontend rode, when a gate failed, and when anything stranded). The caller's cue to promote them after its deploy: call this workflow again with `promote-only` set to it, `version` to the train version and `dry-run: false` (see the frontends paragraph below) |
 | output `hosts-promoted` | the hosts whose `main` this run moved, comma-separated; empty when none moved and on a dry run. Set even when the promote step fails on a stranded repository, for the hosts that did move. The caller's cue to start one deploy for the whole train: a job with `needs: train` and `if: ${{ !cancelled() && needs.train.outputs.hosts-promoted != '' }}` |
 
 **The manifest.** Repositories only. The order is computed, so list them in any order:
@@ -187,6 +189,9 @@ then dispatch it with `dry-run: false` once the owner says yes.
   ],
   "hosts": [
     { "repo": "meshNet", "build": "meshNet.Api.slnx", "solution": "meshNet.Tests.slnx", "deploy": "dispatch-deploy" }
+  ],
+  "frontends": [
+    { "repo": "meshNet.Web.Vocab", "gate": ["npm ci", "node --test test/*.test.mjs", "npm run build"] }
   ]
 }
 ```
@@ -214,6 +219,46 @@ repositories. The train deploys nothing: it names the hosts whose `main` moved i
 starts one deploy for the whole train after the last host moved. A host's own `main` push workflow should not deploy
 as well (with two hosts that was two full deploys per train, the first racing the second host's push). A host without the `ref` branch fails the
 plan, as a repository does.
+
+A `frontends` entry is a name, or an object with `repo` plus `gate`: the commands its own CI runs, in order, each
+through `bash` in the frontend's tree (so `test/*.test.mjs` expands). The default gate is `npm ci`, `npm test`,
+`npm run build`. A frontend is a static web client that deploys on a push to its own `main`: it has no `.csproj` the
+train reads, so it never owns or consumes a package. It is in the train when its ref has commits `main` lacks. While
+`main` has commits the ref lacks (a hand promotion through a merge PR leaves one: merge `main` into the ref once) the
+train leaves the frontend out with a warning, dry run or live, and everything else still ships: a frontend publishes
+nothing and nothing depends on it. The train job never runs a frontend's gate, because the gate runs the
+repository's scripts and every npm dependency's install script, and that job holds the tokens: the plan archives each
+selected frontend at its sha, and the `frontend-gates` job (one runner per frontend, `permissions: {}`, no secret)
+runs the gate on that archive, on a dry run too, with Node from the frontend's `.nvmrc` when it has one (else
+`node-version`), and adds a passed or failed line to the run summary. The train does **not** promote a frontend either: `frontends-ready`
+names them, at the archived sha, only when every gate passed and the train promoted every repository and host it
+selected. The gates are all or nothing: one failed gate holds back every frontend of that train, while the API it already
+promoted stays deployed (the summary says so). The caller promotes them after its deploy has finished, so a client never
+reaches `main` ahead of the API it calls. When the caller's deploy only dispatches another repository's deploy, put a job
+between them that waits for that run (meshNet's `await-deploy` does) and make `frontends` need it:
+
+```yaml
+  frontends:
+    needs: [train, deploy]
+    if: ${{ !cancelled() && needs.train.result == 'success' && needs.train.outputs.frontends-ready != '' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') }}
+    uses: meshent/merryn-github/.github/workflows/dotnet-release-train.yml@main
+    with:
+      manifest: release-train.json
+      dry-run: false
+      promote-only: ${{ needs.train.outputs.frontends-ready }}
+      version: ${{ needs.train.outputs.version }}
+    secrets:
+      repos-token: ${{ secrets.CI_PAT }}
+      packages-token: ${{ secrets.CI_PAT }}
+```
+
+That second call is the promote-only mode with frontends only (promote-only refuses a call that names a frontend beside
+a repository or host): it re-checks each sha against the ref and `main`, fast-forwards `main` and tags
+`train/<version>`, and publishes nothing. It queues in the train's concurrency group, which keeps one pending run: a
+train dispatched while it waits replaces it, and the run then shows the frontends job cancelled; finish it with
+promote-only and that run's `frontends-ready`. The run summary (and so a dry run's proposal)
+lists every frontend with why it rides and the item keys in its commits `main` lacks (what would reach `main`), and the
+gate jobs add their results to it.
 
 **Done** means the run is green. On a live train that also means the summary lists every package at one version and
 every selected repository promoted. The tag `train/<version>` exists in each one, and its `main` equals `ref`.

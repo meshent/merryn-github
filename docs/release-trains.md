@@ -244,6 +244,10 @@ maintained.
 }
 ```
 
+Static web clients (vo.cab, tip.vo.cab) are listed under `frontends` (coordinator:C142, 2026-11-23): their gate runs on
+the release tip in a job with no secret, and the caller promotes them, once the hosts' deploy has finished, in a job after its deploy, through promote-only with the
+train's version (the `frontends-ready` output). See the README's frontends paragraph.
+
 Mira gets the same shape with `Mira` as the one package repo and its tenant hosts (merryn-mira, meshNet.Tower) as hosts.
 
 ### 4. The one PR validation job (when asked for)
