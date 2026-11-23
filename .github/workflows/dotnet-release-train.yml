@@ -37,8 +37,8 @@
 #            names the hosts whose main moved, so the caller fires ONE deploy for the whole train once every host is on
 #            main (a deploy per host main push would start one full deploy per host).
 #            FRONTENDS (the manifest's `frontends`: static web clients, each {repo, gate}) are planned like a host that
-#            consumes nothing (in the train when their ref is ahead of main, refused live when main is not an ancestor of
-#            it) and NOT built or promoted in this job, which holds the tokens: the plan archives each at its sha, and the
+#            consumes nothing (in the train when their ref is ahead of main, left out with a warning while main is not
+#            an ancestor of it) and NOT built or promoted in this job, which holds the tokens: the plan archives each at its sha, and the
 #            `frontend-gates` job (one runner per frontend, `permissions: {}`, no secret) runs its gate on that archive,
 #            dry run or live. `frontends-ready` names them at that sha only when every gate passed and this job promoted
 #            every repository and host it selected. The caller promotes them after its deploy with promote-only and this
@@ -1307,6 +1307,10 @@ jobs:
                   log(f"  + {package_id}: {reason}")
               output("version", version)
               output("frontends-matrix", json.dumps(archive_frontends(plan), separators=(",", ":")))
+              # No NuGet cache for a tenant with frontends: their gates run untrusted npm code in this caller's cache scope,
+              # and a cache entry such code plants (under any key, after an eviction, or from another branch's scope) would
+              # be restored into this job, where restored packages' build targets run beside the tokens.
+              output("nuget-cache", "off" if manifest["frontends"] else "on")
               output("selected", ",".join(selected + hosts_selected + frontends_selected))
               if not selected + hosts_selected + frontends_selected:
                   log("Nothing changed since the last train; nothing to build.")
@@ -1797,12 +1801,13 @@ jobs:
         run: python3 "$RUNNER_TEMP/train.py" plan
 
       # Keyed on the cloned repositories' project files (no packages.lock.json: a lock file would pin every
-      # Version="*" float to its last resolution). Exact key only, no restore-keys prefix: the frontend-gates job runs
-      # untrusted npm code in this same run, and the Actions cache answers to its runtime token whatever its permissions,
-      # so it could save a `nuget-...-train-<anything>` entry that a prefix restore would hand the next train's build. The
-      # exact key is always taken before any gate runs (restored, or saved when this job ends), so a gate cannot plant it.
+      # Version="*" float to its last resolution). Off for a manifest with frontends (the plan's nuget-cache output): the
+      # frontend-gates job runs untrusted npm code in the caller's cache scope, and the Actions cache answers to a job's
+      # runtime token whatever its permissions, so such code could plant an entry (under a key this job will use, after an
+      # eviction, or from another branch) that a restore here would hand the build step and its tokens. Exact key only
+      # for the rest: no prefix restore.
       - name: Cache NuGet packages
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && steps.plan.outputs.nuget-cache == 'on' }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages

@@ -295,9 +295,10 @@ class Unit(unittest.TestCase):
         # GitHub refuses the runner context in a job's env (the whole workflow then fails to load): only in steps.
         for name, job in workflow["jobs"].items():
             self.assertNotIn("runner.", json.dumps(job.get("env", {})), name)
-        # No prefix restore of the NuGet cache a gate job could have planted an entry for.
+        # No prefix restore of the NuGet cache, and no cache at all for a manifest whose gates run in this cache scope.
         cache = next(st for st in workflow["jobs"]["train"]["steps"] if st.get("uses", "").startswith("actions/cache"))
         self.assertNotIn("restore-keys", cache["with"])
+        self.assertIn("steps.plan.outputs.nuget-cache == 'on'", cache["if"])
         ready = (workflow.get("on") or workflow[True])["workflow_call"]["outputs"]["frontends-ready"]["value"]
         self.assertEqual(ready, "${{ jobs.frontend-gates.result == 'success' && jobs.train.outputs.frontends-promotable || '' }}")
 
@@ -1150,6 +1151,7 @@ class Frontends(Fixture):
         self.assertEqual(plan.returncode, 0, plan.stdout)
         self.assertEqual((self.state()["frontends"], self.state()["frontends_selected"]), (["Web"], []))
         self.assertEqual(self.outputs()["frontends-matrix"], "[]")
+        self.assertEqual(self.outputs()["nuget-cache"], "off")                   # a manifest with frontends: no cache
         self.assertIn("Nothing changed since the last train", plan.stdout)
         sha = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
         plan = self.train("plan")
@@ -1220,6 +1222,31 @@ class Frontends(Fixture):
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn("promote-only promotes frontends in a call of their own", done.stdout)
         self.assertEqual((self.rev("Web", "main"), self.rev("Lib", "main")), mains)
+
+    def test_a_manifest_without_frontends_keeps_the_nuget_cache(self):
+        self.manifest([{"repo": "Lib", "test": False}])
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual(self.outputs()["nuget-cache"], "on")
+
+    def test_after_a_split_train_the_frontends_promote_only_takes_the_same_split(self):
+        # The README's after-deploy call passes the train's split: the gated sha is on the split branch, not on release.
+        self.feed_env.update(TRAIN_SPLIT="release-1")
+        self.assertEqual(self.train("split").returncode, 0)
+        sha = self.commit_to("Web", "release-1", {"src/index.html": "<p>split</p>"}, new=True)
+        self.live()
+        for command in ("plan", "build", "publish", "promote"):
+            done = self.train(command)
+            self.assertEqual(done.returncode, 0, f"{command}: {done.stdout}")
+        self.assertEqual(self.outputs()["frontends-promotable"], f"Web={sha}")
+        self.feed_env.update(TRAIN_PROMOTE=f"Web={sha}", TRAIN_VERSION=self.state()["version"])
+        without = dict(self.feed_env); without.pop("TRAIN_SPLIT")
+        refused = subprocess.run([sys.executable, self.script, "promote-only"], env=without, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)                # without the split: not on release
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Web", "main"), sha)
 
     def test_a_split_creates_the_branch_in_a_frontend_and_the_plan_reads_it_there(self):
         sha = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})

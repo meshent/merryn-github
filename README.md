@@ -245,12 +245,20 @@ between them that waits for that run (meshNet's `await-deploy` does) and make `f
     with:
       manifest: release-train.json
       dry-run: false
+      ref: ${{ inputs.ref || 'release' }}          # the same ref, split and override the train ran with:
+      split: ${{ inputs.split || '' }}             # promote-only checks each sha against that ref
+      override: ${{ inputs.override || false }}    # and skips under a hard budget without it
       promote-only: ${{ needs.train.outputs.frontends-ready }}
       version: ${{ needs.train.outputs.version }}
     secrets:
       repos-token: ${{ secrets.CI_PAT }}
       packages-token: ${{ secrets.CI_PAT }}
 ```
+
+A manifest with frontends runs without the NuGet cache: the gates run untrusted npm code in the caller's cache scope,
+and anything they could plant there would be restored into the job that holds the tokens. Removing a tenant's last
+frontend turns the cache back on, so delete that repository's `nuget-*-train-*` cache entries first
+(`gh cache delete --all` in the caller repository).
 
 That second call is the promote-only mode with frontends only (promote-only refuses a call that names a frontend beside
 a repository or host): it re-checks each sha against the ref and `main`, fast-forwards `main` and tags
