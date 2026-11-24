@@ -976,51 +976,6 @@ class Split(Fixture):
             self.assertEqual(self.module.train_ref(), "release-1")
 
 
-@unittest.skipUnless(shutil.which("git-lfs"), "needs git-lfs, as GitHub's ubuntu runner images have")
-class LfsDoesNotCarryTheToken(Fixture):
-    """coordinator:C149. GitHub's ubuntu runner images install git-lfs from its .deb, whose postinst runs
-    `git lfs install --system`, so every checkout runs the LFS smudge filter. A repository's .lfsconfig then names the
-    LFS server, and git-lfs sends it the train's -c http.extraHeader token. The train's git() must keep LFS off."""
-
-    def test_a_clone_of_a_repository_whose_lfsconfig_names_another_server_sends_it_nothing(self):
-        import http.server
-        import threading
-        seen = []
-
-        class Catch(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                seen.append((self.path, self.headers.get("Authorization")))
-                self.send_response(404)
-                self.end_headers()
-            do_GET = do_POST
-
-            def log_message(self, *args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), Catch)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.shutdown)
-        pointer = ("version https://git-lfs.github.com/spec/v1\n"
-                   "oid sha256:" + "a" * 64 + "\nsize 12\n")
-        self.repo("Lib", {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n",
-                          ".lfsconfig": f"[lfs]\n\turl = http://127.0.0.1:{server.server_port}/lfs\n",
-                          "blob.bin": pointer})
-        # The runner image's system config, as `git lfs install --system` writes it.
-        system = self.root / "gitconfig-system"
-        system.write_text("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n"
-                          "\tprocess = git-lfs filter-process\n\trequired = true\n")
-        env = {**self.feed_env, "GIT_CONFIG_SYSTEM": str(system), "REPOS_TOKEN": "c149-secret-token"}
-        script = ("import os, sys; sys.path.insert(0, os.path.dirname(sys.argv[1])); import importlib.util as u; "
-                  "s = u.spec_from_file_location('t', sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); "
-                  "print(m.clone('o', 'Lib', 'main', sys.argv[2]))")
-        done = subprocess.run([sys.executable, "-c", script, str(self.script), str(self.root / "clone")], env=env,
-                              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.assertEqual(done.returncode, 0, done.stdout)
-        self.assertEqual(seen, [], "git-lfs reached the .lfsconfig server during the train's clone")
-        self.assertEqual((self.root / "clone" / "blob.bin").read_text(), pointer)   # the pointer stays a pointer
-        self.assertNotIn("c149-secret-token", done.stdout)
-
-
 @unittest.skipUnless(os.environ.get("TRAIN_DOTNET"), "set TRAIN_DOTNET=1 to run the dotnet end-to-end tests")
 class EndToEnd(Fixture):
     def test_two_repos_pack_in_order_with_one_version_and_downstream_depends_on_the_train_version(self):
@@ -1810,6 +1765,51 @@ class EndToEnd(Fixture):
         self.assertIn('Include="Up.Lib" Version="0.0.1.1"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
         self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
+
+
+@unittest.skipUnless(shutil.which("git-lfs"), "needs git-lfs, as GitHub's ubuntu runner images have")
+class LfsDoesNotCarryTheToken(Fixture):
+    """coordinator:C149. GitHub's ubuntu runner images install git-lfs from its .deb, whose postinst runs
+    `git lfs install --system`, so every checkout runs the LFS smudge filter. A repository's .lfsconfig then names the
+    LFS server, and git-lfs sends it the train's -c http.extraHeader token. The train's git() must keep LFS off."""
+
+    def test_a_clone_of_a_repository_whose_lfsconfig_names_another_server_sends_it_nothing(self):
+        import http.server
+        import threading
+        seen = []
+
+        class Catch(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(404)
+                self.end_headers()
+            do_GET = do_POST
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Catch)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        pointer = ("version https://git-lfs.github.com/spec/v1\n"
+                   "oid sha256:" + "a" * 64 + "\nsize 12\n")
+        self.repo("Lib", {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+                          ".lfsconfig": f"[lfs]\n\turl = http://127.0.0.1:{server.server_port}/lfs\n",
+                          "blob.bin": pointer})
+        # The runner image's system config, as `git lfs install --system` writes it.
+        system = self.root / "gitconfig-system"
+        system.write_text("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n"
+                          "\tprocess = git-lfs filter-process\n\trequired = true\n")
+        env = {**self.feed_env, "GIT_CONFIG_SYSTEM": str(system), "REPOS_TOKEN": "c149-secret-token"}
+        script = ("import os, sys; sys.path.insert(0, os.path.dirname(sys.argv[1])); import importlib.util as u; "
+                  "s = u.spec_from_file_location('t', sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); "
+                  "print(m.clone('o', 'Lib', 'main', sys.argv[2]))")
+        done = subprocess.run([sys.executable, "-c", script, str(self.script), str(self.root / "clone")], env=env,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(seen, [], "git-lfs reached the .lfsconfig server during the train's clone")
+        self.assertEqual((self.root / "clone" / "blob.bin").read_text(), pointer)   # the pointer stays a pointer
+        self.assertNotIn("c149-secret-token", done.stdout)
 
 
 if __name__ == "__main__":
