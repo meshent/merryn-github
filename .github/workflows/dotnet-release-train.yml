@@ -36,11 +36,18 @@
 #            Selected hosts are promoted the same way, last. Nothing is dispatched from here: the `hosts-promoted` output
 #            names the hosts whose main moved, so the caller fires ONE deploy for the whole train once every host is on
 #            main (a deploy per host main push would start one full deploy per host).
+#            FRONTENDS (the manifest's `frontends`: static web clients, each {repo, gate}) are planned like a host that
+#            consumes nothing (in the train when their ref is ahead of main, left out with a warning while main is not
+#            an ancestor of it) and NOT built or promoted in this job, which holds the tokens: the plan archives each at its sha, and the
+#            `frontend-gates` job (one runner per frontend, `permissions: {}`, no secret) runs its gate on that archive,
+#            dry run or live. `frontends-ready` names them at that sha only when every gate passed and this job promoted
+#            every repository and host it selected. The caller promotes them after its deploy with promote-only and this
+#            version, so a client never reaches main ahead of the API it calls.
 #   record   writes the run summary and, when merryn-url is set, POSTs the release record.
 #
 # promote-only (recovery, with `version`) skips plan, build and publish: for a train whose packages are already on the
 # feed (every package of a named repo must be there at that version), or a host-only train that published nothing (every
-# entry a host), it fast-forwards main and tags train/<version> at the repo=sha entries it is given, re-deriving the pins
+# entry a host or a frontend: the caller's after-deploy promotion of frontends-ready is this case), it fast-forwards main and tags train/<version> at the repo=sha entries it is given, re-deriving the pins
 # that train packed,
 # and refuses any sha that is not on `ref` (or main). dry-run with promote-only checks and reports, pushing nothing.
 #
@@ -92,6 +99,10 @@ on:
       dotnet-version:
         type: string
         default: "10.0.x"
+      node-version:
+        description: The Node.js version the manifest's frontends' gates run on
+        type: string
+        default: "22"
       runner:
         description: The runner label the train job runs on. The host test suites are CPU-bound, so a larger runner shortens the train roughly in proportion to its cores
         type: string
@@ -119,6 +130,9 @@ on:
       hosts-promoted:
         description: "The hosts whose main this run moved, comma-separated (empty when none, and on a dry run): the caller's cue to deploy once"
         value: ${{ jobs.train.outputs.hosts-promoted }}
+      frontends-ready:
+        description: "repo=sha entries, comma-separated: the manifest's frontends this live train selected, set only when every one's gate passed in the frontend-gates job and the train promoted every repository and host it selected (empty on a dry run, when none rode, when a gate failed, or when anything stranded). The caller promotes them after its deploy by calling this workflow again with promote-only set to this and version to the train version"
+        value: ${{ jobs.frontend-gates.result == 'success' && jobs.train.outputs.frontends-promotable || '' }}
 
 permissions:
   contents: read
@@ -129,13 +143,17 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 180
     # One train at a time per organization, and a train is never cancelled half-way: a killed publish strands a
-    # half-train on the feed.
+    # half-train on the feed. The caller's after-deploy promote-only call for frontends queues in this group too, and GitHub
+    # keeps one pending run per group: a train dispatched while it waits replaces it, and that run's frontends are then not
+    # promoted (the run shows the frontends job cancelled; finish it with promote-only and that train's frontends-ready).
     concurrency:
       group: release-train-${{ github.repository_owner }}
       cancel-in-progress: false
     outputs:
       version: ${{ steps.plan.outputs.version || steps.promote-only.outputs.version }}
       hosts-promoted: ${{ steps.promote.outputs.hosts-promoted || steps.promote-only.outputs.hosts-promoted }}
+      frontends-matrix: ${{ steps.plan.outputs.frontends-matrix }}
+      frontends-promotable: ${{ steps.promote.outputs.frontends-promotable }}
     env:
       TRAIN_WORK: ${{ github.workspace }}/_train
       TRAIN_REF: ${{ inputs.ref }}
@@ -194,6 +212,7 @@ jobs:
           import json
           import os
           import re
+          import shlex
           import shutil
           import subprocess
           import sys
@@ -218,6 +237,9 @@ jobs:
           PLAN = WORK / "plan.json"
           LOCAL_SOURCE = "train-local"
           SWITCH = "UseProjectReferences"
+          # A frontend's gate when its manifest entry names none: what a static frontend's own CI runs.
+          DEFAULT_FRONTEND_GATE = ["npm ci", "npm test", "npm run build"]
+          FRONTENDS = WORK / "frontends"
           ITEM_KEY = re.compile(r"\b(?:[a-z][a-z-]*:[A-Z]{1,5}\d+|FEAT-\d{3,5})\b")
 
 
@@ -313,7 +335,22 @@ jobs:
               every = names + [h["repo"] for h in hosts]
               if len(set(n.lower() for n in every)) != len(every):
                   raise TrainError(f"{path}: a host is listed twice, or as both a repo and a host")
-              return {"org": org, "repos": repos, "hosts": hosts}
+              frontends = []
+              for entry in data.get("frontends", []):
+                  front = {"repo": entry} if isinstance(entry, str) else dict(entry)
+                  if not front.get("repo"):
+                      raise TrainError(f"{path}: every frontends entry needs a name: {entry!r}")
+                  gate = front.get("gate", DEFAULT_FRONTEND_GATE)
+                  if not (isinstance(gate, list) and gate and all(isinstance(c, str) and c.strip() for c in gate)):
+                      raise TrainError(f"{front['repo']}: a frontend's gate is a non-empty list of commands")
+                  # A frontend (a static web client) is neither packed nor built with dotnet. Its gate never runs in this
+                  # job, which holds the tokens: the plan archives the frontend at its sha and the frontend-gates job runs the
+                  # gate with no secret and no permission. The caller promotes it only after its deploy (frontends-ready).
+                  frontends.append({"repo": front["repo"], "frontend": True, "gate": list(gate), "test": False})
+              every += [f["repo"] for f in frontends]
+              if len(set(n.lower() for n in every)) != len(every):
+                  raise TrainError(f"{path}: a frontend is listed twice, or also as a repo or a host")
+              return {"org": org, "repos": repos, "hosts": hosts, "frontends": frontends}
 
 
           # --- Reading a repository ----------------------------------------------------------------------------------------
@@ -886,6 +923,29 @@ jobs:
                   "; consumes nothing in this train"
 
 
+          def select_frontend(front, ahead):
+              """(selected, reason) for a frontend: it rides when its ref has commits main lacks. It consumes no package, so
+              that is the only thing that can put it in a train."""
+              if ahead:
+                  return True, f"{front['ref']} is ahead of main; gated in the frontend-gates job, promoted after the deploy"
+              return False, "unchanged" + (f" since {front['tag']['tag']}" if front.get("tag") else "")
+
+
+          def archive_frontends(plan):
+              """The frontend-gates job's input: each selected frontend's tree at the sha the plan read, as a tar under
+              FRONTENDS (uploaded as one artifact), and one matrix row per frontend. The gate job gets the source this way, not
+              by cloning: it holds no token, so nothing the gate runs (the repository's scripts, every npm dependency's install
+              script) can reach one, change what this job publishes or pushes, or touch another repository's checkout."""
+              rows = []
+              FRONTENDS.mkdir(parents=True, exist_ok=True)
+              for name in plan.get("frontends_selected", []):
+                  repo = plan["repos"][name]
+                  git(["archive", "--format=tar", "-o", FRONTENDS / f"{name}.tar", repo["sha"]], cwd=checkout_dir(SRC, name))
+                  rows.append({"repo": name, "sha": repo["sha"], "gate": repo["gate"],
+                               "artifact": f"release-train-{plan['version']}-frontends"})
+              return rows
+
+
           def pins_at(dest, commit, ids):
               """The exact pins on ids at a commit, across its .csproj and Directory.Packages.props files: {id: highest}."""
               found = {}
@@ -988,7 +1048,7 @@ jobs:
                   return
               manifest = load_manifest(os.environ["TRAIN_MANIFEST"])
               server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"]]
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["frontends"]]
               heads = {}
               for name in names:
                   url = f"{server}/{manifest['org']}/{name}.git"
@@ -1065,7 +1125,8 @@ jobs:
               if overrides and not dry_run:
                   raise TrainError("ref overrides are for dry runs only: a live train assembles every repository from "
                                    f"'{ref}' and promotes that to main (overrides named {', '.join(sorted(overrides))})")
-              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
+              unknown = sorted(set(overrides) - {r["repo"] for r in manifest["repos"] + manifest["hosts"] +
+                                                     manifest["frontends"]})
               if unknown:
                   raise TrainError(f"ref overrides name repositories that are not in the manifest: {', '.join(unknown)}")
               if WORK.exists():
@@ -1100,6 +1161,20 @@ jobs:
                   projects = [describe_project(dest, p) for p in find_projects(dest)]
                   hosts[name] = {**host, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag,
                                  "projects": projects, "project_order": [], "ships": []}
+              # Frontends carry no .csproj the train reads: they never own a package or consume one, so they are read for
+              # their position against main only.
+              frontends = {}
+              for front in manifest["frontends"]:
+                  name = front["repo"]
+                  repo_ref = overrides.get(name, ref)
+                  dest = checkout_dir(SRC, name)
+                  sha = clone(manifest["org"], name, repo_ref, dest)
+                  tag = latest_train_tag(dest)
+                  main = git(["rev-parse", "origin/main"], cwd=dest, capture=True).strip()
+                  log(f"{name} (frontend): {repo_ref} {sha[:12]}{' (override)' if name in overrides else ''}, "
+                      f"main {main[:12]}, latest train tag {tag['tag'] if tag else '(none)'}")
+                  frontends[name] = {**front, "ref": repo_ref, "sha": sha, "base": sha, "main": main, "tag": tag,
+                                     "projects": [], "project_order": [], "ships": []}
 
               owner = {}
               for name, repo in repos.items():
@@ -1145,8 +1220,13 @@ jobs:
                   host["selected"], host["reason"] = select_host(host, ship, ahead)
               hosts_selected = [n for n in hosts if hosts[n]["selected"]]
               repos.update(hosts)
+              for name, front in frontends.items():
+                  front["selected"], front["reason"] = select_frontend(
+                      front, not is_ancestor(checkout_dir(SRC, name), front["sha"], front["main"]))
+              frontends_selected = [n for n in frontends if frontends[n]["selected"]]
+              repos.update(frontends)
               warnings = []
-              for name in selected + hosts_selected:
+              for name in selected + hosts_selected + frontends_selected:
                   repo = repos[name]
                   dest = checkout_dir(SRC, name)
                   if not is_ancestor(dest, repo["main"], repo["sha"]):
@@ -1163,6 +1243,14 @@ jobs:
                       else:
                           message = (f"{name}: main ({repo['main'][:12]}) is not an ancestor of {repo['ref']} ({repo['sha'][:12]}), "
                                      f"so the train could publish it but never fast-forward main. Merge main into {repo['ref']} first.")
+                          if repo.get("frontend"):
+                              # A frontend publishes nothing and nothing depends on it, so it is left out (dry run or live)
+                              # rather than failing the train: the API and the other clients still ship.
+                              repo["selected"] = False
+                              repo["reason"] = f"left out: main is not an ancestor of {repo['ref']}; merge main into it"
+                              warnings.append(message + " The train leaves this frontend out; everything else still ships.")
+                              log(f"WARNING {message}")
+                              continue
                           if not dry_run:
                               raise TrainError(message)
                           # A dry run promotes nothing, so it can still build and test the branch; the summary carries the warning.
@@ -1174,9 +1262,15 @@ jobs:
                       repo["build_file"] = repo["build"] or ("" if repo["test"] else find_solution(dest, repo))
                   repo["source_graph"] = SWITCH in ((checkout_dir(SRC, name) / "Directory.Build.targets").read_text()
                                                     if (checkout_dir(SRC, name) / "Directory.Build.targets").exists() else "")
+                  if repo.get("frontend"):
+                      # What would reach main: a frontend's main moves only through the train, so main..sha is what ships.
+                      log_range = [f"{repo['main']}..{repo['sha']}"]
+                  else:
+                      log_range = [f"{repo['tag']['sha']}..{repo['sha']}"] if repo["tag"] else [repo["sha"], "-n", "200"]
                   repo["items"] = sorted(set(ITEM_KEY.findall(git(
-                      ["log", "--format=%B", f"{repo['tag']['sha']}..{repo['sha']}" if repo["tag"] else repo["sha"],
-                       *([] if repo["tag"] else ["-n", "200"])], cwd=checkout_dir(SRC, name), capture=True))))
+                      ["log", "--format=%B", *log_range], cwd=checkout_dir(SRC, name), capture=True))))
+
+              frontends_selected = [n for n in frontends_selected if repos[n]["selected"]]
 
               build, revision = stamp()
               version = normalized_version(build, revision)
@@ -1192,24 +1286,33 @@ jobs:
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
                       "decisions": decisions, "published": published,
                       "repo_edges": repo_edges, "repos": repos, "hosts": list(hosts), "hosts_selected": hosts_selected,
+                      "frontends": list(frontends), "frontends_selected": frontends_selected,
                       "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
 
               log(f"\nRunner: {os.cpu_count()} CPU(s).")
               log(f"\nTrain {version} ({'dry run' if dry_run else 'live'}), ref {ref}" +
                   (" with overrides " + ", ".join(f"{n}={r}" for n, r in sorted(overrides.items())) if overrides else ""))
-              log(f"Repository order: {' -> '.join(repo_order)}" + (f", then hosts {', '.join(hosts)}" if hosts else ""))
+              log(f"Repository order: {' -> '.join(repo_order)}" + (f", then hosts {', '.join(hosts)}" if hosts else "") +
+                  (f", then frontends {', '.join(frontends)} (promoted after the deploy)" if frontends else ""))
               for name in repo_order:
                   deps = ", ".join(repo_edges[name]) or "nothing in the manifest"
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name}: {repos[name]['reason']}; depends on {deps}")
               for name in hosts:
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name} (host): {repos[name]['reason']}")
+              for name in frontends:
+                  log(f"  {'*' if repos[name]['selected'] else ' '} {name} (frontend): {repos[name]['reason']}")
               log(f"Packages: {len(ship)} of {len(decisions)} in this train, across {len(repo_order)} repositories")
               for package_id, reason in ship.items():
                   log(f"  + {package_id}: {reason}")
               output("version", version)
-              output("selected", ",".join(selected + hosts_selected))
-              if not selected + hosts_selected:
+              output("frontends-matrix", json.dumps(archive_frontends(plan), separators=(",", ":")))
+              # No NuGet cache for a tenant with frontends: their gates run untrusted npm code in this caller's cache scope,
+              # and a cache entry such code plants (under any key, after an eviction, or from another branch's scope) would
+              # be restored into this job, where restored packages' build targets run beside the tokens.
+              output("nuget-cache", "off" if manifest["frontends"] else "on")
+              output("selected", ",".join(selected + hosts_selected + frontends_selected))
+              if not selected + hosts_selected + frontends_selected:
                   log("Nothing changed since the last train; nothing to build.")
 
 
@@ -1228,6 +1331,7 @@ jobs:
               # is in the local feed by then. Their exact pins resolve exactly as a package's do (the train version for an
               # in-train package, else newest(published, carry)), they are built and tested, never packed, and a failure here
               # fails the train before anything is published.
+              # Frontends are not built here: their gate runs in the frontend-gates job, with no secret (archive_frontends).
               for name in plan["selected"] + plan.get("hosts_selected", []):
                   repo = plan["repos"][name]
                   needs = ({owner[p] for p in repo.get("consumes", []) if p in owner} if repo.get("host")
@@ -1410,6 +1514,11 @@ jobs:
               # Hosts last, like the build: main moving is a host's deploy, so it moves only once every package repository
               # it consumes has been promoted (or recorded as stranded).
               promote_all(plan, [n for n in plan["selected"] + plan.get("hosts_selected", []) if n not in plan["promoted"]])
+              # Reached only when nothing stranded (promote_all raises otherwise): the frontends this train selected, at the
+              # sha the plan archived for their gate. The workflow's frontends-ready output passes this on only when every
+              # gate passed; the caller promotes them after its deploy, with promote-only and this train's version, so a client
+              # never reaches main ahead of the API it calls, and not at all when a repository or host stranded.
+              output("frontends-promotable", ",".join(f"{n}={plan['repos'][n]['sha']}" for n in plan.get("frontends_selected", [])))
 
 
           def cmd_promote_only():
@@ -1432,10 +1541,18 @@ jobs:
               targets = repo_assignments(os.environ.get("TRAIN_PROMOTE", ""), "promote-only entry", "sha")
               if not targets:
                   raise TrainError("promote-only needs at least one repo=sha entry")
-              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"] + manifest["hosts"]})
+              unknown = sorted(set(targets) - {r["repo"] for r in manifest["repos"] + manifest["hosts"] +
+                                                   manifest["frontends"]})
               if unknown:
                   raise TrainError(f"promote-only names repositories that are not in the manifest: {', '.join(unknown)}")
               host_names = {h["repo"] for h in manifest["hosts"]}
+              frontend_names = {f["repo"] for f in manifest["frontends"]}
+              if set(targets) & frontend_names and set(targets) - frontend_names:
+                  # A frontend's main is its deploy and must follow its API's: it is promoted only in a call of its own, after
+                  # the deploy (the caller's frontends job), never beside a repository or host that may still strand.
+                  raise TrainError("promote-only promotes frontends in a call of their own, after the deploy; this call also "
+                                   f"names {', '.join(sorted(set(targets) - frontend_names))}. Promote those first, deploy, then "
+                                   f"promote {', '.join(sorted(set(targets) & frontend_names))}.")
               # A dispatch input reaches git as an argument: only a commit id (hex) is accepted, never a ref name or an option.
               not_sha = sorted(f"{n}={v}" for n, v in targets.items() if not re.fullmatch(r"[0-9a-fA-F]{7,40}", v))
               if not_sha:
@@ -1447,14 +1564,14 @@ jobs:
 
               repos, tagged_at, others, problems = {}, {}, {}, []
               # A host is cloned only when it is named: it produces no package, so it never says what the train shipped.
-              for entry in manifest["repos"] + [h for h in manifest["hosts"] if h["repo"] in targets]:
+              for entry in manifest["repos"] + [h for h in manifest["hosts"] + manifest["frontends"] if h["repo"] in targets]:
                   name = entry["repo"]
                   dest = checkout_dir(SRC, name)
                   tip = clone(manifest["org"], name, ref, dest)
                   tagged = bool(git(["tag", "--list", tag], cwd=dest, capture=True).strip())
                   if tagged:
                       tagged_at[name] = git(["rev-list", "-n", "1", tag], cwd=dest, capture=True).strip()
-                  elif name not in targets and name not in host_names:
+                  elif name not in targets and name not in host_names | frontend_names:
                       # Read at the train tag a plan for this train saw, or at the tip for a repository with none.
                       others[name] = (latest_train_tag(dest, before=version) or {"sha": tip})["sha"]
                   if name not in targets:
@@ -1476,7 +1593,8 @@ jobs:
                                       f"commits the train did not make, so main cannot fast-forward to it")
                   repos[name] = {"repo": name, "ref": ref, "sha": sha, "base": sha, "tip": tip, "main": main,
                                  "reason": f"promote-only at {sha[:12]}", "items": [], "selected": True,
-                                 **({"host": True} if name in host_names else {})}
+                                 **({"host": True} if name in host_names else {}),
+                                 **({"frontend": True} if name in frontend_names else {})}
                   if not is_ancestor(dest, main, sha) and only_train_commits(dest, sha, main):
                       repos[name]["carry_from"] = main
               if problems:
@@ -1502,7 +1620,7 @@ jobs:
                                       f"at {version} here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
               train_ids = {i for ids in member_ids.values() for i in ids}
-              if not train_ids and not set(targets) <= host_names:
+              if not train_ids and not set(targets) <= host_names | frontend_names:
                   raise TrainError(f"promote-only refused, nothing was pushed: no package of any manifest repository is on the "
                                    f"feed at {version}; promote-only only finishes a train whose packages were published")
               if not train_ids:
@@ -1515,11 +1633,13 @@ jobs:
               for name in targets:
                   if name in host_names:
                       log(f"{name} (host): main moves to what train {version} built and is tagged")
+                  elif name in frontend_names:
+                      log(f"{name} (frontend): main moves to the sha train {version} gated and is tagged")
                   elif not member_ids[name]:
                       log(f"{name}: none of its packages is in train {version}; main still moves and is tagged")
 
               # Hosts last, as the train promotes them.
-              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] if r["repo"] in targets]
+              names = [r["repo"] for r in manifest["repos"] + manifest["hosts"] + manifest["frontends"] if r["repo"] in targets]
               for name in names:
                   repo, dest = repos[name], checkout_dir(SRC, name)
                   git(["checkout", "-q", "--detach", repo["sha"]], cwd=dest)
@@ -1570,13 +1690,20 @@ jobs:
                   repo = plan["repos"][name]
                   lines.append(f"| {name} (host) | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | "
                                f"{', '.join(repo.get('consumes', [])) or '—'} | {', '.join(repo.get('items', [])) or '—'} |")
+              for name in plan.get("frontends", []):
+                  # Frontends: gated in the frontend-gates job, promoted by the caller after its deploy (frontends-ready).
+                  repo = plan["repos"][name]
+                  lines.append(f"| {name} (frontend) | {'yes' if repo['selected'] else 'no'} | {repo['reason']} | — | "
+                               f"{', '.join(repo.get('items', [])) or '—'} |")
               if plan.get("decisions") is not None:
                   ship = plan.get("ship", {})
                   lines += ["", f"Repositories: {len(plan['repo_order'])} considered, {len(plan['selected'])} in this train. "
                                 f"Packages: {len(plan['decisions'])} considered, {len(ship)} in this train; every other package "
                                 f"is unchanged since its last publication and is neither packed nor pushed." +
                                 (f" Hosts: {len(plan['hosts'])} considered, {len(plan.get('hosts_selected', []))} built and "
-                                 f"tested against this train (never packed)." if plan.get("hosts") else "")]
+                                 f"tested against this train (never packed)." if plan.get("hosts") else "") +
+                                (f" Frontends: {len(plan['frontends'])} considered, {len(plan.get('frontends_selected', []))} "
+                                 f"gated in the frontend-gates job and promoted after the deploy." if plan.get("frontends") else "")]
               packed = {p["id"]: p for p in plan["packages"]}
               if plan.get("ship"):
                   lines += ["", "| package | why | version | in-train dependencies |", "|---|---|---|---|"]
@@ -1674,20 +1801,32 @@ jobs:
         run: python3 "$RUNNER_TEMP/train.py" plan
 
       # Keyed on the cloned repositories' project files (no packages.lock.json: a lock file would pin every
-      # Version="*" float to its last resolution).
+      # Version="*" float to its last resolution). Off for a manifest with frontends (the plan's nuget-cache output): the
+      # frontend-gates job runs untrusted npm code in the caller's cache scope, and the Actions cache answers to a job's
+      # runtime token whatever its permissions, so such code could plant an entry (under a key this job will use, after an
+      # eviction, or from another branch) that a restore here would hand the build step and its tokens. Exact key only
+      # for the rest: no prefix restore.
       - name: Cache NuGet packages
-        if: ${{ inputs.promote-only == '' }}
+        if: ${{ inputs.promote-only == '' && steps.plan.outputs.nuget-cache == 'on' }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-train-${{ hashFiles('_train/src/**/*.csproj', '_train/src/**/Directory.Build.*', '_train/src/**/nuget.config') }}
-          restore-keys: nuget-${{ runner.os }}-train-
 
       - name: Build, test and pack into the local feed
         if: ${{ steps.plan.outputs.selected != '' }}
         env:
           PACKAGES_TOKEN: ${{ secrets.packages-token }}
         run: python3 "$RUNNER_TEMP/train.py" build
+
+      # The frontend-gates job's only input: each selected frontend's tree at its planned sha (archive_frontends).
+      - name: Upload the frontends' sources for their gates
+        if: ${{ steps.plan.outputs.frontends-matrix != '' && steps.plan.outputs.frontends-matrix != '[]' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-train-${{ steps.plan.outputs.version }}-frontends
+          path: _train/frontends/*.tar
+          retention-days: 7
 
       - name: Upload the local feed (dry run)
         if: ${{ inputs.dry-run && steps.plan.outputs.selected != '' }}
@@ -1731,3 +1870,82 @@ jobs:
           MERRYN_URL: ${{ secrets.merryn-url }}
           MERRYN_TOKEN: ${{ secrets.merryn-token }}
         run: python3 "$RUNNER_TEMP/train.py" record
+
+  # Each frontend's gate, on its own runner, with no secret and no permission: the gate runs the frontend's own scripts and
+  # every npm dependency's install script, so it must not share a job (a process tree, $GITHUB_ENV, the train's script, its
+  # local feed or its checkouts) with the tokens the train publishes and pushes with. It reads the archive the plan made at
+  # the sha the train will promote. Runs on a dry run too, so the proposal shows whether each frontend would ship.
+  frontend-gates:
+    needs: train
+    if: ${{ !cancelled() && needs.train.result == 'success' && needs.train.outputs.frontends-matrix != '' && needs.train.outputs.frontends-matrix != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        frontend: ${{ fromJSON(needs.train.outputs.frontends-matrix) }}
+    name: gate ${{ matrix.frontend.repo }}
+    env:
+      FRONTEND_REPO: ${{ matrix.frontend.repo }}
+      FRONTEND_SHA: ${{ matrix.frontend.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.frontend.artifact }}
+          path: ${{ runner.temp }}/frontends
+
+      - name: Extract the archived tree
+        env:
+          FRONTEND_ARCHIVES: ${{ runner.temp }}/frontends
+        run: |
+          python3 - <<'EXTRACT_PY'
+          """The frontend's tree at the sha the train will promote, into the workspace (so its .nvmrc can pick Node)."""
+          import os, tarfile
+          from pathlib import Path
+          tree = Path(os.environ["GITHUB_WORKSPACE"]) / "frontend"
+          tree.mkdir(parents=True)
+          with tarfile.open(Path(os.environ["FRONTEND_ARCHIVES"]) / f"{os.environ['FRONTEND_REPO']}.tar") as tar:
+              tar.extractall(tree, filter="data")
+          EXTRACT_PY
+
+      # The frontend's own pin when it has one (as its CI reads it), else the workflow's node-version.
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('frontend/.nvmrc') != '' }}
+        with:
+          node-version-file: frontend/.nvmrc
+      - uses: actions/setup-node@v4
+        if: ${{ hashFiles('frontend/.nvmrc') == '' }}
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Gate
+        env:
+          FRONTEND_GATE: ${{ toJSON(matrix.frontend.gate) }}
+          CI: "true"
+        run: |
+          python3 - <<'GATE_PY'
+          """Run one frontend's gate in the extracted tree: every command in order, through bash (so a gate can name
+          test/*.test.mjs), stopping at the first that fails. The result is added to the run summary beside the train's."""
+          import json, os, subprocess, sys
+          from pathlib import Path
+          repo, sha = os.environ["FRONTEND_REPO"], os.environ["FRONTEND_SHA"]
+          gate = json.loads(os.environ["FRONTEND_GATE"])
+          tree = Path(os.environ["GITHUB_WORKSPACE"]) / "frontend"
+
+          def summary(line):
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write(line + "\n")
+
+          print(f"{repo} at {sha[:12]}: {len(gate)} gate command(s)", flush=True)
+          for command in gate:
+              print(f"$ {command}", flush=True)
+              done = subprocess.run(["bash", "-euo", "pipefail", "-c", command], cwd=tree)
+              if done.returncode != 0:
+                  print(f"::error::{repo}: gate command failed ({done.returncode}): {command}", flush=True)
+                  summary(f"- ❌ Frontend {repo} at `{sha[:12]}`: gate failed at `{command}`. No frontend is promoted by this train.")
+                  sys.exit(1)
+          print(f"{repo}: gate passed at {sha[:12]}", flush=True)
+          summary(f"- ✅ Frontend {repo} at `{sha[:12]}`: gate passed ({len(gate)} command(s)).")
+          GATE_PY

@@ -8,9 +8,11 @@ The script is extracted from the workflow file itself, so these always test the 
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -245,6 +247,116 @@ class Unit(unittest.TestCase):
             path.write_text(json.dumps(bad))
             with self.assertRaises(self.train.TrainError):
                 self.train.load_manifest(path)
+
+    # --- Frontends (coordinator:C142): static web clients, gated in a job with no secret, promoted after the deploy --
+
+    def test_manifest_frontends_take_a_gate_default_to_npm_and_refuse_duplicates_and_empty_gates(self):
+        path = Path(self.tmp.name) / "m.json"
+        path.write_text(json.dumps({"org": "o", "repos": ["A"], "hosts": ["H"], "frontends": [
+            "Web.Plain", {"repo": "Web.Vocab", "gate": ["npm ci", "node --test test/*.test.mjs", "npm run build"]}]}))
+        frontends = self.train.load_manifest(path)["frontends"]
+        self.assertEqual([f["repo"] for f in frontends], ["Web.Plain", "Web.Vocab"])
+        self.assertTrue(all(f["frontend"] and not f["test"] for f in frontends))
+        self.assertEqual(frontends[0]["gate"], ["npm ci", "npm test", "npm run build"])
+        self.assertEqual(frontends[1]["gate"], ["npm ci", "node --test test/*.test.mjs", "npm run build"])
+        path.write_text(json.dumps({"org": "o", "repos": ["A"]}))
+        self.assertEqual(self.train.load_manifest(path)["frontends"], [])       # an old manifest has none
+        for bad in ({"org": "o", "repos": ["A"], "frontends": ["a"]},                 # a repo and a frontend at once
+                    {"org": "o", "repos": ["A"], "hosts": ["H"], "frontends": ["h"]},  # a host and a frontend at once
+                    {"org": "o", "repos": ["A"], "frontends": ["W", "w"]},            # a frontend twice
+                    {"org": "o", "repos": ["A"], "frontends": [{"gate": ["npm test"]}]},
+                    {"org": "o", "repos": ["A"], "frontends": [{"repo": "W", "gate": []}]},
+                    {"org": "o", "repos": ["A"], "frontends": [{"repo": "W", "gate": "npm test"}]},
+                    {"org": "o", "repos": ["A"], "frontends": [{"repo": "W", "gate": ["npm test", " "]}]}):
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(self.train.TrainError, msg=json.dumps(bad)):
+                self.train.load_manifest(path)
+
+    def test_a_frontend_rides_only_when_its_ref_is_ahead_of_main(self):
+        front = {"ref": "release", "tag": {"tag": "train/0.0.9.1"}}
+        self.assertEqual(self.train.select_frontend(front, True),
+                         (True, "release is ahead of main; gated in the frontend-gates job, promoted after the deploy"))
+        self.assertEqual(self.train.select_frontend(front, False), (False, "unchanged since train/0.0.9.1"))
+        self.assertEqual(self.train.select_frontend({"ref": "release"}, False), (False, "unchanged"))
+
+    def test_the_gate_job_holds_no_secret_and_no_permission_and_frontends_ready_needs_it_to_pass(self):
+        # The gate runs the frontend's scripts and every npm dependency's install script. Sharing the train job would hand
+        # them its tokens (/proc/<parent>/environ, $GITHUB_ENV, the train script, the local feed), so it gets its own job.
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        gates = workflow["jobs"]["frontend-gates"]
+        self.assertEqual(gates["permissions"], {})
+        self.assertEqual(gates["needs"], "train")
+        self.assertNotIn("secrets", json.dumps(gates))
+        self.assertNotIn("TOKEN", json.dumps(gates))
+        self.assertEqual(gates["strategy"]["matrix"]["frontend"], "${{ fromJSON(needs.train.outputs.frontends-matrix) }}")
+        self.assertFalse(gates["strategy"]["fail-fast"])
+        train_steps = json.dumps(workflow["jobs"]["train"]["steps"])
+        self.assertNotIn("setup-node", train_steps)                               # nothing in the train job runs node
+        # GitHub refuses the runner context in a job's env (the whole workflow then fails to load): only in steps.
+        for name, job in workflow["jobs"].items():
+            self.assertNotIn("runner.", json.dumps(job.get("env", {})), name)
+        # No prefix restore of the NuGet cache, and no cache at all for a manifest whose gates run in this cache scope.
+        cache = next(st for st in workflow["jobs"]["train"]["steps"] if st.get("uses", "").startswith("actions/cache"))
+        self.assertNotIn("restore-keys", cache["with"])
+        self.assertIn("steps.plan.outputs.nuget-cache == 'on'", cache["if"])
+        ready = (workflow.get("on") or workflow[True])["workflow_call"]["outputs"]["frontends-ready"]["value"]
+        self.assertEqual(ready, "${{ jobs.frontend-gates.result == 'success' && jobs.train.outputs.frontends-promotable || '' }}")
+
+    def test_frontends_promotable_is_written_only_when_nothing_stranded(self):
+        from unittest.mock import patch
+        out = Path(self.tmp.name) / "github_output"
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+
+        def plan(stranding):
+            return {"version": "0.0.1", "promoted": [], "stranded": [], "release_behind": [], "selected": ["Lib"],
+                    "hosts_selected": ["Api"], "frontends_selected": ["Web.Vocab", "Web.Pay"], "repos": {
+                        "Lib": {"repo": "Lib", "sha": "a" * 40}, "Api": {"repo": "Api", "sha": "b" * 40, "host": True,
+                                                                         "strand": stranding},
+                        "Web.Vocab": {"repo": "Web.Vocab", "sha": "c" * 40, "frontend": True},
+                        "Web.Pay": {"repo": "Web.Pay", "sha": "d" * 40, "frontend": True}}}
+
+        promoted = []
+
+        def promote(plan, name, repo, dest):
+            if repo.get("strand"):
+                raise self.train.TrainError("refused")
+            promoted.append(name)
+            plan.setdefault("main_moved", []).append(name)
+            plan["promoted"].append(name)
+
+        for stranding in (False, True):
+            promoted.clear()
+            self.train.PLAN.write_text(json.dumps(plan(stranding)))
+            with patch.dict(os.environ, GITHUB_OUTPUT=str(out)), patch.object(self.train, "promote_repo", promote):
+                if stranding:
+                    with self.assertRaises(self.train.TrainError):
+                        self.train.cmd_promote()
+                else:
+                    self.train.cmd_promote()
+            self.assertEqual(promoted, ["Lib"] if stranding else ["Lib", "Api"])   # never a frontend here
+            lines = out.read_text().splitlines()
+            out.unlink()
+            if stranding:
+                self.assertEqual(lines, ["hosts-promoted="])
+            else:
+                self.assertEqual(lines, ["hosts-promoted=Api",
+                                         f"frontends-promotable=Web.Vocab={'c' * 40},Web.Pay={'d' * 40}"])
+
+    def test_the_summary_lists_frontends_after_the_hosts(self):
+        self.train.PLAN.parent.mkdir(parents=True, exist_ok=True)
+        self.train.PLAN.write_text(json.dumps({
+            "version": "0.0.1.1", "dry_run": True, "ref": "release", "repo_order": ["Lib"], "selected": [],
+            "repo_edges": {"Lib": []}, "packages": [], "promoted": [], "hosts": [], "frontends": ["Web.Vocab"],
+            "frontends_selected": ["Web.Vocab"], "decisions": {}, "ship": {}, "repos": {
+                "Lib": {"selected": False, "reason": "unchanged"},
+                "Web.Vocab": {"selected": True, "reason": "release is ahead of main", "items": ["vocab:V806"]}}}))
+        summary = Path(self.tmp.name) / "summary.md"
+        from unittest.mock import patch
+        with patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(summary)):
+            self.train.cmd_record()
+        text = summary.read_text()
+        self.assertIn("| Web.Vocab (frontend) | yes | release is ahead of main | — | vocab:V806 |", text)
+        self.assertIn("Frontends: 1 considered, 1 gated in the frontend-gates job and promoted after the deploy.", text)
 
     def test_a_host_is_in_the_train_when_it_consumes_an_in_train_package_or_its_ref_is_ahead_of_main(self):
         host = {"ref": "release", "tag": {"tag": "train/0.0.9.1"},
@@ -856,9 +968,9 @@ class Fixture(unittest.TestCase):
                            "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}",
                            "Down.slnx": '<Solution><Project Path="Down.Lib/Down.Lib.csproj" /></Solution>'})
 
-    def manifest(self, repos, hosts=()):
+    def manifest(self, repos, hosts=(), frontends=()):
         path = self.root / "manifest.json"
-        path.write_text(json.dumps({"org": "o", "repos": repos, "hosts": list(hosts)}))
+        path.write_text(json.dumps({"org": "o", "repos": repos, "hosts": list(hosts), "frontends": list(frontends)}))
         self.feed_env["TRAIN_MANIFEST"] = str(path)
 
     def train(self, command):
@@ -973,6 +1085,205 @@ class Split(Fixture):
             self.assertEqual(self.module.train_ref(), "release")
         with patch.dict(os.environ, TRAIN_REF="release", TRAIN_SPLIT="release-1"):
             self.assertEqual(self.module.train_ref(), "release-1")
+
+
+class Frontends(Fixture):
+    """A frontend has no .csproj, so these run with git and node only (no dotnet): a package repository with no project
+    stands beside it, as the manifest needs one."""
+
+    GATE = ["node --test test/*.test.mjs", "mkdir -p dist && cp src/index.html dist/"]
+
+    def setUp(self):
+        super().setUp()
+        self.repo("Lib", {"README.md": "no project"})
+        self.repo("Web", {"src/index.html": "<p>v1</p>", "package.json": '{"type": "module"}',
+                          "test/a.test.mjs": "import test from 'node:test'; test('ok', () => {});"})
+        self.release_branches("Lib", "Web")
+        self.manifest([{"repo": "Lib", "test": False}], frontends=[{"repo": "Web", "gate": self.GATE}])
+        self.feed_env["TRAIN_REF"] = "release"
+        self.out = self.root / "github_output"
+        self.feed_env["GITHUB_OUTPUT"] = str(self.out)
+
+    def state(self):
+        return json.loads((self.root / "train/plan.json").read_text())
+
+    def outputs(self):
+        lines = self.out.read_text().splitlines() if self.out.exists() else []
+        return dict(line.split("=", 1) for line in lines)
+
+    def gate(self, row):
+        """Run the frontend-gates job's Gate step, as the workflow ships it, on the archive the plan made."""
+        steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["frontend-gates"]["steps"]
+        workspace = self.root / "workspace"
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir()
+        self.gate_summary = self.root / "gate-summary.md"
+        # The job's and each step's env as the workflow declares them, with the contexts a runner would fill in.
+        job_env = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["frontend-gates"].get("env", {})
+        contexts = {"${{ matrix.frontend.repo }}": row["repo"], "${{ matrix.frontend.sha }}": row["sha"],
+                    "${{ toJSON(matrix.frontend.gate) }}": json.dumps(row["gate"]),
+                    "${{ runner.temp }}": str(self.root / "train")}
+
+        def fill(value):
+            for expression, actual in contexts.items():
+                value = value.replace(expression, actual)
+            self.assertNotIn("${{", value)
+            return value
+
+        (self.root / "train" / "frontends").mkdir(parents=True, exist_ok=True)
+        base = {"PATH": os.environ["PATH"], "GITHUB_WORKSPACE": str(workspace), "GITHUB_STEP_SUMMARY": str(self.gate_summary),
+                "RUNNER_TEMP": str(self.root / "train"), **{k: fill(str(v)) for k, v in job_env.items()}}
+        output = ""
+        for name in ("Extract the archived tree", "Gate"):
+            step = next(s for s in steps if s.get("name") == name)
+            env = {**base, **{k: fill(str(v)) for k, v in step.get("env", {}).items()}}
+            done = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+            output += done.stdout
+            if done.returncode != 0:
+                break
+        done.stdout = output
+        return done, workspace / "frontend"
+
+    def test_a_frontend_rides_once_its_release_is_ahead_and_the_plan_archives_it_for_the_gate_job(self):
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual((self.state()["frontends"], self.state()["frontends_selected"]), (["Web"], []))
+        self.assertEqual(self.outputs()["frontends-matrix"], "[]")
+        self.assertEqual(self.outputs()["nuget-cache"], "off")                   # a manifest with frontends: no cache
+        self.assertIn("Nothing changed since the last train", plan.stdout)
+        sha = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = self.state()
+        self.assertEqual((state["selected"], state["frontends_selected"]), ([], ["Web"]))
+        self.assertEqual(state["repos"]["Web"]["items"], [])                     # main..sha only: not main's own (test:T1)
+        rows = json.loads(self.outputs()["frontends-matrix"])
+        self.assertEqual(rows, [{"repo": "Web", "sha": sha, "gate": self.GATE,
+                                 "artifact": f"release-train-{state['version']}-frontends"}])
+        with tarfile.open(self.root / "train" / "frontends" / "Web.tar") as tar:
+            self.assertEqual(tar.extractfile("src/index.html").read(), b"<p>v2</p>")
+            self.assertFalse(any(n.startswith(".git/") for n in tar.getnames()))
+        # The build step never runs a frontend's gate: a failing frontend test cannot fail (or reach) the train job.
+        self.commit_to("Web", "release", {"test/b.test.mjs": "import test from 'node:test'; test('no', () => { throw 1; });"})
+        self.assertEqual(self.train("plan").returncode, 0)
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        self.assertNotIn("node --test", build.stdout)
+
+    def test_the_gate_step_runs_every_command_in_the_archived_tree_and_fails_on_the_first_that_fails(self):
+        self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        self.assertEqual(self.train("plan").returncode, 0)
+        row = json.loads(self.outputs()["frontends-matrix"])[0]
+        done, tree = self.gate(row)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("Web: gate passed at", done.stdout)
+        self.assertEqual((tree / "dist" / "index.html").read_text(), "<p>v2</p>")   # the glob expanded, steps ran in order
+        self.assertIn(f"✅ Frontend Web at `{row['sha'][:12]}`: gate passed", self.gate_summary.read_text())
+        self.commit_to("Web", "release", {"test/b.test.mjs": "import test from 'node:test'; test('no', () => { throw 1; });"})
+        self.out.unlink()
+        self.assertEqual(self.train("plan").returncode, 0)
+        done, tree = self.gate(json.loads(self.outputs()["frontends-matrix"])[0])
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("::error::Web: gate command failed", done.stdout)
+        self.assertFalse((tree / "dist").exists())                                  # stopped at the first failure
+        self.assertIn("❌ Frontend Web", self.gate_summary.read_text())
+
+    def test_a_live_train_leaves_a_frontend_s_main_to_the_caller_s_promote_only(self):
+        sha = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        main = self.rev("Web", "main")
+        self.live()
+        for command in ("plan", "build", "publish", "promote"):
+            done = self.train(command)
+            self.assertEqual(done.returncode, 0, f"{command}: {done.stdout}")
+        self.assertEqual(self.rev("Web", "main"), main)                           # the train never moves a frontend
+        version = self.state()["version"]
+        self.assertEqual(self.outputs()["frontends-promotable"], f"Web={sha}")
+        self.assertEqual(self.outputs()["hosts-promoted"], "")
+        # The caller's after-deploy job: promote-only with frontends-ready and the train version.
+        self.feed_env.update(TRAIN_PROMOTE=self.outputs()["frontends-promotable"], TRAIN_VERSION=version)
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("Web (frontend): main moves to the sha train", done.stdout)
+        self.assertEqual(self.rev("Web", "main"), sha)
+        self.assertEqual(self.rev("Web", f"train/{version}^{{commit}}"), sha)
+        again = self.train("promote-only")                                        # a repeat is refused, nothing moves
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("already exists", again.stdout)
+
+    def test_promote_only_refuses_a_frontend_beside_a_repository_or_host_and_moves_nothing(self):
+        web = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        lib = self.commit_to("Lib", "release", {"README.md": "changed"})
+        mains = (self.rev("Web", "main"), self.rev("Lib", "main"))
+        self.live()
+        self.feed_env.update(TRAIN_PROMOTE=f"Lib={lib},Web={web}", TRAIN_VERSION="0.0.1.1")
+        done = self.train("promote-only")
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("promote-only promotes frontends in a call of their own", done.stdout)
+        self.assertEqual((self.rev("Web", "main"), self.rev("Lib", "main")), mains)
+
+    def test_a_manifest_without_frontends_keeps_the_nuget_cache(self):
+        self.manifest([{"repo": "Lib", "test": False}])
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual(self.outputs()["nuget-cache"], "on")
+
+    def test_after_a_split_train_the_frontends_promote_only_takes_the_same_split(self):
+        # The README's after-deploy call passes the train's split: the gated sha is on the split branch, not on release.
+        self.feed_env.update(TRAIN_SPLIT="release-1")
+        self.assertEqual(self.train("split").returncode, 0)
+        sha = self.commit_to("Web", "release-1", {"src/index.html": "<p>split</p>"}, new=True)
+        self.live()
+        for command in ("plan", "build", "publish", "promote"):
+            done = self.train(command)
+            self.assertEqual(done.returncode, 0, f"{command}: {done.stdout}")
+        self.assertEqual(self.outputs()["frontends-promotable"], f"Web={sha}")
+        self.feed_env.update(TRAIN_PROMOTE=f"Web={sha}", TRAIN_VERSION=self.state()["version"])
+        without = dict(self.feed_env); without.pop("TRAIN_SPLIT")
+        refused = subprocess.run([sys.executable, self.script, "promote-only"], env=without, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)                # without the split: not on release
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Web", "main"), sha)
+
+    def test_a_split_creates_the_branch_in_a_frontend_and_the_plan_reads_it_there(self):
+        sha = self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        self.feed_env.update(TRAIN_SPLIT="release-1")
+        done = self.train("split")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.rev("Web", "release-1"), sha)
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertEqual((self.state()["repos"]["Web"]["ref"], self.state()["frontends_selected"]), ("release-1", ["Web"]))
+
+    def test_a_live_train_leaves_out_a_frontend_whose_main_has_a_merge_commit_release_lacks_and_still_ships(self):
+        # A hand promotion through a merge PR leaves main with a merge commit release never got.
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.root / "make" / "Web", check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m",
+                        "Merge pull request #1 from o/release"], cwd=self.root / "make" / "Web", check=True)
+        subprocess.run(["git", "push", "-q", str(self.bare("Web")), "main"], cwd=self.root / "make" / "Web", check=True)
+        self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        self.commit_to("Lib", "release", {"README.md": "a docs change still ships"})
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)                         # the rest of the train is not held
+        state = self.state()
+        self.assertEqual((state["selected"], state["frontends_selected"]), (["Lib"], []))
+        self.assertEqual(state["repos"]["Web"]["reason"], "left out: main is not an ancestor of release; merge main into it")
+        self.assertTrue(any("Merge main into release first" in w and "leaves this frontend out" in w for w in state["warnings"]))
+        self.assertEqual(self.outputs()["frontends-matrix"], "[]")
+
+    def test_promote_only_refuses_a_frontend_sha_that_is_not_on_release(self):
+        self.commit_to("Web", "release", {"src/index.html": "<p>v2</p>"})
+        lane = self.commit_to("Web", "lane", {"src/index.html": "<p>unreviewed</p>"}, new=True)
+        self.live()
+        self.feed_env.update(TRAIN_PROMOTE=f"Web={lane}", TRAIN_VERSION="0.0.1.1")
+        done = self.train("promote-only")
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("is not on release", done.stdout)
+        self.assertNotEqual(self.rev("Web", "main"), lane)
 
 
 @unittest.skipUnless(os.environ.get("TRAIN_DOTNET"), "set TRAIN_DOTNET=1 to run the dotnet end-to-end tests")
