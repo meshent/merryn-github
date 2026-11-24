@@ -34,6 +34,10 @@ on:
       dotnet-version:
         type: string
         default: "10.0.x"
+      nuget-cache:
+        description: "Restore and save ~/.nuget/packages through the Actions cache. Set false in a repository whose release train has frontends (coordinator:C150): their gates run untrusted npm code in this repository's cache scope, and any entry they plant, under any key, would be restored next to the packages token"
+        type: boolean
+        default: true
     secrets:
       packages-token:
         description: read:packages on the org feed; falls back to the workflow's own token
@@ -68,10 +72,11 @@ jobs:
           dotnet-version: ${{ inputs.dotnet-version }}
 
       # Not setup-dotnet's `cache: true`: that needs packages.lock.json, and a lock file pins every Version="*"
-      # float to its last resolution. Exact key only, no restore-keys prefix (coordinator:C150): a tenant whose release
-      # train has frontends runs untrusted npm code in the caller repository's cache scope, and a prefix restore here
-      # would hand an entry that code planted to this job, which holds the packages token.
+      # float to its last resolution. Exact key only, never a restore-keys prefix, and off with nuget-cache: false
+      # (coordinator:C150): a tenant whose release train has frontends runs untrusted npm code in the caller
+      # repository's cache scope, and could plant an entry under a key this job will compute.
       - name: Cache NuGet packages
+        if: ${{ inputs.nuget-cache }}
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages

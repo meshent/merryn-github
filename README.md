@@ -257,10 +257,12 @@ between them that waits for that run (meshNet's `await-deploy` does) and make `f
 
 A manifest with frontends runs without the NuGet cache: the gates run untrusted npm code in the caller's cache scope,
 and anything they could plant there would be restored into the job that holds the tokens.
-The same holds for every other workflow in the caller repository: a tenant with frontends must not restore any cache
-by prefix (`restore-keys`) there, since a gate could plant an entry under any key. `dotnet-validate.yml` restores its
-exact key only. Removing a tenant's last
-frontend turns the cache back on, so delete that repository's `nuget-*-train-*` cache entries first
+The same holds for every other workflow in the caller repository. A gate can plant an entry under any key, including an
+exact key it can compute from the repository's project files, so a tenant with frontends runs no NuGet cache there at
+all: call `dotnet-validate.yml` with `nuget-cache: false`, and use no `actions/cache` (or `setup-*` `cache:` input)
+for packages in its own workflows. When a tenant removes its last frontend, delete every `nuget-*` cache entry in the
+caller repository before turning caches back on. Removing a tenant's last
+frontend turns the cache back on, so delete that repository's `nuget-*` cache entries first
 (`gh cache delete --all` in the caller repository).
 
 That second call is the promote-only mode with frontends only (promote-only refuses a call that names a frontend beside

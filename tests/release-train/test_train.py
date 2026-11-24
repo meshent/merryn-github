@@ -258,8 +258,22 @@ class Unit(unittest.TestCase):
             workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
             for name, job in workflow.get("jobs", {}).items():
                 for step in job.get("steps", []):
-                    if str(step.get("uses", "")).startswith("actions/cache"):
+                    uses = str(step.get("uses", ""))
+                    if uses.startswith("actions/cache"):
                         self.assertNotIn("restore-keys", step.get("with", {}), f"{path.name} job {name}")
+                    if uses.startswith("actions/setup-"):
+                        self.assertNotIn("cache", step.get("with", {}), f"{path.name} job {name}: {uses} caches")
+
+    def test_dotnet_validate_can_turn_its_nuget_cache_off(self):
+        # coordinator:C150: an exact key is plantable too, so a frontend tenant turns the cache off entirely.
+        workflow = yaml.safe_load((ROOT / ".github/workflows/dotnet-validate.yml").read_text(encoding="utf-8"))
+        on = workflow.get("on") or workflow[True]
+        self.assertEqual(on["workflow_call"]["inputs"]["nuget-cache"]["type"], "boolean")
+        caches = [step for job in workflow["jobs"].values() for step in job.get("steps", [])
+                  if str(step.get("uses", "")).startswith("actions/cache")]
+        self.assertTrue(caches)
+        for step in caches:
+            self.assertEqual(step.get("if"), "${{ inputs.nuget-cache }}")
 
     def test_manifest_frontends_take_a_gate_default_to_npm_and_refuse_duplicates_and_empty_gates(self):
         path = Path(self.tmp.name) / "m.json"
