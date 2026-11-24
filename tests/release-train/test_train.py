@@ -251,6 +251,16 @@ class Unit(unittest.TestCase):
 
     # --- Frontends (coordinator:C142): static web clients, gated in a job with no secret, promoted after the deploy --
 
+    def test_no_workflow_here_restores_a_cache_by_prefix(self):
+        # coordinator:C150: a frontend gate runs untrusted npm code in the caller's cache scope, so a prefix restore in
+        # any reusable workflow a tenant calls could hand it a planted entry next to a token.
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for name, job in workflow.get("jobs", {}).items():
+                for step in job.get("steps", []):
+                    if str(step.get("uses", "")).startswith("actions/cache"):
+                        self.assertNotIn("restore-keys", step.get("with", {}), f"{path.name} job {name}")
+
     def test_manifest_frontends_take_a_gate_default_to_npm_and_refuse_duplicates_and_empty_gates(self):
         path = Path(self.tmp.name) / "m.json"
         path.write_text(json.dumps({"org": "o", "repos": ["A"], "hosts": ["H"], "frontends": [

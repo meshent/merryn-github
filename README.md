@@ -256,7 +256,10 @@ between them that waits for that run (meshNet's `await-deploy` does) and make `f
 ```
 
 A manifest with frontends runs without the NuGet cache: the gates run untrusted npm code in the caller's cache scope,
-and anything they could plant there would be restored into the job that holds the tokens. Removing a tenant's last
+and anything they could plant there would be restored into the job that holds the tokens.
+The same holds for every other workflow in the caller repository: a tenant with frontends must not restore any cache
+by prefix (`restore-keys`) there, since a gate could plant an entry under any key. `dotnet-validate.yml` restores its
+exact key only. Removing a tenant's last
 frontend turns the cache back on, so delete that repository's `nuget-*-train-*` cache entries first
 (`gh cache delete --all` in the caller repository).
 
