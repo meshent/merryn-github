@@ -251,6 +251,30 @@ class Unit(unittest.TestCase):
 
     # --- Frontends (coordinator:C142): static web clients, gated in a job with no secret, promoted after the deploy --
 
+    def test_no_workflow_here_restores_a_cache_by_prefix(self):
+        # coordinator:C150: a frontend gate runs untrusted npm code in the caller's cache scope, so a prefix restore in
+        # any reusable workflow a tenant calls could hand it a planted entry next to a token.
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for name, job in workflow.get("jobs", {}).items():
+                for step in job.get("steps", []):
+                    uses = str(step.get("uses", ""))
+                    if uses.startswith("actions/cache"):
+                        self.assertNotIn("restore-keys", step.get("with", {}), f"{path.name} job {name}")
+                    if uses.startswith("actions/setup-"):
+                        self.assertNotIn("cache", step.get("with", {}), f"{path.name} job {name}: {uses} caches")
+
+    def test_dotnet_validate_can_turn_its_nuget_cache_off(self):
+        # coordinator:C150: an exact key is plantable too, so a frontend tenant turns the cache off entirely.
+        workflow = yaml.safe_load((ROOT / ".github/workflows/dotnet-validate.yml").read_text(encoding="utf-8"))
+        on = workflow.get("on") or workflow[True]
+        self.assertEqual(on["workflow_call"]["inputs"]["nuget-cache"]["type"], "boolean")
+        caches = [step for job in workflow["jobs"].values() for step in job.get("steps", [])
+                  if str(step.get("uses", "")).startswith("actions/cache")]
+        self.assertTrue(caches)
+        for step in caches:
+            self.assertEqual(step.get("if"), "${{ inputs.nuget-cache }}")
+
     def test_manifest_frontends_take_a_gate_default_to_npm_and_refuse_duplicates_and_empty_gates(self):
         path = Path(self.tmp.name) / "m.json"
         path.write_text(json.dumps({"org": "o", "repos": ["A"], "hosts": ["H"], "frontends": [
