@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -1674,9 +1675,14 @@ class EndToEnd(Fixture):
         self.assertEqual(promote.returncode, 0, promote.stdout)
         pin_commit = self.rev("Down", "main")
         self.assertFalse(self.is_ancestor("Down", "main", "release"))  # main is ahead of release by the pin commit
-        # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved.
+        # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved. Its stamp must differ from
+        # the first train's: the stamp has two-second resolution, and a fast runner gets here inside one window, which
+        # would give both trains the same version and the second one's train/<version> tag would already exist.
+        while self.module.normalized_version(*self.module.stamp()) == first:
+            time.sleep(0.2)
         plan = self.train("plan")
         self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertNotEqual(json.loads((self.root / "train/plan.json").read_text())["version"], first)
         self.assertIn("is ahead of release by train commits only; this train reconciles it", plan.stdout)
         state = json.loads((self.root / "train/plan.json").read_text())
         self.assertEqual(state["selected"], ["Down"])
@@ -2075,6 +2081,98 @@ class EndToEnd(Fixture):
         self.assertIn('Include="Up.Lib" Version="0.0.1.1"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
         self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
+
+
+@unittest.skipUnless(shutil.which("git-lfs"), "needs git-lfs, as GitHub's ubuntu runner images have")
+class LfsDoesNotCarryTheToken(Fixture):
+    """coordinator:C149. GitHub's ubuntu runner images install git-lfs from its .deb, whose postinst runs
+    `git lfs install --system`, so every checkout runs the LFS smudge filter. A repository's .lfsconfig then names the
+    LFS server, and git-lfs sends it the train's -c http.extraHeader token. The train's git() must keep LFS off."""
+
+    def test_the_script_runs_no_git_command_that_skips_the_lfs_and_hook_guard(self):
+        # Every git the train runs goes through local_git() or git(); a bare run(["git", ...]) would bypass NO_LFS and
+        # core.hooksPath. The three read-only subprocess calls (merge-base, cat-file -e, check-ref-format) run no filter,
+        # hook or network.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        bare = [line.strip() for line in text.splitlines() if 'run(["git"' in line and "*NO_LFS" not in line
+                and "never a bare" not in line]
+        self.assertEqual([b for b in bare if not any(k in b for k in ('"merge-base"', '"cat-file"', '"check-ref-format"'))], [])
+        self.assertIn('"core.hooksPath=/dev/null"', text)
+
+    def test_a_pin_commit_and_push_in_a_repository_whose_lfs_attributes_match_the_csproj_send_it_nothing(self):
+        # The add of a pinned .csproj that a .gitattributes routes through LFS used to run git-lfs, which installs its
+        # pre-push hook in the checkout; the token-carrying push then ran the hook against the .lfsconfig server.
+        seen, port = self.catch_server()
+        self.repo("Lib", {".gitattributes": "*.csproj filter=lfs diff=lfs merge=lfs -text\n",
+                          ".lfsconfig": f"[lfs]\n\turl = http://127.0.0.1:{port}/lfs\n",
+                          "Lib/Lib.csproj": '<Project><ItemGroup><PackageReference Include="Up" Version="0.0.1.1" /></ItemGroup></Project>'})
+        script = ("import os, sys; import importlib.util as u; s = u.spec_from_file_location('t', sys.argv[1]); "
+                  "m = u.module_from_spec(s); s.loader.exec_module(m); dest = sys.argv[2]; "
+                  "m.clone('o', 'Lib', 'main', dest); "
+                  "p = os.path.join(dest, 'Lib', 'Lib.csproj'); t = open(p).read(); open(p, 'w').write(t.replace('0.0.1.1', '0.0.2.1')); "
+                  "m.commit_pins(dest, [('Lib/Lib.csproj', 'Up', '0.0.1.1', '0.0.2.1')], '0.0.2.1'); "
+                  "m.git(['push', 'origin', 'HEAD:refs/heads/main'], cwd=dest); "
+                  "print(sorted(os.listdir(os.path.join(dest, '.git', 'hooks'))))")
+        done = subprocess.run([sys.executable, "-c", script, str(self.script), str(self.root / "clone")], env=self.lfs_env(),
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(seen, [], "git-lfs reached the .lfsconfig server during the train's pin commit or push")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertNotIn("'pre-push'", done.stdout.splitlines()[-1])                # no LFS hook was installed
+        pushed = self.file_at("Lib", "main", "Lib/Lib.csproj")
+        self.assertIn('Version="0.0.2.1"', pushed)                                   # the real file, not an LFS pointer
+        self.assertNotIn("git-lfs.github.com/spec", pushed)
+
+    def repo(self, name, files, org_feed=False):
+        # The fixture's own commit must not go through a git-lfs this machine may have installed system-wide: the
+        # repository on the "server" holds the real files, as a repository that only names LFS in .gitattributes does.
+        from unittest.mock import patch
+        with patch.dict(os.environ, GIT_CONFIG_SYSTEM=os.devnull):
+            super().repo(name, files, org_feed)
+
+    def catch_server(self):
+        import http.server
+        import threading
+        seen = []
+
+        class Catch(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(404)
+                self.end_headers()
+            do_GET = do_POST
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Catch)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return seen, server.server_port
+
+    def lfs_env(self):
+        # The runner image's system config, as `git lfs install --system` writes it.
+        system = self.root / "gitconfig-system"
+        system.write_text("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n"
+                          "\tprocess = git-lfs filter-process\n\trequired = true\n")
+        return {**self.feed_env, "GIT_CONFIG_SYSTEM": str(system), "REPOS_TOKEN": "c149-secret-token"}
+
+    def test_a_clone_of_a_repository_whose_lfsconfig_names_another_server_sends_it_nothing(self):
+        seen, port = self.catch_server()
+        pointer = ("version https://git-lfs.github.com/spec/v1\n"
+                   "oid sha256:" + "a" * 64 + "\nsize 12\n")
+        self.repo("Lib", {".gitattributes": "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+                          ".lfsconfig": f"[lfs]\n\turl = http://127.0.0.1:{port}/lfs\n",
+                          "blob.bin": pointer})
+        env = self.lfs_env()
+        script = ("import os, sys; sys.path.insert(0, os.path.dirname(sys.argv[1])); import importlib.util as u; "
+                  "s = u.spec_from_file_location('t', sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); "
+                  "print(m.clone('o', 'Lib', 'main', sys.argv[2]))")
+        done = subprocess.run([sys.executable, "-c", script, str(self.script), str(self.root / "clone")], env=env,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(seen, [], "git-lfs reached the .lfsconfig server during the train's clone")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual((self.root / "clone" / "blob.bin").read_text(), pointer)   # the pointer stays a pointer
+        self.assertNotIn("c149-secret-token", done.stdout)
 
 
 if __name__ == "__main__":

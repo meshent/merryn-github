@@ -279,12 +279,28 @@ jobs:
               return result.stdout if capture else ""
 
 
+          # Git LFS stays off for every git command the train runs (coordinator:C149). GitHub's ubuntu images install git-lfs
+          # with `git lfs install --system`, so a checkout runs its smudge filter, and a repository's .lfsconfig names the
+          # server git-lfs talks to, with the -c http.extraHeader below: any repository's committer could have the token
+          # sent anywhere. No manifest repository uses LFS; a pointer file stays a pointer.
+          # Hooks stay off too: a filter that ran once (or a repository's build) could have installed one in a checkout,
+          # and a pre-push hook runs inside the token-carrying push. Every git command the script runs goes through
+          # local_git() or git(), never a bare run(["git", ...]).
+          NO_LFS = ["-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.clean=",
+                    "-c", "filter.lfs.required=false", "-c", "core.hooksPath=/dev/null"]
+
+
+          def local_git(args, cwd=None, capture=False):
+              """A git command that needs no credential (init, add, commit, merge, tag), with LFS and hooks off."""
+              return run(["git", *NO_LFS, *args], cwd=cwd, capture=capture, env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})
+
+
           def git(args, cwd=None, capture=False):
               # The token travels as a per-command header, never in a remote URL, so nothing on disk holds it; run() redacts
               # it from what it prints.
               token = os.environ.get("REPOS_TOKEN", "")
               auth = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth(token)}"] if token else []
-              return run(["git", *auth, *args], cwd=cwd, capture=capture)
+              return local_git([*auth, *args], cwd=cwd, capture=capture)
 
 
           def dotnet_env():
@@ -1069,7 +1085,7 @@ jobs:
                   # One commit, no blobs: the remote already holds everything the new branch names.
                   # The branch as it is now (a lane may have merged since the read above), fetched and pushed by name.
                   with tempfile.TemporaryDirectory() as scratch:
-                      run(["git", "init", "-q", scratch])
+                      local_git(["init", "-q", scratch])
                       git(["fetch", "-q", "--depth=1", "--filter=blob:none", url, f"refs/heads/{ref}"], cwd=scratch)
                       at_ref = git(["rev-parse", "FETCH_HEAD"], cwd=scratch, capture=True).strip()
                       git(["push", "-q", url, f"{at_ref}:refs/heads/{split}"], cwd=scratch)
@@ -1097,7 +1113,7 @@ jobs:
 
 
           def train_commit(cwd, args):
-              run(["git", "-c", f"user.name={TRAIN_NAME}", "-c", f"user.email={TRAIN_EMAIL}", *args], cwd=cwd)
+              local_git(["-c", f"user.name={TRAIN_NAME}", "-c", f"user.email={TRAIN_EMAIL}", *args], cwd=cwd)
               return git(["rev-parse", "HEAD"], cwd=cwd, capture=True).strip()
 
 
@@ -1113,7 +1129,7 @@ jobs:
               others = sorted({f"{pid} to {new}" for _, pid, _, new in pins if new != version})
               message = f"[train {version}] pin " + "; ".join(
                   ([", ".join(ids) + f" to {version}"] if ids else []) + others)
-              run(["git", "add", "--", *sorted({path for path, *_ in pins})], cwd=src)
+              local_git(["add", "--", *sorted({path for path, *_ in pins})], cwd=src)
               return train_commit(src, ["commit", "-q", "-m", message])
 
 
@@ -1477,7 +1493,7 @@ jobs:
               # main is at what was built from here on, even if the tag push below fails and the repository is recorded as
               # stranded: a host listed here is on main and so needs the caller's deploy (hosts-promoted).
               plan.setdefault("main_moved", []).append(name)
-              run(["git", "-c", f"user.name={TRAIN_NAME}", "-c", f"user.email={TRAIN_EMAIL}",
+              local_git(["-c", f"user.name={TRAIN_NAME}", "-c", f"user.email={TRAIN_EMAIL}",
                    "tag", "-a", tag, repo["sha"], "-m", f"Release train {plan['version']}"], cwd=dest)
               git(["push", "origin", f"refs/tags/{tag}"], cwd=dest)
               plan["promoted"].append(name)
