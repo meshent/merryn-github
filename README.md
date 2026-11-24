@@ -261,9 +261,7 @@ The same holds for every other workflow in the caller repository. A gate can pla
 exact key it can compute from the repository's project files, so a tenant with frontends runs no NuGet cache there at
 all: call `dotnet-validate.yml` with `nuget-cache: false`, and use no `actions/cache` (or `setup-*` `cache:` input)
 for packages in its own workflows. When a tenant removes its last frontend, delete every `nuget-*` cache entry in the
-caller repository before turning caches back on. Removing a tenant's last
-frontend turns the cache back on, so delete that repository's `nuget-*` cache entries first
-(`gh cache delete --all` in the caller repository).
+caller repository before turning caches back on (`gh cache delete --all` there).
 
 That second call is the promote-only mode with frontends only (promote-only refuses a call that names a frontend beside
 a repository or host): it re-checks each sha against the ref and `main`, fast-forwards `main` and tags
@@ -325,9 +323,11 @@ jobs:
 | `test-args` | extra arguments for `dotnet test` |
 | `label` | the label that opts a PR in; default `ci:validate`. Empty runs on every PR event the wrapper subscribes to |
 | `dotnet-version` | default `10.0.x` |
+| `nuget-cache` | restore and save `~/.nuget/packages` through the Actions cache (exact key, never a prefix); default `true`. Pass `false` in a repository whose release train has frontends: their gates run untrusted npm code in its cache scope |
 | secret `packages-token` | `read:packages` on the org feed. Optional: the fallback is the workflow's own token, which reads an org package only when that package grants the calling repository access (package settings › Manage Actions access). Pass one (e.g. `secrets.MESHENT_CI_PAT`) when it does not |
 
-Both workflows cache `~/.nuget/packages` with `actions/cache`, keyed on the project files. They deliberately do not
+Both workflows cache `~/.nuget/packages` with `actions/cache`, keyed exactly on the project files, never restored by
+prefix; `dotnet-validate.yml` skips it with `nuget-cache: false` (see the release train's frontends). They deliberately do not
 use `setup-dotnet`'s `cache: true`, which needs `packages.lock.json`, and a lock file pins every `Version="*"` float
 to whatever it resolved last time.
 
