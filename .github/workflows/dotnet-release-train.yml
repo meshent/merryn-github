@@ -257,12 +257,21 @@ jobs:
               return result.stdout if capture else ""
 
 
+          # Git LFS stays off for every git command the train runs (coordinator:C149). GitHub's ubuntu images install git-lfs
+          # with `git lfs install --system`, so a checkout runs its smudge filter, and a repository's .lfsconfig names the
+          # server git-lfs talks to, with the -c http.extraHeader below: any repository's committer could have the token
+          # sent anywhere. No manifest repository uses LFS; a pointer file stays a pointer.
+          NO_LFS = ["-c", "filter.lfs.process=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.clean=",
+                    "-c", "filter.lfs.required=false"]
+
+
           def git(args, cwd=None, capture=False):
               # The token travels as a per-command header, never in a remote URL, so nothing on disk holds it; run() redacts
               # it from what it prints.
               token = os.environ.get("REPOS_TOKEN", "")
               auth = ["-c", f"http.extraHeader=AUTHORIZATION: basic {basic_auth(token)}"] if token else []
-              return run(["git", *auth, *args], cwd=cwd, capture=capture)
+              return run(["git", *NO_LFS, *auth, *args], cwd=cwd, capture=capture,
+                         env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})
 
 
           def dotnet_env():
