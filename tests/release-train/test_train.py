@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -1364,9 +1365,14 @@ class EndToEnd(Fixture):
         self.assertEqual(promote.returncode, 0, promote.stdout)
         pin_commit = self.rev("Down", "main")
         self.assertFalse(self.is_ancestor("Down", "main", "release"))  # main is ahead of release by the pin commit
-        # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved.
+        # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved. Its stamp must differ from
+        # the first train's: the stamp has two-second resolution, and a fast runner gets here inside one window, which
+        # would give both trains the same version and the second one's train/<version> tag would already exist.
+        while self.module.normalized_version(*self.module.stamp()) == first:
+            time.sleep(0.2)
         plan = self.train("plan")
         self.assertEqual(plan.returncode, 0, plan.stdout)
+        self.assertNotEqual(json.loads((self.root / "train/plan.json").read_text())["version"], first)
         self.assertIn("is ahead of release by train commits only; this train reconciles it", plan.stdout)
         state = json.loads((self.root / "train/plan.json").read_text())
         self.assertEqual(state["selected"], ["Down"])
