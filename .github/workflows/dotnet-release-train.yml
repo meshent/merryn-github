@@ -11,14 +11,17 @@
 #            the commit its newest version on the org feed was packed from), a package it depends on is in the train, or
 #            it was never published; every other package is neither packed nor pushed. A repository is in the train when
 #            one of its packages is, or when `ref` has commits main lacks (main moves even when nothing is published).
-#            The version stamp is read ONCE from the clock with Directory.Build.props' formula (UTC, one reading) and is
-#            the train id; nothing sets Version*, PackageVersion or GITHUB_RUN_NUMBER by hand.
+#            The version stamp (build, revision) is read ONCE from the clock with Directory.Build.props' formula (UTC, one
+#            reading); each project keeps the VersionMajor.VersionMinor its own Directory.Build.props declares, and the
+#            plan evaluates every in-train package's version with MSBuild under the pack's properties. The train id
+#            (label) is <highest major.minor among its packages and the latest train/* tag>.<build>.<revision>; nothing
+#            sets Version*, PackageVersion or GITHUB_RUN_NUMBER by hand.
 #   build    bottom-up, per selected repository: adds the runner-local feed to its nuget.config (never committed), runs
 #            its tests from source (with -p:UseProjectReferences=true where Directory.Build.targets has that switch),
 #            then packs every package of it that is in the train WITHOUT the switch, from a copy taken before anything
 #            was built, into the local feed. A downstream repository restores the upstream packed minutes earlier. Every
-#            package must carry the train stamp and every in-train dependency in its nuspec must name that same version.
-#            Before packing, an exact pin on an in-train package moves to the train version and one on any other manifest
+#            package must carry its evaluated train version and every in-train dependency in its nuspec must name that
+#            dependency's own train version. Before packing, an exact pin on an in-train package moves to its train version and one on any other manifest
 #            package moves forward (never back) to its newest release already on the feed, so nothing packs against a
 #            pin that a dependency published ahead of it has outpaced.
 #            Then each selected HOST (the manifest's `hosts`), after every package repository: the same pin resolution
@@ -183,14 +186,15 @@ jobs:
                       package edges (a cycle fails, naming it), select the packages that changed since their last
                       publication (select_packages) and the repos that carry one or are ahead of main, the hosts that
                       consume an in-train package or are ahead of main (select_host), read the one
-                      version stamp from the clock, refuse a repo whose main is not an ancestor of TRAIN_REF
+                      version stamp from the clock, evaluate each in-train package's version (its project's own
+                      major.minor with the stamp) and the train label, refuse a repo whose main is not an ancestor of TRAIN_REF
                       (a dry run warns instead: it promotes nothing). TRAIN_REF_OVERRIDES, dry runs only, takes the
                       repos it names at another branch, so a lane branch can ride a rehearsal before it merges
-            build     per selected repo, bottom-up: bump every exact pin on an in-train package to the train version
+            build     per selected repo, bottom-up: bump every exact pin on an in-train package to its train version
                       and every stale exact pin on another manifest package forward to its newest published release
                       (committed on a live train), point its nuget.config at the local feed, pack its in-train projects
                       (without the source-graph switch, from an untouched copy) into the local feed, check every package
-                      carries the train version and every in-train dependency in its nuspec names that same version, then
+                      carries its evaluated train version and every in-train dependency in its nuspec names its own, then
                       run its test gate from source; then each selected host (hosts last): the same pins, its build
                       and test targets against the local feed, nothing packed
             publish   push every package to the org feed in the same order (only reached when build passed everywhere)
@@ -559,15 +563,86 @@ jobs:
               return seconds // 86400, (seconds % 86400) // 2
 
 
-          def normalized_version(build, revision):
-              # NuGet drops a trailing zero revision: 0.0.2471.0 is published (and named) 0.0.2471.
-              return f"0.0.{build}.{revision}" if revision else f"0.0.{build}"
+          def nuget_normalized(version):
+              """A version as NuGet names the package: numeric parts without leading zeros, at least three of them, and a
+              trailing zero revision dropped (1.2.2471.0 is published, and named, 1.2.2471). Anything else (a prerelease
+              label) is returned as written."""
+              text = (version or "").strip()
+              if not VERSION.fullmatch(text):
+                  return text
+              parts = [int(p) for p in text.split(".")]
+              parts += [0] * (3 - len(parts))
+              if len(parts) == 4 and parts[3] == 0:
+                  parts = parts[:3]
+              return ".".join(str(p) for p in parts)
+
+
+          def normalized_version(build, revision, line):
+              """<major>.<minor>.<build>.<revision>, NuGet-normalized. line is the (major, minor) a project declares in its
+              own Directory.Build.props (or the train label's line): the train never chooses it, it only stamps the clock."""
+              return nuget_normalized(f"{line[0]}.{line[1]}.{build}.{revision}")
+
+
+          def stamp_of(version):
+              """(build, revision) of a <major>.<minor>.<build>[.<revision>] version: the train stamp it carries, whatever
+              line the project is on. A missing revision is 0, as NuGet drops it."""
+              parts = version_key(version) + (0, 0, 0, 0)
+              return parts[2], parts[3]
+
+
+          def line_of(version):
+              """(major, minor) of a version: the line its project declares."""
+              parts = version_key(version) + (0, 0)
+              return parts[0], parts[1]
 
 
           def stamp_time(version):
-              """The UTC moment a 0.0.<build>.<revision> stamp was read: stamp()'s inverse, to the second."""
+              """The UTC moment a <major>.<minor>.<build>.<revision> stamp was read: stamp()'s inverse, to the second. Only
+              build and revision count, so any line works."""
               parts = version_key(version) + (0, 0)
               return EPOCH + timedelta(days=parts[2], seconds=parts[3] * 2)
+
+
+          # The line of the train label when nothing names one: no package ships in this train and no repository carries a
+          # train/* tag yet (a first, host-only train).
+          FIRST_LINE = (0, 0)
+
+
+          def train_label(build, revision, package_versions, tags):
+              """The train's one name: the version output, the train/<label> tag and the [train <label>] commits. Its line is
+              the highest major.minor among this train's packages (as each project evaluates its own) and the latest
+              train/* tag of any manifest repository, so a label never sorts below an earlier train's tag even when this
+              train ships only packages on an older line, or none (a host-only train reuses the latest tag's line). Its build
+              and revision are the stamp, so a later train's label is always larger."""
+              lines = [line_of(v) for v in package_versions if VERSION.fullmatch(v)]
+              lines += [line_of(t[len("train/"):]) for t in tags if t and VERSION.fullmatch(t[len("train/"):])]
+              return normalized_version(build, revision, max(lines, default=FIRST_LINE))
+
+
+          def evaluate_version(dest, path, package_id, build, revision, env):
+              """The version a project packs at under this train's stamp, evaluated by MSBuild with exactly the properties
+              the pack passes, NuGet-normalized: the project's own VersionMajor.VersionMinor with the train's build and
+              revision. Raises TrainError, naming what it evaluated, when the result does not carry the stamp."""
+              out = run(["dotnet", "msbuild", path, "-nologo", *pack_properties(build, revision),
+                         "-getProperty:PackageVersion", "-getProperty:Version"], cwd=dest, capture=True, env=env)
+              try:
+                  props = json.loads(out[out.find("{"):])["Properties"]
+              except (ValueError, KeyError):
+                  raise TrainError(f"{package_id}: could not evaluate its PackageVersion ({path}): {redact(out.strip())[-300:]}")
+              evaluated = props.get("PackageVersion") or props.get("Version") or ""
+              version = nuget_normalized(evaluated)
+              if not VERSION.fullmatch(version) or stamp_of(version) != (build, revision):
+                  raise TrainError(f"{package_id}: evaluates to PackageVersion '{evaluated}', expected <VersionMajor>."
+                                   f"<VersionMinor>.{build}.{revision}; the project did not take the train stamp (its "
+                                   f"Directory.Build.props must accept VersionBuild/VersionRevision)")
+              return version
+
+
+          def pack_properties(build, revision):
+              """The properties every pack (and every version evaluation) passes. Never a VersionMajor/VersionMinor: the
+              project dictates its line."""
+              return ["-p:Branch=main", f"-p:VersionBuild={build}", f"-p:VersionRevision={revision}",
+                      "-p:ContinuousIntegrationBuild=true"]
 
 
           # --- nuget.config ------------------------------------------------------------------------------------------------
@@ -617,9 +692,10 @@ jobs:
           VERSION = re.compile(r"\d+(\.\d+){1,3}")
 
 
-          def pin_train_versions(dest, train_ids, version, latest=None):
-              """Bump every exact pin on a package this train produces to the train version, in every .csproj and
-              Directory.Packages.props under dest. A float (`*`, `1.*`) is left alone: it resolves to the train version through
+          def pin_train_versions(dest, train, latest=None):
+              """Bump every exact pin on a package this train produces to its train version, in every .csproj and
+              Directory.Packages.props under dest. train maps each in-train package to the version it packs at in this train
+              (its project's own major.minor with the train's stamp, evaluate_version). A float (`*`, `1.*`) is left alone: it resolves to the train version through
               the local feed by itself. Returns [(path, id, old, new)], the record of what the train rewrote. This is what makes
               exact pins (dependencies tracked, never discovered) and one-version trains compatible: the train is the one place
               that knows the version it is about to publish, so it maintains the pins, and on a live train commits them.
@@ -640,8 +716,8 @@ jobs:
 
                   def bump(m):
                       package_id, old = m.group("id"), m.group("version")
-                      if package_id in train_ids:
-                          new = version
+                      if package_id in train:
+                          new = train[package_id]
                       elif package_id in latest and VERSION.fullmatch(old) and version_key(old) < version_key(latest[package_id]):
                           new = latest[package_id]
                       else:
@@ -680,22 +756,30 @@ jobs:
               wanted = f"{package_id}.{version}.nupkg".lower()
               match = [p for p in FEED.glob("*.nupkg") if p.name.lower() == wanted]
               if not match:
-                  raise TrainError(f"{package_id}: no {package_id}.{version}.nupkg in the local feed; the project did not "
-                                   f"take the train stamp (its Directory.Build.props must accept VersionBuild/VersionRevision)")
+                  prefix = f"{package_id}.".lower()
+                  found = sorted(p.name for p in FEED.glob("*.nupkg") if p.name.lower().startswith(prefix)
+                                 and VERSION.fullmatch(p.name[len(prefix):-len(".nupkg")]))
+                  raise TrainError(f"{package_id}: no {package_id}.{version}.nupkg in the local feed (it evaluated to "
+                                   f"{version}; the feed has {', '.join(found) or f'no {package_id} package'}); the project "
+                                   f"did not take the train stamp (its Directory.Build.props must accept "
+                                   f"VersionBuild/VersionRevision)")
               return match[0]
 
 
-          def check_package(package_id, version, train_ids):
+          def check_package(package_id, version, train):
+              """The packed package carries version (what its project evaluated to under the train stamp), and every
+              in-train dependency in its nuspec names that package's own train version (train maps id to version)."""
               nupkg = find_package(package_id, version)
               nid, nversion, deps = nuspec_of(nupkg)
               if nversion != version:
-                  raise TrainError(f"{nupkg.name}: nuspec version {nversion}, expected the train version {version}")
-              wrong = [(d, v) for d, v in deps if d in train_ids and lower_bound(v) != version]
+                  raise TrainError(f"{nupkg.name}: nuspec version {nversion}, expected its train version {version}")
+              wrong = [(d, v, train[d]) for d, v in deps if d in train and lower_bound(v) != train[d]]
               if wrong:
-                  raise TrainError(f"{nupkg.name}: depends on {', '.join(f'{d} {v}' for d, v in wrong)}, not the train "
-                                   f"version {version}; it restored a sibling from outside this train")
+                  raise TrainError(f"{nupkg.name}: depends on " +
+                                   ", ".join(f"{d} {v} (its train version is {want})" for d, v, want in wrong) +
+                                   ", not the train version; it restored a sibling from outside this train")
               return {"id": nid, "version": nversion, "file": nupkg.name,
-                      "dependencies": [f"{d} {v}" for d, v in deps if d in train_ids]}
+                      "dependencies": [f"{d} {v}" for d, v in deps if d in train]}
 
 
           # --- Reading the org feed (each package's last publication; promote-only) -----------------------------------------
@@ -978,13 +1062,15 @@ jobs:
 
 
           def published_versions(org, ids, before):
-              """{id: newest release version on the org feed below the train version before} for each of ids the feed has:
-              what was published (by an earlier train, in merge order) ahead of this train. Stamps grow with time, so a
-              promote-only for the same train reads the same map the plan did."""
+              """{id: newest release version on the org feed stamped before the train before} for each of ids the feed has:
+              what was published (by an earlier train, in merge order) ahead of this train. "Before" compares the stamp
+              (build, revision) only, never the line: a package on 0.1 published yesterday is ahead of a train labelled
+              0.1 and of one labelled 0.0 alike, and a package's newest is still picked by its full version. Stamps grow
+              with time, so a promote-only for the same train reads the same map the plan did."""
               found = {}
               for package_id in sorted(ids):
                   versions = [v for v in feed_versions(org, package_id)
-                              if VERSION.fullmatch(v) and version_key(v) < version_key(before)]
+                              if VERSION.fullmatch(v) and stamp_of(v) < stamp_of(before)]
                   if versions:
                       found[package_id] = max(versions, key=version_key)
               return found
@@ -1124,11 +1210,22 @@ jobs:
                                          line.split("\x1f", 1)[-1].startswith("[train ") for line in lines)
 
 
-          def commit_pins(src, pins, version):
-              ids = sorted({pid for _, pid, _, new in pins if new == version})
-              others = sorted({f"{pid} to {new}" for _, pid, _, new in pins if new != version})
+          def commit_pins(src, pins, version, train=None):
+              """Commit the pin rewrites as "[train <label>] pin A, B to <its train version>; C to <newest release>": the
+              in-train packages grouped by the version each packs at (one group per line, so one group while every
+              package shares the label), then every forward move on a package outside the train."""
+              def in_train(pid, new):
+                  return train.get(pid) == new if train else new == version
+
+              moved_in = {(pid, new) for _, pid, _, new in pins if in_train(pid, new)}
+              groups = {}
+              for pid, new in moved_in:
+                  groups.setdefault(new, set()).add(pid)
+              others = sorted({f"{pid} to {new}" for _, pid, _, new in pins if (pid, new) not in moved_in})
               message = f"[train {version}] pin " + "; ".join(
-                  ([", ".join(ids) + f" to {version}"] if ids else []) + others)
+                  [", ".join(sorted(groups[v])) + f" to {v}"
+                   for v in sorted(groups, key=lambda v: (v != version, version_key(v) if VERSION.fullmatch(v) else ()))] +
+                  others)
               local_git(["add", "--", *sorted({path for path, *_ in pins})], cwd=src)
               return train_commit(src, ["commit", "-q", "-m", message])
 
@@ -1289,7 +1386,26 @@ jobs:
               frontends_selected = [n for n in frontends_selected if repos[n]["selected"]]
 
               build, revision = stamp()
-              version = normalized_version(build, revision)
+              # Each package's train version is what its own project evaluates to under the stamp, with exactly the
+              # properties the pack passes: its Directory.Build.props declares VersionMajor.VersionMinor, the train only
+              # stamps build and revision. Evaluated here, from the checkout the build copies to pack (the build only adds
+              # pins and a reconcile merge that keeps this tree), so the label below and every pin and check share it. A
+              # project that does not take the stamp is recorded against its repository, whose build then fails with
+              # what it evaluated, so one run still reports every failure.
+              env = dotnet_env()
+              versions = {}
+              for name in repo_order:
+                  repo = repos[name]
+                  by_path = {p["path"]: p for p in repo["projects"]}
+                  for path in repo["ships"]:
+                      package_id = by_path[path]["id"]
+                      try:
+                          versions[package_id] = evaluate_version(checkout_dir(SRC, name), path, package_id, build, revision, env)
+                      except TrainError as error:
+                          repo.setdefault("version_errors", []).append(str(error))
+                          log(f"::error::{name}: {redact(str(error))}")
+              tags = [r["tag"]["tag"] for r in list(repos.values()) if r.get("tag")]
+              version = train_label(build, revision, versions.values(), tags)
               # Only the packages that changed are in the train. An exact pin on any other manifest package moves forward to
               # its newest version on the feed (published ahead of this train, in merge order), never back: a sibling's
               # float resolves to its newest version, which may already name a newer one than a stale csproj pin.
@@ -1297,7 +1413,7 @@ jobs:
               published = published_versions(manifest["org"], set(owner) - set(ship), version)
               split_from = os.environ.get("TRAIN_REF", "release")
               plan = {"org": manifest["org"], "ref": ref, "split_from": split_from if split_from != ref else None,
-                      "version": version, "build": build, "revision": revision,
+                      "version": version, "build": build, "revision": revision, "versions": versions,
                       "dry_run": dry_run, "overrides": overrides, "warnings": warnings,
                       "repo_order": repo_order, "selected": selected, "train_ids": train_ids, "ship": ship,
                       "decisions": decisions, "published": published,
@@ -1320,7 +1436,7 @@ jobs:
                   log(f"  {'*' if repos[name]['selected'] else ' '} {name} (frontend): {repos[name]['reason']}")
               log(f"Packages: {len(ship)} of {len(decisions)} in this train, across {len(repo_order)} repositories")
               for package_id, reason in ship.items():
-                  log(f"  + {package_id}: {reason}")
+                  log(f"  + {package_id} {versions.get(package_id, '(no version: see the error above)')}: {reason}")
               output("version", version)
               output("frontends-matrix", json.dumps(archive_frontends(plan), separators=(",", ":")))
               # No NuGet cache for a tenant with frontends: their gates run untrusted npm code in this caller's cache scope,
@@ -1376,10 +1492,14 @@ jobs:
 
           def build_repo(plan, name, repo, train_ids, version, env):
               """Build, pack and test one selected repository (or build and test one host); returns the packages it packed.
-              Raises TrainError where it fails; cmd_build decides what still runs after that."""
+              version is the train label. Raises TrainError where it fails; cmd_build decides what still runs after that."""
               packages = []
+              # {id: the version it packs at}: each project's own major.minor with the train's stamp (cmd_plan).
+              train = plan.get("versions", {})
+              if repo.get("version_errors"):
+                  raise TrainError("; ".join(repo["version_errors"]))
               src, pack = checkout_dir(SRC, name), checkout_dir(PACK, name)
-              # Exact pins on in-train packages move to the train version first, in the source tree, before any copy: the
+              # Exact pins on in-train packages move to their train versions first, in the source tree, before any copy: the
               # train is the one place that knows the version it is about to publish. On a live train that edit is
               # committed on top of the ref (only the project files, never the nuget.config edit below), so main and the
               # ref receive exactly what was packed. A dry run keeps the edit in the runner's copy only.
@@ -1391,19 +1511,19 @@ jobs:
                                                    f"[train {version}] reconcile main's train commits into {plan['ref']}",
                                                    repo["reconcile"]])
                   repo["train_commits"] = True
-              pins = pin_train_versions(src, train_ids, version, newest(plan.get("published"), repo.get("carry")))
+              pins = pin_train_versions(src, train, newest(plan.get("published"), repo.get("carry")))
               repo["pins"] = [list(p) for p in pins]
               if pins:
                   log(f"{name}: pinned {len(pins)} reference(s): " +
                       ", ".join(sorted({f'{pid} ({old} -> {new})' for _, pid, old, new in pins})))
                   if not plan["dry_run"]:
-                      repo["sha"] = commit_pins(src, pins, version)
+                      repo["sha"] = commit_pins(src, pins, version, train)
                       repo["train_commits"] = True
               if repo.get("host"):
                   point_at_local_feed(src, train_ids)
                   build_host(repo, src, env)
                   log("::endgroup::")
-                  log(f"{name} (host): built and tested at {version}, nothing packed")
+                  log(f"{name} (host): built and tested against train {version}, nothing packed")
                   return packages
               # Pack from a copy taken before anything is built: never pack a tree the source-graph switch touched.
               if pack.exists():
@@ -1414,12 +1534,11 @@ jobs:
               # Pack before testing: a pin bumped to the train version can only restore once the upstream package is in
               # the local feed, and the project order puts it there first. Publishing is still gated on the tests below.
               for path in repo["ships"]:
-                  run(["dotnet", "pack", path, "-c", "Release", "-o", FEED, "-p:Branch=main",
-                       f"-p:VersionBuild={plan['build']}", f"-p:VersionRevision={plan['revision']}",
-                       "-p:ContinuousIntegrationBuild=true"], cwd=pack, env=env)
+                  run(["dotnet", "pack", path, "-c", "Release", "-o", FEED,
+                       *pack_properties(plan["build"], plan["revision"])], cwd=pack, env=env)
               for path in repo["ships"]:
                   project = next(p for p in repo["projects"] if p["path"] == path)
-                  packages.append({"repo": name, **check_package(project["id"], version, train_ids)})
+                  packages.append({"repo": name, **check_package(project["id"], train[project["id"]], train)})
               if repo["test"]:
                   args = ["dotnet", "test", repo["solution_file"], "-c", "Release"]
                   if repo["source_graph"]:
@@ -1430,7 +1549,8 @@ jobs:
               else:
                   log(f"{name}: tests skipped (\"test\": false in the manifest)")
               log("::endgroup::")
-              log(f"{name}: {len(repo['ships'])} package(s) at {version}" +
+              log(f"{name}: {len(repo['ships'])} package(s) at " +
+                  ", ".join(sorted({p["version"] for p in packages})) + f" (train {version})" +
                   (f"; {len(repo['project_order']) - len(repo['ships'])} unchanged, not packed"
                    if len(repo["ships"]) < len(repo["project_order"]) else ""))
               return packages
@@ -1626,14 +1746,21 @@ jobs:
               # The train's packages are exactly the ones on the feed at its version: a train publishes only what changed, so
               # a repository it tagged or stranded may have shipped some of its packages and not others.
               at = {**tagged_at, **others, **{name: repos[name]["sha"] for name in targets}}
-              member_ids, manifest_ids, warnings = {}, set(), []
+              member_ids, member_versions, manifest_ids, warnings = {}, {}, set(), []
               for name in [r["repo"] for r in manifest["repos"]]:
                   ids = packable_ids_at(name, at[name])
                   manifest_ids.update(ids)
-                  member_ids[name] = [i for i in ids if version in feed_versions(manifest["org"], i)]
+                  # A package is in the train when the feed has it at the train's stamp, on whatever line its project
+                  # declares (the label's line is the highest of them, so it need not be the package's own).
+                  for i in ids:
+                      at_stamp = sorted((v for v in feed_versions(manifest["org"], i)
+                                         if VERSION.fullmatch(v) and stamp_of(v) == stamp_of(version)), key=version_key)
+                      if at_stamp:
+                          member_versions[i] = at_stamp[-1]
+                  member_ids[name] = [i for i in ids if i in member_versions]
                   if name in others and member_ids[name]:
                       warnings.append(f"{name} was in train {version} but is neither tagged nor named; its packages are pinned "
-                                      f"at {version} here. Finish it with promote-only too.")
+                                      f"at their train {version} versions here. Finish it with promote-only too.")
                       log(f"::warning::{warnings[-1]}")
               train_ids = {i for ids in member_ids.values() for i in ids}
               if not train_ids and not set(targets) <= host_names | frontend_names:
@@ -1665,16 +1792,16 @@ jobs:
                                                         f"[train {version}] reconcile main's train commits", repo["main"]])
                       repo["train_commits"] = True
                   carry = pins_at(dest, repo["carry_from"], manifest_ids) if repo.get("carry_from") else {}
-                  pins = pin_train_versions(dest, train_ids, version, newest(published, carry))
+                  pins = pin_train_versions(dest, member_versions, newest(published, carry))
                   repo["pins"] = [list(p) for p in pins]
                   if pins:
-                      repo["sha"] = commit_pins(dest, pins, version)
+                      repo["sha"] = commit_pins(dest, pins, version, member_versions)
                       repo["train_commits"] = True
                   log(f"{name}: main {repo['main'][:12]} -> {repo['sha'][:12]} (from {repo['base'][:12]}"
                       f"{', with ' + str(len(pins)) + ' pin(s)' if pins else ''}), tag {tag}")
               plan = {"mode": "promote-only", "org": manifest["org"], "ref": ref, "version": version, "dry_run": dry_run,
                       "overrides": {}, "warnings": warnings, "repo_order": names, "selected": names,
-                      "repo_edges": {n: [] for n in names}, "train_ids": sorted(train_ids),
+                      "repo_edges": {n: [] for n in names}, "train_ids": sorted(train_ids), "versions": member_versions,
                       "repos": repos, "packages": [], "promoted": [], "stranded": [], "release_behind": [], "release_refused": []}
               PLAN.write_text(json.dumps(plan, indent=2))
               output("version", version)
@@ -1723,7 +1850,7 @@ jobs:
               packed = {p["id"]: p for p in plan["packages"]}
               if plan.get("ship"):
                   lines += ["", "| package | why | version | in-train dependencies |", "|---|---|---|---|"]
-                  lines += [f"| {i} | {reason} | {packed[i]['version'] if i in packed else plan['version'] + ' (not packed)'} | "
+                  lines += [f"| {i} | {reason} | {packed[i]['version'] if i in packed else plan.get('versions', {}).get(i, plan['version']) + ' (not packed)'} | "
                             f"{', '.join(packed[i]['dependencies']) if i in packed and packed[i]['dependencies'] else '—'} |"
                             for i, reason in plan["ship"].items()]
               elif plan["packages"]:

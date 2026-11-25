@@ -96,11 +96,37 @@ A repository is **in the train** when one of its packages is, or when `ref` has 
 or docs-only change is promoted and tagged with nothing published. A repository with `ref` equal to `main` and no
 package change is skipped and reported "unchanged".
 
-**The version is the build's own stamp, read once.** The train reads the clock once (UTC) and applies the
-`Directory.Build.props` formula: `0.0.<days since 2020-01-01>.<half-seconds into the day>`. It passes the result to
-every pack as `VersionBuild`/`VersionRevision`, the inputs `Directory.Build.props` already takes from CI, and uses it
-as the train id. **Nothing sets `Version*`, `PackageVersion` or `GITHUB_RUN_NUMBER` by hand.** The packages in one
-train share the stamp because it was read once, not because anyone chose a version.
+**The version is the build's own stamp, read once, on each project's own line.** The train reads the clock once
+(UTC) and applies the `Directory.Build.props` formula: build = days since 2020-01-01, revision = half-seconds into
+the day. It passes them to every pack as `VersionBuild`/`VersionRevision`, the inputs `Directory.Build.props` already
+takes from CI. **Each project declares its own `VersionMajor.VersionMinor`** in its `Directory.Build.props`; the train
+never passes or assumes one. **Nothing sets `Version*`, `PackageVersion` or `GITHUB_RUN_NUMBER` by hand.** The
+packages in one train share the stamp because it was read once, not because anyone chose a version: a repository on
+`0.1` packs `0.1.<build>.<revision>`, one still on `0.0` packs `0.0.<build>.<revision>`, in the same train.
+
+**Each package's train version is evaluated, not built by the train.** Right after the stamp is read, the plan asks
+MSBuild what every package in the train packs at, with exactly the properties the pack passes
+(`dotnet msbuild <csproj> -p:Branch=main -p:VersionBuild=<b> -p:VersionRevision=<r>
+-p:ContinuousIntegrationBuild=true -getProperty:PackageVersion`), NuGet-normalized (a zero revision is dropped:
+`0.1.2520.0` is `0.1.2520`). That per-package version is what the train looks for in the local feed, checks in the
+nuspec, writes into exact pins (sibling packages and hosts) and compares against the feed. A project whose evaluated
+version does not carry the train's build and revision fails its repository with what it evaluated and what was
+expected ("did not take the train stamp").
+
+**The train label** is the one name a train still needs: the `version` output, the `train/<label>` tag and the
+`[train <label>]` commits. It is **`<highest major.minor>.<build>.<revision>`**, NuGet-normalized, where the highest
+major.minor is taken over every package in this train (as each evaluates) **and** the latest `train/*` tag of any
+manifest repository. So:
+- a train that ships only `0.0` packages, or a mixed `0.0`/`0.1` train, is labelled on `0.1` once any repository is
+  tagged on `0.1` (or a `0.1` package ships): a label never sorts below an earlier train's tag, and since the stamp only
+  grows, the next label always sorts above this one (`latest_train_tag`, `promote-only`'s "tag before this train");
+- a host-only train (nothing ships) reuses the latest `train/*` tag's line;
+- a first train with no package and no tag anywhere falls back to `0.0`;
+- a manifest whose repositories are all still on `0.0` is labelled exactly as before.
+
+The label and a package's version can differ (a `0.0` package in a train labelled `0.1`). `promote-only` takes the
+label as `version` and finds the train's packages on the feed by its stamp (build and revision), whatever line each is
+on; "published ahead of this train" also compares stamps, never lines.
 
 Each repository is cloned alone in its own folder, so a project that switches to a sibling checkout when one sits
 next to it (a `ProjectReference` conditioned on `Exists('../../<repo>/...')`) builds and packs in the train exactly
@@ -114,8 +140,9 @@ For each selected repository, bottom-up, the train:
    defines that switch.
 3. Packs its packages that are in the train into the local feed, **without** the switch, from a copy of the
    repository taken before anything was built.
-4. Checks each package before moving on. Every package must carry the train version, and every in-train dependency
-   in its nuspec must name that same version. A package that restored a sibling from outside the train fails here.
+4. Checks each package before moving on. Every package must carry its evaluated train version, and every in-train
+   dependency in its nuspec must name that dependency's own train version. A package that restored a sibling from
+   outside the train fails here.
 
 Only when every selected repository has passed does the train push the packages, in the same order, with
 `--skip-duplicate`. It then fast-forwards `main` to `ref` in each repository (a plain push, never forced) and tags
@@ -271,8 +298,8 @@ promote-only and that run's `frontends-ready`. The run summary (and so a dry run
 lists every frontend with why it rides and the item keys in its commits `main` lacks (what would reach `main`), and the
 gate jobs add their results to it.
 
-**Done** means the run is green. On a live train that also means the summary lists every package at one version and
-every selected repository promoted. The tag `train/<version>` exists in each one, and its `main` equals `ref`.
+**Done** means the run is green. On a live train that also means the summary lists every package at the one stamp
+(each on its project's line) and every selected repository promoted. The tag `train/<version>` exists in each one, and its `main` equals `ref`.
 
 The train is one job in one concurrency group per organization, with `cancel-in-progress: false`: a killed publish
 would strand half a train on the feed. The script lives inside the workflow file, so a pinned tag pins the logic too.
@@ -281,7 +308,8 @@ would strand half a train on the feed. The script lives inside the workflow file
 
 **Exact pins.** A repository that pins an in-train package to an exact version (`Version="0.0.2460.13471"`, the
 "tracked, never discovered" convention) is handled by the train: before packing, every such pin on a package this
-train produces moves to the train version, so the packed nuspec names the version being published; a float
+train produces moves to that package's own train version (its line, the train's stamp), so the packed nuspec names
+the version being published; a float
 (`Version="*"`) is left alone and resolves through the local feed. On a live train the pin edit is committed on top of
 the ref and pushed to the ref and to `main` with the promote; a dry run keeps it in the runner's copy. Inside a
 repository the train packs first and tests after, so a bumped pin restores the sibling packed moments earlier;
