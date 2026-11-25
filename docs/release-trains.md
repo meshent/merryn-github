@@ -89,18 +89,24 @@ Phases, in the one job:
    That is what this replaces.
 3. **Stamp.** The clock is read once, the way `Directory.Build.props` already reads it (it accepts
    `VersionBuild`/`VersionRevision` from CI by design). Every package that ships in a train carries that
-   `0.0.<days>.<halfsecs>`, which is the train id. Nothing sets `Version*`, `PackageVersion` or `GITHUB_RUN_NUMBER` by
-   hand: it is the existing stamp taken once instead of once per pack. A proposal says it this way and never says "one
+   `<days>.<halfsecs>` as its build and revision, on the `VersionMajor.VersionMinor` its own `Directory.Build.props`
+   declares (the owner's rule: the project dictates its line, the train only stamps the clock). The plan evaluates
+   each package's version with MSBuild under the pack's properties and uses that per package for the feed lookup, the
+   nuspec check, exact pins and the feed comparisons. The train id (label) is `<highest major.minor>.<days>.<halfsecs>`,
+   the highest line among the train's packages and the latest `train/*` tag (a host-only train reuses the tag's; with
+   neither, `0.0`), so it never sorts below an earlier train. Nothing sets `Version*`, `PackageVersion` or
+   `GITHUB_RUN_NUMBER` by hand: it is the existing stamp taken once instead of once per pack. A proposal says it this way and never says "one
    version for N packages".
 4. **Build and pack, bottom-up, into a local feed.** For each repo in order: `dotnet restore` with the local feed folder
    as an extra source (so a downstream resolves the upstream that was packed a minute ago, not the one on the public
    feed), run the repo's test gate from source (`-p:UseProjectReferences=true` where the repo has the switch; a plain
    `dotnet test` otherwise), then `dotnet pack` **without** the switch into the local feed. The nuspec records the
-   sibling version it actually restored, which is the train's version. Nothing has left the runner yet.
+   sibling version it actually restored, which is that sibling's train version. Nothing has left the runner yet.
 5. **Publish.** Only when every selected repo built and passed: `dotnet nuget push` each package to GitHub Packages, in
    the same order. A failure anywhere in 4 publishes nothing, so the feed is never half a train.
-6. **Pin.** Consumers that pin exact versions get their `PackageReference` bumped to the train version by the train (the
-   one place that knows it), committed to `release` and `main` as `[train <id>] pin meshNet.* to <version>`. This is how
+6. **Pin.** Consumers that pin exact versions get their `PackageReference` bumped to the package's train version by the
+   train (the one place that knows it), committed to `release` and `main` as `[train <id>] pin meshNet.* to <version>`
+   (one `… to <version>` group per line when a train mixes lines). This is how
    the standing request for exact pins instead of `Version="*"` becomes sustainable: the train does the bump, not a
    person, and a host never again fails to compile against a float that moved under it (coordinator:C3, C6, P46).
    Repos still on floats need no pin step. **Owner decision** (filed): move consumers to exact pins now that the train
@@ -125,7 +131,7 @@ Phases, in the one job:
    A host is **in the train** when its ref has commits `main` lacks, or when any manifest package one of its projects
    references is in the train (a direct reference is enough: whatever depends on an in-train package is in the train
    itself). It is built **last**, after every package repository, so everything it can restore from this train is in
-   the local feed. Its pins resolve exactly as a package's do (`pin_train_versions` with the train version for an
+   the local feed. Its pins resolve exactly as a package's do (`pin_train_versions` with its own train version for an
    in-train package, else `newest(published, carry)`), the local feed is added to its `nuget.config` (left untouched
    when no package is in the train: a `packageSourceMapping` source with no pattern fails restore), then its `build`
    target is built and its `solution` (test target) tested, with the manifest's `test-env`/`test-args`, against

@@ -90,8 +90,8 @@ class Unit(unittest.TestCase):
             self.assertEqual(self.train.ref_overrides(), {"Down": "lane", "Up": "main"})
 
     def test_a_zero_revision_is_named_the_way_nuget_normalizes_it(self):
-        self.assertEqual(self.train.normalized_version(2472, 15628), "0.0.2472.15628")
-        self.assertEqual(self.train.normalized_version(2472, 0), "0.0.2472")
+        self.assertEqual(self.train.normalized_version(2472, 15628, (0, 0)), "0.0.2472.15628")
+        self.assertEqual(self.train.normalized_version(2472, 0, (0, 0)), "0.0.2472")
 
     def test_promotion_names_the_hosts_whose_main_moved_even_when_another_repository_strands(self):
         # The caller fires one deploy for the whole train from hosts-promoted, so a host that moved is named even when the
@@ -493,7 +493,8 @@ class Unit(unittest.TestCase):
             '<Project><ItemGroup><PackageVersion Include="Patterns.Messaging.Sms" Version="0.0.2460.13471" /></ItemGroup></Project>\n')
         (repo / "obj").mkdir()
         (repo / "obj" / "Stale.csproj").write_text('<PackageReference Include="Patterns.Messaging.Sms" Version="1" />')
-        changed = self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms", "meshNet.Common"}, "0.0.2472.17298")
+        changed = self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms": "0.0.2472.17298",
+                                                            "meshNet.Common": "0.0.2472.17298"})
         self.assertEqual(sorted(Path(c[0]).as_posix() for c in changed), ["Adapter/Adapter.csproj", "Directory.Packages.props"])
         self.assertEqual({(c[1], c[2], c[3]) for c in changed},
                          {("Patterns.Messaging.Sms", "0.0.2460.13471", "0.0.2472.17298")})
@@ -502,7 +503,7 @@ class Unit(unittest.TestCase):
         self.assertIn('Include="meshNet.Common" Version="*"', text)                       # a float stays a float
         self.assertIn('Include="Microsoft.Extensions.Http" Version="10.0.12"', text)     # not in the train
         self.assertIn('Version="1"', (repo / "obj" / "Stale.csproj").read_text())          # obj/ is never touched
-        self.assertEqual(self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms"}, "0.0.2472.17298"), [])  # idempotent
+        self.assertEqual(self.train.pin_train_versions(repo, {"Patterns.Messaging.Sms": "0.0.2472.17298"}), [])  # idempotent
 
     def test_a_pin_on_a_package_outside_the_train_moves_forward_to_its_latest_train_tag_and_never_back(self):
         repo = Path(self.tmp.name) / "latest"
@@ -520,7 +521,7 @@ class Unit(unittest.TestCase):
             """))
         latest = {"meshNet.Common": "0.0.2474.11566", "meshNet.Users": "0.0.2474.11566",
                   "meshNet.Shares": "0.0.2474.11566", "meshNet.Networks": "0.0.2474.11566"}
-        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce"}, "0.0.2476.9", latest)
+        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce": "0.0.2476.9"}, latest)
         self.assertEqual({(c[1], c[2], c[3]) for c in changed},
                          {("meshNet.Common", "0.0.2470.100", "0.0.2474.11566"),     # outside the train: its latest tag
                           ("meshNet.Commerce", "0.0.2470.100", "0.0.2476.9")})      # in the train: the train version
@@ -565,7 +566,7 @@ class Unit(unittest.TestCase):
         # main's carried pins and the feed merge to the higher of the two.
         self.assertEqual(self.train.newest(published, {"meshNet.Common": "0.0.2470.1", "meshNet.Users": "0.0.2475.2"},
                                            None)["meshNet.Users"], "0.0.2475.2")
-        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce.Models"}, version,
+        changed = self.train.pin_train_versions(repo, {"meshNet.Commerce.Models": version},
                                                 self.train.newest(published, {"meshNet.Common": "0.0.2470.1"}))
         self.assertEqual({(c[1], c[2], c[3]) for c in changed},
                          {("meshNet.Common", "0.0.2455.8240", "0.0.2474.11566")})
@@ -754,10 +755,10 @@ class Unit(unittest.TestCase):
 
     def test_a_package_that_restored_a_sibling_from_outside_the_train_fails(self):
         self._nupkg("A", "0.0.9.1", [("B", "0.0.9.1"), ("Newtonsoft.Json", "13.0.3")])
-        self.assertEqual(self.train.check_package("A", "0.0.9.1", {"A", "B"})["dependencies"], ["B 0.0.9.1"])
+        self.assertEqual(self.train.check_package("A", "0.0.9.1", {"A": "0.0.9.1", "B": "0.0.9.1"})["dependencies"], ["B 0.0.9.1"])
         self._nupkg("C", "0.0.9.1", [("B", "[0.0.8.5, )")])
         with self.assertRaises(self.train.TrainError) as raised:
-            self.train.check_package("C", "0.0.9.1", {"B", "C"})
+            self.train.check_package("C", "0.0.9.1", {"B": "0.0.9.1", "C": "0.0.9.1"})
         self.assertIn("not the train version", str(raised.exception))
 
     def test_tokens_never_reach_the_log_or_an_error(self):
@@ -779,7 +780,7 @@ class Unit(unittest.TestCase):
 
     def test_stamp_time_is_the_stamp_s_inverse(self):
         moment = datetime(2026, 10, 10, 6, 25, 32, tzinfo=timezone.utc)
-        self.assertEqual(self.train.stamp_time(self.train.normalized_version(*self.train.stamp(moment))), moment)
+        self.assertEqual(self.train.stamp_time(self.train.normalized_version(*self.train.stamp(moment), (0, 0))), moment)
         self.assertEqual(self.train.stamp_time("0.0.2474"), datetime(2026, 10, 10, tzinfo=timezone.utc))
 
     def test_a_change_touches_a_project_through_its_folder_imports_references_and_outside_paths(self):
@@ -858,8 +859,107 @@ class Unit(unittest.TestCase):
     def test_a_package_that_did_not_take_the_stamp_fails(self):
         self._nupkg("A", "1.0.0", [])
         with self.assertRaises(self.train.TrainError) as raised:
-            self.train.check_package("A", "0.0.9.1", {"A"})
+            self.train.check_package("A", "0.0.9.1", {"A": "0.0.9.1"})
         self.assertIn("did not take the train stamp", str(raised.exception))
+
+
+    # --- Each project's own major.minor (the train stamps only build and revision) --------------------------------
+
+    def test_a_version_on_another_line_is_named_the_way_nuget_normalizes_it(self):
+        self.assertEqual(self.train.normalized_version(2520, 2169, (0, 1)), "0.1.2520.2169")
+        self.assertEqual(self.train.normalized_version(2520, 0, (0, 1)), "0.1.2520")           # revision 0 dropped
+        self.assertEqual(self.train.nuget_normalized("0.1.2520.0"), "0.1.2520")
+        self.assertEqual(self.train.nuget_normalized("01.1.2520.07"), "1.1.2520.7")
+        self.assertEqual(self.train.nuget_normalized("1.2"), "1.2.0")
+        self.assertEqual(self.train.nuget_normalized("0.1.2520.1-beta"), "0.1.2520.1-beta")   # a prerelease as written
+
+    def test_stamp_time_and_version_order_work_on_any_line(self):
+        moment = datetime(2026, 11, 25, 1, 12, 18, tzinfo=timezone.utc)
+        build, revision = self.train.stamp(moment)
+        on_01 = self.train.normalized_version(build, revision, (0, 1))
+        self.assertEqual(self.train.stamp_time(on_01), moment)
+        self.assertEqual(self.train.stamp_time("0.1.2520"), datetime(2026, 11, 25, tzinfo=timezone.utc))
+        self.assertEqual(self.train.stamp_of(on_01), (build, revision))
+        self.assertEqual(self.train.stamp_of("0.1.2520"), (2520, 0))
+        self.assertEqual(self.train.line_of(on_01), (0, 1))
+        # A tuple order: every 0.1 version sorts above every 0.0 one, whatever their stamps.
+        versions = ["0.1.2520.5", "0.0.2530.1", "0.1.2519.40000", "0.0.2520.5", "0.1.2520"]
+        self.assertEqual(sorted(versions, key=self.train.version_key),
+                         ["0.0.2520.5", "0.0.2530.1", "0.1.2519.40000", "0.1.2520", "0.1.2520.5"])
+
+    def test_the_latest_train_tag_orders_a_0_1_label_above_every_0_0_one(self):
+        repo = Path(self.tmp.name) / "tags"
+        repo.mkdir()
+        for args in (["init", "-q", "-b", "main"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                                                     "--allow-empty", "-m", "x"]):
+            subprocess.run(["git", *args], cwd=repo, check=True)
+        for tag in ("train/0.0.2530.1", "train/0.1.2520.5", "train/0.0.2520.9", "train/not-a-version"):
+            subprocess.run(["git", "tag", tag], cwd=repo, check=True)
+        self.assertEqual(self.train.latest_train_tag(repo)["tag"], "train/0.1.2520.5")
+        # The tag a plan for train 0.1.2520.5 saw: the highest one below it.
+        self.assertEqual(self.train.latest_train_tag(repo, before="0.1.2520.5")["tag"], "train/0.0.2530.1")
+
+    def test_the_train_label_takes_the_highest_line_of_its_packages_and_never_sorts_below_a_tag(self):
+        label = self.train.train_label
+        # Mixed train: the highest line among the packages it ships.
+        self.assertEqual(label(2520, 2169, ["0.0.2520.2169", "0.1.2520.2169"], ["train/0.0.2519.7"]), "0.1.2520.2169")
+        # Only 0.0 packages ship after a 0.1 train: the label keeps 0.1, so it sorts above that tag.
+        after = label(2521, 3, ["0.0.2521.3"], ["train/0.1.2520.2169", "train/0.0.2519.7"])
+        self.assertEqual(after, "0.1.2521.3")
+        self.assertGreater(self.train.version_key(after), self.train.version_key("0.1.2520.2169"))
+        # Host-only train: nothing ships, so it reuses the line of the latest train/* tag.
+        self.assertEqual(label(2521, 0, [], ["train/0.1.2520.2169", "train/0.0.2519.7"]), "0.1.2521")
+        # A first train with no tag and no package: the documented fallback.
+        self.assertEqual(label(2521, 9, [], []), "0.0.2521.9")
+        # A repository still on 0.0 with 0.0 tags only: exactly what the train named before.
+        self.assertEqual(label(2521, 9, ["0.0.2521.9"], ["train/0.0.2520.1"]), "0.0.2521.9")
+
+    def test_a_package_on_0_1_is_published_ahead_of_a_train_by_its_stamp_not_its_line(self):
+        from unittest.mock import patch
+        feed = Path(self.tmp.name) / "orgfeed01"
+        feed.mkdir()
+        for name in ("meshNet.Common.0.0.2519.1", "meshNet.Common.0.1.2520.5", "meshNet.Common.0.1.2530.1",
+                     "meshNet.Users.0.0.2510.1", "meshNet.Users.0.1.2526.1"):
+            (feed / f"{name}.nupkg").write_bytes(b"")
+        with patch.dict(os.environ, TRAIN_FEED=str(feed)):
+            # A train labelled 0.0 (only 0.0 packages in it) still sees the 0.1 release published before it.
+            self.assertEqual(self.train.published_versions("o", {"meshNet.Common", "meshNet.Users"}, "0.0.2525.1"),
+                             {"meshNet.Common": "0.1.2520.5", "meshNet.Users": "0.0.2510.1"})
+            self.assertEqual(self.train.published_versions("o", {"meshNet.Common"}, "0.1.2525.1"),
+                             {"meshNet.Common": "0.1.2520.5"})
+
+    def test_a_mixed_train_checks_each_package_and_dependency_against_its_own_train_version(self):
+        train = {"Api": "0.1.9.1", "Types": "0.0.9.1", "Common": "0.1.9"}
+        self._nupkg("Api", "0.1.9.1", [("Types", "0.0.9.1"), ("Common", "[0.1.9, )")])
+        self.assertEqual(self.train.check_package("Api", "0.1.9.1", train)["dependencies"],
+                         ["Types 0.0.9.1", "Common [0.1.9, )"])
+        self._nupkg("Bad", "0.1.9.1", [("Types", "0.1.9.1")])
+        with self.assertRaises(self.train.TrainError) as raised:
+            self.train.check_package("Bad", "0.1.9.1", {**train, "Bad": "0.1.9.1"})
+        self.assertIn("Types 0.1.9.1 (its train version is 0.0.9.1)", str(raised.exception))
+        # A package that packed on another line than it evaluated to names both.
+        self._nupkg("Moved", "0.2.9.1", [])
+        with self.assertRaises(self.train.TrainError) as raised:
+            self.train.check_package("Moved", "0.1.9.1", {"Moved": "0.1.9.1"})
+        self.assertIn("evaluated to 0.1.9.1; the feed has Moved.0.2.9.1.nupkg", str(raised.exception))
+        self.assertIn("did not take the train stamp", str(raised.exception))
+
+    def test_exact_pins_move_to_each_in_train_package_s_own_train_version(self):
+        repo = Path(self.tmp.name) / "mixedpins"
+        (repo / "Host").mkdir(parents=True)
+        (repo / "Host" / "Host.csproj").write_text(self.pinned_csproj(
+            ("meshNet.Common", "0.0.2510.1"), ("meshNet.Common.Api", "0.0.2510.1"), ("meshNet.Old", "0.0.2510.1")))
+        train = {"meshNet.Common": "0.1.2520.2169", "meshNet.Common.Api": "0.1.2520.2169", "meshNet.Old": "0.0.2520.2169"}
+        changed = self.train.pin_train_versions(repo, train)
+        self.assertEqual({(c[1], c[3]) for c in changed}, set(train.items()))
+        text = (repo / "Host" / "Host.csproj").read_text()
+        self.assertIn('Include="meshNet.Common.Api" Version="0.1.2520.2169"', text)
+        self.assertIn('Include="meshNet.Old" Version="0.0.2520.2169"', text)
+
+    @staticmethod
+    def pinned_csproj(*pins):
+        refs = "".join(f'<PackageReference Include="{p}" Version="{v}" />' for p, v in pins)
+        return f'<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>{refs}</ItemGroup></Project>\n'
 
 
 PROPS = """<Project>
@@ -873,6 +973,10 @@ PROPS = """<Project>
   </PropertyGroup>
 </Project>
 """
+
+
+# A package repository's props after the move to its own line: the same formula, VersionMinor declared by the project.
+PROPS_LINE = PROPS.replace(">0</VersionMinor>", ">{minor}</VersionMinor>")
 
 
 def csproj(references):
@@ -1460,7 +1564,7 @@ class EndToEnd(Fixture):
         built = self.rev("Up", "main")
         self.commit_to("Up", "main", {"Up.Two/More.cs": "namespace UpTwo; public class More {}"})
         self.manifest([{"repo": "Up", "test": False}])
-        tomorrow = self.module.normalized_version(*self.module.stamp(datetime.now(timezone.utc) + timedelta(days=1)))
+        tomorrow = self.module.normalized_version(*self.module.stamp(datetime.now(timezone.utc) + timedelta(days=1)), (0, 0))
         self.feed_package("Up.Lib", "0.0.2000.1", "e" * 40)                       # older, ignored
         self.feed_package("Up.Lib", "0.0.2474.11566", built)                      # packed from a commit Up has
         self.feed_package("Up.Two", tomorrow, "f" * 40)                           # an unpushed commit, stamped later
@@ -1702,7 +1806,7 @@ class EndToEnd(Fixture):
         # The next train: Up is unchanged since its tag (not rebuilt), Down's release moved. Its stamp must differ from
         # the first train's: the stamp has two-second resolution, and a fast runner gets here inside one window, which
         # would give both trains the same version and the second one's train/<version> tag would already exist.
-        while self.module.normalized_version(*self.module.stamp()) == first:
+        while self.module.normalized_version(*self.module.stamp(), (0, 0)) == first:
             time.sleep(0.2)
         plan = self.train("plan")
         self.assertEqual(plan.returncode, 0, plan.stdout)
@@ -2105,6 +2209,173 @@ class EndToEnd(Fixture):
         self.assertIn('Include="Up.Lib" Version="0.0.1.1"', self.file_at("Host", "main", "Host.App/Host.App.csproj"))
         self.assertEqual(self.rev("Host", f"train/{version}^{{commit}}"), self.rev("Host", "main"))
         self.assertEqual(json.loads((self.root / "train/plan.json").read_text())["promoted"], ["Host"])
+
+
+    # --- Each project's own major.minor: the 26 package repos moved to 0.1 (meshNet run 45522028023) ---------------
+
+    def line_repo(self, name, files, line=1, org_feed=False):
+        """A repository whose Directory.Build.props declares VersionMinor `line`, as each package repo now does."""
+        self.repo(name, {"Directory.Build.props": PROPS_LINE.format(minor=line), **files}, org_feed=org_feed)
+
+    def test_a_repo_on_0_1_packs_checks_pins_and_tags_at_its_own_major_minor(self):
+        """The failure this fixes: Up and Down declare VersionMinor 1, so they pack 0.1.<build>.<revision>, and the train
+        must look for, check, pin and tag exactly that (it looked for 0.0.<build>.<revision> and failed)."""
+        self.line_repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.line_repo("Down", {"Down.Lib/Down.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1")),
+                                "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}"}, org_feed=True)
+        self.release_branches("Up", "Down")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        label = state["version"]
+        self.assertEqual(label, self.module.normalized_version(state["build"], state["revision"], (0, 1)))
+        self.assertEqual(state["versions"], {"Up.Lib": label, "Down.Lib": label})
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual([(p["id"], p["version"]) for p in state["packages"]], [("Up.Lib", label), ("Down.Lib", label)])
+        self.assertEqual(state["packages"][1]["dependencies"], [f"Up.Lib {label}"])
+        self.assertTrue((self.root / "train/feed" / f"Up.Lib.{label}.nupkg").exists())
+        self.assertIn(f"Down: pinned 1 reference(s): Up.Lib (0.0.1.1 -> {label})", build.stdout)
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        for name in ("Up", "Down"):
+            self.assertEqual(self.rev(name, f"train/{label}^{{commit}}"), self.rev(name, "main"))
+        self.assertIn(f'Include="Up.Lib" Version="{label}"', self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        subject = subprocess.run(["git", "log", "-1", "--format=%s", "main"], cwd=self.bare("Down"), capture_output=True,
+                                 text=True, check=True).stdout.strip()
+        self.assertEqual(subject, f"[train {label}] pin Up.Lib to {label}")
+
+    def test_a_mixed_0_0_and_0_1_train_packs_pins_and_checks_each_package_at_its_own_line(self):
+        """Up moved to 0.1, Mid is still on 0.0: each packs on its own line with the one stamp, Mid's nuspec names Up.Lib
+        at 0.1, the host's exact pins move to each package's own version, and the train is labelled (and every
+        repository tagged) with the higher line."""
+        self.line_repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.repo("Mid", {"Mid.Lib/Mid.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1")),
+                          "Mid.Lib/Class.cs": "namespace Mid; public class B : Up.A {}"}, org_feed=True)
+        self.host_repo("Host", [("Up.Lib", "0.0.1.1"), ("Mid.Lib", "0.0.1.1")], code="namespace Host; public class C : Mid.B {}")
+        self.release_branches("Up", "Mid", "Host")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Mid", "test": False}],
+                      [{"repo": "Host", "build": "Host.Api.slnx", "test": False}])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        b, r = state["build"], state["revision"]
+        up, mid = (self.module.normalized_version(b, r, line) for line in ((0, 1), (0, 0)))
+        self.assertEqual((state["version"], state["versions"]), (up, {"Up.Lib": up, "Mid.Lib": mid}))
+        build = self.train("build")
+        self.assertEqual(build.returncode, 0, build.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual([(p["id"], p["version"], p["dependencies"]) for p in state["packages"]],
+                         [("Up.Lib", up, []), ("Mid.Lib", mid, [f"Up.Lib {up}"])])
+        self.assertEqual(sorted(tuple(p[1:]) for p in state["repos"]["Host"]["pins"]),
+                         [("Mid.Lib", "0.0.1.1", mid), ("Up.Lib", "0.0.1.1", up)])
+        self.publish()
+        promote = self.train("promote")
+        self.assertEqual(promote.returncode, 0, promote.stdout)
+        for name in ("Up", "Mid", "Host"):
+            self.assertEqual(self.rev(name, f"train/{up}^{{commit}}"), self.rev(name, "main"))
+        host = self.file_at("Host", "main", "Host.App/Host.App.csproj")
+        self.assertIn(f'Include="Up.Lib" Version="{up}"', host)
+        self.assertIn(f'Include="Mid.Lib" Version="{mid}"', host)
+        subject = subprocess.run(["git", "log", "-1", "--format=%s", "main"], cwd=self.bare("Host"), capture_output=True,
+                                 text=True, check=True).stdout.strip()
+        self.assertEqual(subject, f"[train {up}] pin Up.Lib to {up}; Mid.Lib to {mid}")
+
+    def test_a_revision_0_stamp_evaluates_packs_and_checks_as_major_minor_build(self):
+        """NuGet drops a zero revision: at revision 0 a 0.1 project packs <id>.0.1.<build>.nupkg, and the evaluation the
+        train checks against says exactly that."""
+        work = self.root / "rev0"
+        (work / "Lib").mkdir(parents=True)
+        (work / "Directory.Build.props").write_text(PROPS_LINE.format(minor=1))
+        (work / "Lib" / "Lib.csproj").write_text(csproj([]))
+        (work / "Lib" / "Class.cs").write_text("namespace Lib; public class A {}")
+        env = self.module.dotnet_env()
+        version = self.module.evaluate_version(work, "Lib/Lib.csproj", "Rev0.Lib", 2520, 0, env)
+        self.assertEqual(version, "0.1.2520")
+        self.module.FEED.mkdir(parents=True, exist_ok=True)
+        self.module.run(["dotnet", "pack", "Lib/Lib.csproj", "-c", "Release", "-o", self.module.FEED, "-p:PackageId=Rev0.Lib",
+                         *self.module.pack_properties(2520, 0)], cwd=work, env=env)
+        self.assertTrue((self.module.FEED / "Rev0.Lib.0.1.2520.nupkg").exists())
+        self.assertEqual(self.module.check_package("Rev0.Lib", version, {"Rev0.Lib": version})["version"], "0.1.2520")
+
+    def test_a_host_only_train_is_labelled_on_the_line_of_the_latest_train_tag(self):
+        """Nothing ships, so no package names a line: the label reuses the latest train/* tag's (0.1 here), so the host's
+        tag sorts above that train's, and promote-only finds it as the latest tag."""
+        self.line_repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.host_repo("Host", [("Up.Lib", "0.1.1.1")], code="namespace Host; public class B {}")
+        self.release_branches("Up", "Host")
+        subprocess.run(["git", "tag", "train/0.0.2600.1", "main"], cwd=self.bare("Up"), check=True)  # older line, later stamp
+        subprocess.run(["git", "tag", "train/0.1.1.1", "main"], cwd=self.bare("Up"), check=True)
+        self.released("Up.Lib", "0.1.1.1", self.rev("Up", "main"))
+        self.commit_to("Host", "release", {"README.md": "a host-only change"})
+        self.manifest(["Up"], [{"repo": "Host", "build": "Host.Api.slnx", "test": False}])
+        self.live()
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((state["selected"], state["hosts_selected"], state["train_ids"]), ([], ["Host"], []))
+        label = state["version"]
+        self.assertEqual(label, self.module.normalized_version(state["build"], state["revision"], (0, 1)))
+        for step in ("build", "publish", "promote"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.rev("Host", f"train/{label}^{{commit}}"), self.rev("Host", "main"))
+        dest = self.root / "train/src/Host/Host"
+        subprocess.run(["git", "fetch", "-q", "--tags", str(self.bare("Host"))], cwd=dest, check=True)
+        self.assertEqual(self.module.latest_train_tag(dest)["tag"], f"train/{label}")
+
+    def test_promote_only_finishes_a_mixed_train_labelled_0_1_with_each_package_s_own_version(self):
+        """A train labelled 0.1 that published Up.Lib at 0.1 and Down.Lib at 0.0 and then stranded: promote-only with that
+        label finds both on the feed by the stamp (not by the label), and re-derives Down's pin on Up.Lib at 0.1."""
+        self.line_repo("Up", {"Up.Lib/Up.Lib.csproj": csproj([]), "Up.Lib/Class.cs": "namespace Up; public class A {}"})
+        self.repo("Down", {"Down.Lib/Down.Lib.csproj": self.pinned_lib(("Up.Lib", "0.0.1.1")),
+                           "Down.Lib/Class.cs": "namespace Down; public class B : Up.A {}"}, org_feed=True)
+        self.release_branches("Up", "Down")
+        self.manifest([{"repo": "Up", "test": False}, {"repo": "Down", "test": False}])
+        self.live()
+        for step in ("plan", "build"):
+            result = self.train(step)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        label, versions = state["version"], state["versions"]
+        self.assertEqual(self.module.line_of(label), (0, 1))
+        self.assertEqual(self.module.line_of(versions["Down.Lib"]), (0, 0))
+        self.publish()                                                              # published, never promoted
+        self.feed_env.update(TRAIN_VERSION=label,
+                             TRAIN_PROMOTE=f"Up={state['repos']['Up']['base']}, Down={state['repos']['Down']['base']}")
+        done = self.train("promote-only")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        result = json.loads((self.root / "train/plan.json").read_text())
+        self.assertEqual((result["train_ids"], result["versions"]), (["Down.Lib", "Up.Lib"], versions))
+        self.assertIn(f'Include="Up.Lib" Version="{versions["Up.Lib"]}"',
+                      self.file_at("Down", "main", "Down.Lib/Down.Lib.csproj"))
+        for name in ("Up", "Down"):
+            self.assertEqual(self.rev(name, f"train/{label}^{{commit}}"), self.rev(name, "main"))
+
+    def test_a_project_that_does_not_take_the_stamp_fails_naming_what_it_evaluated(self):
+        """A project that hand-sets its version never carries the stamp. Its repository fails with the version it
+        evaluated and the one expected; a repository that does not depend on it still builds and packs."""
+        self.repo("Bad", {"Bad.Lib/Bad.Lib.csproj": '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Version>1.2.3</Version>'
+                                                    '</PropertyGroup></Project>\n',
+                          "Bad.Lib/Class.cs": "namespace Bad; public class A {}"})
+        self.line_repo("Good", {"Good.Lib/Good.Lib.csproj": csproj([]), "Good.Lib/Class.cs": "namespace Good; public class A {}"})
+        self.manifest([{"repo": "Bad", "test": False}, {"repo": "Good", "test": False}])
+        plan = self.train("plan")
+        self.assertEqual(plan.returncode, 0, plan.stdout)
+        state = json.loads((self.root / "train/plan.json").read_text())
+        b, r = state["build"], state["revision"]
+        self.assertEqual(state["versions"], {"Good.Lib": self.module.normalized_version(b, r, (0, 1))})
+        build = self.train("build")
+        self.assertNotEqual(build.returncode, 0, build.stdout)
+        self.assertIn(f"Bad.Lib: evaluates to PackageVersion '1.2.3', expected <VersionMajor>.<VersionMinor>.{b}.{r}; "
+                      f"the project did not take the train stamp", build.stdout)
+        self.assertTrue((self.root / "train/feed" / f"Good.Lib.{state['version']}.nupkg").exists())
+        self.assertEqual(sorted(json.loads((self.root / "train/plan.json").read_text())["failed"]), ["Bad"])
 
 
 @unittest.skipUnless(shutil.which("git-lfs"), "needs git-lfs, as GitHub's ubuntu runner images have")
